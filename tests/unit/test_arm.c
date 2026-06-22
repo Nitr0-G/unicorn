@@ -867,6 +867,67 @@ static void test_arm_mem_hook_read_write(void)
     OK(uc_close(uc));
 }
 
+static void test_arm_thumb_it_mem_read_cb(uc_engine *uc, uc_mem_type type,
+                                          uint64_t address, int size,
+                                          int64_t value, void *user_data)
+{
+    uint64_t *count = (uint64_t *)user_data;
+
+    (void)uc;
+    (void)type;
+    (void)address;
+    (void)size;
+    (void)value;
+
+    (*count)++;
+}
+
+static void test_arm_thumb_it_mem_hook(void)
+{
+    uc_engine *uc;
+    uc_hook hk;
+    uint8_t code[] = {
+        0x00, 0x28, /* cmp r0, #0 */
+        0x1c, 0xbf, /* itt ne */
+        0x11, 0x68, /* ldrne r1, [r2] */
+        0x00, 0x29, /* cmpne r1, #0 */
+        0x00, 0xe0, /* b.n #0x100c */
+        0x00, 0xbf, /* nop */
+        0x03, 0x2c, /* cmp r4, #3 */
+        0x00, 0xd3, /* bcc #0x1012 */
+        0x01, 0x23, /* movs r3, #1 */
+        0x02, 0x23, /* movs r3, #2 */
+    };
+    uint32_t r0 = 1;
+    uint32_t r1 = 0;
+    uint32_t r2 = code_start + 0x200;
+    uint32_t r3 = 0;
+    uint32_t r4 = 1;
+    uint32_t data = LEINT32(1);
+    uint64_t count = 0;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (char *)code, sizeof(code), UC_CPU_ARM_CORTEX_M7);
+
+    OK(uc_mem_write(uc, r2, &data, sizeof(data)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_write(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_ARM_REG_R3, &r3));
+    OK(uc_reg_write(uc, UC_ARM_REG_R4, &r4));
+
+    OK(uc_hook_add(uc, &hk, UC_HOOK_MEM_READ,
+                   test_arm_thumb_it_mem_read_cb, &count, 1, 0));
+
+    OK(uc_emu_start(uc, code_start | 1, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_ARM_REG_R3, &r3));
+    TEST_CHECK(r3 == 2);
+    TEST_CHECK(count == 1);
+
+    OK(uc_close(uc));
+}
+
 typedef struct {
     uint64_t v0;
     uint64_t v1;
@@ -1130,6 +1191,7 @@ TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_arm_thumb2", test_arm_thumb2},
              {"test_armeb_be32_thumb2", test_armeb_be32_thumb2},
              {"test_arm_mem_hook_read_write", test_arm_mem_hook_read_write},
+             {"test_arm_thumb_it_mem_hook", test_arm_thumb_it_mem_hook},
              {"test_arm_tcg_opcode_cmp", test_arm_tcg_opcode_cmp},
              {"test_arm_thumb_tcg_opcode_cmn", test_arm_thumb_tcg_opcode_cmn},
              {"test_arm_cp15_c1_c0_2", test_arm_cp15_c1_c0_2},
