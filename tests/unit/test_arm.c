@@ -958,6 +958,48 @@ static void test_arm_cp15_c1_c0_2(void)
     OK(uc_close(uc));
 }
 
+static void test_arm_mrrc_cp15_c15_1_cpu(uc_cpu_arm cpu)
+{
+    uc_engine *uc;
+    uc_arm_cp_reg reg = {
+        .cp = 15,
+        .is64 = 1,
+        .sec = 0,
+        .crm = 15,
+        .opc1 = 1,
+        .val = 0x0123456789abcdefULL,
+    };
+    const char code[] = "\x1f\x1f\x40\xec"
+                        "\x1f\x1f\x50\xec";
+    uint32_t r0 = 0x76543210;
+    uint32_t r1 = 0x89abcdef;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_ARM, code, sizeof(code) - 1,
+                    cpu);
+
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_write(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_ARM_REG_CP_REG, &reg));
+    OK(uc_reg_read(uc, UC_ARM_REG_CP_REG, &reg));
+    TEST_CHECK(reg.val == 0);
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+
+    TEST_CHECK(r0 == 0);
+    TEST_CHECK(r1 == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_arm_mrrc_cp15_c15_1(void)
+{
+    test_arm_mrrc_cp15_c15_1_cpu(UC_CPU_ARM_CORTEX_A9);
+    test_arm_mrrc_cp15_c15_1_cpu(UC_CPU_ARM_CORTEX_A15);
+    test_arm_mrrc_cp15_c15_1_cpu(UC_CPU_ARM_MAX);
+}
+
 static bool test_arm_v7_lpae_hook_tlb(uc_engine *uc, uint64_t addr,
                                       uc_mem_type type, uc_tlb_entry *result,
                                       void *user_data)
@@ -1091,6 +1133,7 @@ TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_arm_tcg_opcode_cmp", test_arm_tcg_opcode_cmp},
              {"test_arm_thumb_tcg_opcode_cmn", test_arm_thumb_tcg_opcode_cmn},
              {"test_arm_cp15_c1_c0_2", test_arm_cp15_c1_c0_2},
+             {"test_arm_mrrc_cp15_c15_1", test_arm_mrrc_cp15_c15_1},
              {"test_arm_v7_lpae", test_arm_v7_lpae},
              {"test_arm_svc_hvc_syndrome", test_arm_svc_hvc_syndrome},
              {"test_arm_hook_insn_wfi", test_arm_hook_insn_wfi},
