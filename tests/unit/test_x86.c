@@ -1089,6 +1089,28 @@ static void test_x86_cmpxchg32_accumulator(void)
                                 0xffffffffffffffffULL, false);
 }
 
+static void test_x86_ret_imm16_unsigned(void)
+{
+    uc_engine *uc;
+    char code[] = "\xc2\x00\xff"; /* ret 0xff00 */
+    uint64_t stack_address = 0x2000000;
+    uint64_t return_address = code_start + sizeof(code) - 1;
+    uint64_t rsp = stack_address;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, stack_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, stack_address, &return_address,
+                    sizeof(return_address)));
+    OK(uc_reg_write(uc, UC_X86_REG_RSP, &rsp));
+
+    OK(uc_emu_start(uc, code_start, return_address, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_RSP, &rsp));
+
+    TEST_CHECK(rsp == stack_address + 8 + 0xff00);
+
+    OK(uc_close(uc));
+}
+
 static void test_x86_nested_emu_start_cb(uc_engine *uc, uint64_t addr,
                                          size_t size, void *data)
 {
@@ -2335,6 +2357,7 @@ TEST_LIST = {
     {"test_x86_hook_tcg_op", test_x86_hook_tcg_op},
     {"test_x86_cmpxchg", test_x86_cmpxchg},
     {"test_x86_cmpxchg32_accumulator", test_x86_cmpxchg32_accumulator},
+    {"test_x86_ret_imm16_unsigned", test_x86_ret_imm16_unsigned},
     {"test_x86_nested_emu_start", test_x86_nested_emu_start},
     {"test_x86_nested_emu_stop", test_x86_nested_emu_stop},
     {"test_x86_64_nested_emu_start_error", test_x86_64_nested_emu_start_error},

@@ -7159,7 +7159,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         /************************/
         /* control */
     case 0xc2: /* ret im */
-        val = x86_ldsw_code(env, s);
+        val = x86_lduw_code(env, s);
         ot = gen_pop_T0(s);
         gen_stack_update(s, val + (1 << ot));
         /* Note that gen_pop_T0 uses a zero-extending load.  */
@@ -7176,7 +7176,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_jr(s, s->T0);
         break;
     case 0xca: /* lret im */
-        val = x86_ldsw_code(env, s);
+        val = x86_lduw_code(env, s);
     do_lret:
         if (s->pe && !s->vm86) {
             gen_update_cc_op(s);
