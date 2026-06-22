@@ -217,6 +217,32 @@ static void test_riscv64_3steps_pc_update(void)
     OK(uc_close(uc));
 }
 
+static void test_riscv64_until_at_page_end(void)
+{
+    uc_engine *uc;
+    uint64_t address = 0x6d76d7473ffc;
+    uint64_t page = address & ~0xfffULL;
+    char code[] = "\x13\x81\x00\x7d";
+    uint64_t r_x1 = 0x1234;
+    uint64_t r_x2 = 0;
+    uint64_t r_pc = 0;
+
+    OK(uc_open(UC_ARCH_RISCV, UC_MODE_RISCV64, &uc));
+    OK(uc_mem_map(uc, page, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, address, code, sizeof(code) - 1));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X1, &r_x1));
+
+    OK(uc_emu_start(uc, address, address + sizeof(code) - 1, 0, 1));
+
+    OK(uc_reg_read(uc, UC_RISCV_REG_X2, &r_x2));
+    OK(uc_reg_read(uc, UC_RISCV_REG_PC, &r_pc));
+
+    TEST_CHECK(r_x2 == 0x1a04);
+    TEST_CHECK(r_pc == address + sizeof(code) - 1);
+
+    OK(uc_close(uc));
+}
+
 static void test_riscv32_fp_move(void)
 {
     uc_engine *uc;
@@ -887,6 +913,7 @@ TEST_LIST = {
     {"test_riscv64_nop", test_riscv64_nop},
     {"test_riscv32_3steps_pc_update", test_riscv32_3steps_pc_update},
     {"test_riscv64_3steps_pc_update", test_riscv64_3steps_pc_update},
+    {"test_riscv64_until_at_page_end", test_riscv64_until_at_page_end},
     {"test_riscv32_until_pc_update", test_riscv32_until_pc_update},
     {"test_riscv64_until_pc_update", test_riscv64_until_pc_update},
     {"test_riscv32_fp_move", test_riscv32_fp_move},
