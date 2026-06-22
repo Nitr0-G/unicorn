@@ -313,6 +313,11 @@ static const uint8_t cc_op_live[CC_OP_NB] = {
     [CC_OP_BMILGL] = USES_CC_DST | USES_CC_SRC,
     [CC_OP_BMILGQ] = USES_CC_DST | USES_CC_SRC,
 
+    [CC_OP_BLSIB] = USES_CC_DST | USES_CC_SRC,
+    [CC_OP_BLSIW] = USES_CC_DST | USES_CC_SRC,
+    [CC_OP_BLSIL] = USES_CC_DST | USES_CC_SRC,
+    [CC_OP_BLSIQ] = USES_CC_DST | USES_CC_SRC,
+
     [CC_OP_ADCX] = USES_CC_DST | USES_CC_SRC,
     [CC_OP_ADOX] = USES_CC_SRC | USES_CC_SRC2,
     [CC_OP_ADCOX] = USES_CC_DST | USES_CC_SRC | USES_CC_SRC2,
@@ -959,6 +964,14 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
         size = s->cc_op - CC_OP_BMILGB;
         t0 = gen_ext_tl(tcg_ctx, reg, tcg_ctx->cpu_cc_src, size, false);
         return (CCPrepare) { .cond = TCG_COND_EQ, .reg = t0, .mask = -1 };
+
+    case CC_OP_BLSIB:
+    case CC_OP_BLSIW:
+    case CC_OP_BLSIL:
+    case CC_OP_BLSIQ:
+        size = s->cc_op - CC_OP_BLSIB;
+        t0 = gen_ext_tl(tcg_ctx, reg, tcg_ctx->cpu_cc_src, size, false);
+        return (CCPrepare) { .cond = TCG_COND_NE, .reg = t0, .mask = -1 };
 
     case CC_OP_ADCX:
     case CC_OP_ADCOX:
@@ -4393,7 +4406,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 }
                 tcg_gen_mov_tl(tcg_ctx, tcg_ctx->cpu_cc_dst, s->T0);
                 gen_op_mov_reg_v(s, ot, s->vex_v, s->T0);
-                set_cc_op(s, CC_OP_BMILGB + ot);
+                if ((reg & 7) == 3) {
+                    set_cc_op(s, CC_OP_BLSIB + ot);
+                } else {
+                    set_cc_op(s, CC_OP_BMILGB + ot);
+                }
                 break;
 
             default:
