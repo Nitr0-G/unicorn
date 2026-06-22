@@ -4186,16 +4186,21 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 tcg_gen_ext8u_tl(tcg_ctx, s->T1, tcg_ctx->cpu_regs[s->vex_v]);
                 {
                     TCGv bound = tcg_const_tl(tcg_ctx, ot == MO_64 ? 63 : 31);
+                    TCGv zero = tcg_const_tl(tcg_ctx, 0);
                     /* Note that since we're using BMILG (in order to get O
                        cleared) we need to store the inverse into C.  */
-                    tcg_gen_setcond_tl(tcg_ctx, TCG_COND_LT, tcg_ctx->cpu_cc_src,
+                    tcg_gen_setcond_tl(tcg_ctx, TCG_COND_LEU, tcg_ctx->cpu_cc_src,
                                        s->T1, bound);
-                    tcg_gen_movcond_tl(tcg_ctx, TCG_COND_GT, s->T1, s->T1,
+                    tcg_gen_movcond_tl(tcg_ctx, TCG_COND_GTU, s->T1, s->T1,
                                        bound, bound, s->T1);
                     tcg_temp_free(tcg_ctx, bound);
+                    tcg_gen_movi_tl(tcg_ctx, s->A0, -1);
+                    tcg_gen_shl_tl(tcg_ctx, s->A0, s->A0, s->T1);
+                    tcg_gen_movcond_tl(tcg_ctx, TCG_COND_EQ, s->A0,
+                                       tcg_ctx->cpu_cc_src, zero,
+                                       zero, s->A0);
+                    tcg_temp_free(tcg_ctx, zero);
                 }
-                tcg_gen_movi_tl(tcg_ctx, s->A0, -1);
-                tcg_gen_shl_tl(tcg_ctx, s->A0, s->A0, s->T1);
                 tcg_gen_andc_tl(tcg_ctx, s->T0, s->T0, s->A0);
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
                 gen_op_update1_cc(s);
