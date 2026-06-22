@@ -1168,6 +1168,27 @@ static void test_x86_shrd_rip_relative_imm(void)
     test_x86_shiftd_rip_relative_imm(code, sizeof(code) - 1, 1, 0x9108);
 }
 
+static void test_x86_pdep32_zero_extend(void)
+{
+    uc_engine *uc;
+    char code[] = "\xc4\xe2\x63\xf5\xc1"; /* pdep eax, ebx, ecx */
+    uint64_t rax = 0xffffffffffffffffULL;
+    uint64_t rbx = 0xffffffffffffff00ULL;
+    uint64_t rcx = 0xffffffffffffff00ULL;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, code, sizeof(code) - 1);
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+    OK(uc_reg_write(uc, UC_X86_REG_RCX, &rcx));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+
+    TEST_CHECK(rax == 0x00000000ffff0000ULL);
+
+    OK(uc_close(uc));
+}
+
 static void test_x86_nested_emu_start_cb(uc_engine *uc, uint64_t addr,
                                          size_t size, void *data)
 {
@@ -2418,6 +2439,7 @@ TEST_LIST = {
     {"test_x86_rorx_rip_relative_imm", test_x86_rorx_rip_relative_imm},
     {"test_x86_shld_rip_relative_imm", test_x86_shld_rip_relative_imm},
     {"test_x86_shrd_rip_relative_imm", test_x86_shrd_rip_relative_imm},
+    {"test_x86_pdep32_zero_extend", test_x86_pdep32_zero_extend},
     {"test_x86_nested_emu_start", test_x86_nested_emu_start},
     {"test_x86_nested_emu_stop", test_x86_nested_emu_stop},
     {"test_x86_64_nested_emu_start_error", test_x86_64_nested_emu_start_error},
