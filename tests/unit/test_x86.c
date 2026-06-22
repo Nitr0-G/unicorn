@@ -1043,6 +1043,52 @@ static void test_x86_cmpxchg(void)
     OK(uc_close(uc));
 }
 
+static void test_x86_cmpxchg32_acc_case(uint64_t initial_rax,
+                                        uint64_t initial_mem,
+                                        uint64_t expected_rax,
+                                        uint64_t expected_mem,
+                                        bool expected_zf)
+{
+    uc_engine *uc;
+    char code[] = "\x41\x0f\xb1\x18"; /* cmpxchg dword ptr [r8], ebx */
+    uint64_t data_address = 0x2000000;
+    uint64_t rax = initial_rax;
+    uint64_t rbx = 0;
+    uint64_t r8 = data_address;
+    uint64_t rflags;
+    uint64_t mem;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &initial_mem, sizeof(initial_mem)));
+    OK(uc_reg_write(uc, UC_X86_REG_R8, &r8));
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_read(uc, UC_X86_REG_RFLAGS, &rflags));
+    OK(uc_mem_read(uc, data_address, &mem, sizeof(mem)));
+
+    TEST_CHECK(rax == expected_rax);
+    TEST_CHECK(mem == expected_mem);
+    TEST_CHECK((bool)(rflags & 0x40) == expected_zf);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_cmpxchg32_accumulator(void)
+{
+    test_x86_cmpxchg32_acc_case(0xffffffffffffffffULL,
+                                0xffffffffffffffffULL,
+                                0xffffffffffffffffULL,
+                                0xffffffff00000000ULL, true);
+    test_x86_cmpxchg32_acc_case(0xffffffff00000000ULL,
+                                0xffffffffffffffffULL,
+                                0x00000000ffffffffULL,
+                                0xffffffffffffffffULL, false);
+}
+
 static void test_x86_nested_emu_start_cb(uc_engine *uc, uint64_t addr,
                                          size_t size, void *data)
 {
@@ -2288,6 +2334,7 @@ TEST_LIST = {
     {"test_x86_clear_empty_tb", test_x86_clear_empty_tb},
     {"test_x86_hook_tcg_op", test_x86_hook_tcg_op},
     {"test_x86_cmpxchg", test_x86_cmpxchg},
+    {"test_x86_cmpxchg32_accumulator", test_x86_cmpxchg32_accumulator},
     {"test_x86_nested_emu_start", test_x86_nested_emu_start},
     {"test_x86_nested_emu_stop", test_x86_nested_emu_stop},
     {"test_x86_64_nested_emu_start_error", test_x86_64_nested_emu_start_error},

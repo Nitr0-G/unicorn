@@ -493,6 +493,38 @@ static void gen_op_mov_reg_v(DisasContext *s, MemOp ot, int reg, TCGv t0)
     }
 }
 
+static void gen_op_update_cmpxchg_acc(DisasContext *s, MemOp ot, TCGv oldv,
+                                      TCGv cmpv)
+{
+    TCGContext *tcg_ctx = s->uc->tcg_ctx;
+    TCGv new_acc = tcg_temp_new(tcg_ctx);
+
+    switch(ot) {
+    case MO_8:
+        tcg_gen_deposit_tl(tcg_ctx, new_acc, tcg_ctx->cpu_regs[R_EAX],
+                           oldv, 0, 8);
+        break;
+    case MO_16:
+        tcg_gen_deposit_tl(tcg_ctx, new_acc, tcg_ctx->cpu_regs[R_EAX],
+                           oldv, 0, 16);
+        break;
+    case MO_32:
+        tcg_gen_ext32u_tl(tcg_ctx, new_acc, oldv);
+        break;
+#ifdef TARGET_X86_64
+    case MO_64:
+        tcg_gen_mov_tl(tcg_ctx, new_acc, oldv);
+        break;
+#endif
+    default:
+        tcg_abort();
+    }
+
+    tcg_gen_movcond_tl(tcg_ctx, TCG_COND_EQ, tcg_ctx->cpu_regs[R_EAX],
+                       oldv, cmpv, tcg_ctx->cpu_regs[R_EAX], new_acc);
+    tcg_temp_free(tcg_ctx, new_acc);
+}
+
 static inline
 void gen_op_mov_v_reg(DisasContext *s, MemOp ot, TCGv t0, int reg)
 {
@@ -5761,7 +5793,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_lea_modrm(env, s, modrm);
                 tcg_gen_atomic_cmpxchg_tl(tcg_ctx, oldv, s->A0, cmpv, newv,
                                           s->mem_index, ot | MO_LE);
-                gen_op_mov_reg_v(s, ot, R_EAX, oldv);
+                gen_extu(tcg_ctx, ot, oldv);
+                gen_extu(tcg_ctx, ot, cmpv);
+                gen_op_update_cmpxchg_acc(s, ot, oldv, cmpv);
             } else {
                 if (mod == 3) {
                     rm = (modrm & 7) | REX_B(s);
@@ -5776,7 +5810,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 /* store value = (old == cmp ? new : old);  */
                 tcg_gen_movcond_tl(tcg_ctx, TCG_COND_EQ, newv, oldv, cmpv, newv, oldv);
                 if (mod == 3) {
-                    gen_op_mov_reg_v(s, ot, R_EAX, oldv);
+                    gen_op_update_cmpxchg_acc(s, ot, oldv, cmpv);
                     gen_op_mov_reg_v(s, ot, rm, newv);
                 } else {
                     /* Perform an unconditional store cycle like physical cpu;
@@ -5784,7 +5818,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                        idempotency if the store faults and the instruction
                        is restarted */
                     gen_op_st_v(s, ot, newv, s->A0);
-                    gen_op_mov_reg_v(s, ot, R_EAX, oldv);
+                    gen_op_update_cmpxchg_acc(s, ot, oldv, cmpv);
                 }
             }
             tcg_gen_mov_tl(tcg_ctx, tcg_ctx->cpu_cc_src, oldv);
