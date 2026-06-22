@@ -1156,6 +1156,63 @@ static void test_x86_ret_imm16_unsigned(void)
     OK(uc_close(uc));
 }
 
+static void test_x86_rorx_rip_relative_imm(void)
+{
+    uc_engine *uc;
+    char code[] = "\xc4\xe3\x7b\xf0\x05\xf6\x14\x00\x00\x00";
+    uint64_t expected_address = code_start + sizeof(code) - 1 + 0x14f6;
+    uint8_t data[] = {0xaa, 0x11, 0x22, 0x33, 0x44};
+    uint64_t rax;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, code, sizeof(code) - 1);
+    OK(uc_mem_write(uc, expected_address - 1, data, sizeof(data)));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+
+    TEST_CHECK(rax == 0x44332211);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_shiftd_rip_relative_imm(const char *code,
+                                             size_t code_size, uint64_t rbx,
+                                             uint16_t expected_value)
+{
+    uc_engine *uc;
+    uint64_t expected_address = code_start + code_size + 0x14f7;
+    uint8_t data[] = {0xaa, 0x11, 0x22, 0x33, 0x44};
+    uint8_t previous;
+    uint16_t mem;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, code, code_size);
+    OK(uc_mem_write(uc, expected_address - 1, data, sizeof(data)));
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+
+    OK(uc_emu_start(uc, code_start, code_start + code_size, 0, 1));
+    OK(uc_mem_read(uc, expected_address - 1, &previous, sizeof(previous)));
+    OK(uc_mem_read(uc, expected_address, &mem, sizeof(mem)));
+
+    TEST_CHECK(previous == 0xaa);
+    TEST_CHECK(mem == expected_value);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_shld_rip_relative_imm(void)
+{
+    char code[] = "\x66\x0f\xa4\x1d\xf7\x14\x00\x00\x01";
+
+    test_x86_shiftd_rip_relative_imm(code, sizeof(code) - 1, 0x8000, 0x4423);
+}
+
+static void test_x86_shrd_rip_relative_imm(void)
+{
+    char code[] = "\x66\x0f\xac\x1d\xf7\x14\x00\x00\x01";
+
+    test_x86_shiftd_rip_relative_imm(code, sizeof(code) - 1, 1, 0x9108);
+}
+
 static void test_x86_nested_emu_start_cb(uc_engine *uc, uint64_t addr,
                                          size_t size, void *data)
 {
@@ -2404,6 +2461,9 @@ TEST_LIST = {
     {"test_x86_cmpxchg32_accumulator", test_x86_cmpxchg32_accumulator},
     {"test_x86_cmpxchg32_register", test_x86_cmpxchg32_register},
     {"test_x86_ret_imm16_unsigned", test_x86_ret_imm16_unsigned},
+    {"test_x86_rorx_rip_relative_imm", test_x86_rorx_rip_relative_imm},
+    {"test_x86_shld_rip_relative_imm", test_x86_shld_rip_relative_imm},
+    {"test_x86_shrd_rip_relative_imm", test_x86_shrd_rip_relative_imm},
     {"test_x86_nested_emu_start", test_x86_nested_emu_start},
     {"test_x86_nested_emu_stop", test_x86_nested_emu_stop},
     {"test_x86_64_nested_emu_start_error", test_x86_64_nested_emu_start_error},

@@ -4640,6 +4640,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     goto illegal_op;
                 }
                 ot = mo_64_32(s->dflag);
+                s->rip_offset = 1;
                 gen_ldst_modrm(env, s, modrm, ot, OR_TMP0, 0);
                 b = x86_ldub_code(env, s);
                 if (ot == MO_64) {
@@ -6337,6 +6338,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         rm = (modrm & 7) | REX_B(s);
         reg = ((modrm >> 3) & 7) | rex_r;
         if (mod != 3) {
+            if (shift) {
+                s->rip_offset = 1;
+            }
             gen_lea_modrm(env, s, modrm);
             opreg = OR_TMP0;
         } else {
