@@ -29,6 +29,7 @@
 #include "exec/helper-proto.h"
 #include "qemu/atomic.h"
 #include "qemu/atomic128.h"
+#include "hw/core/tcg-cpu-ops.h"
 #include "translate-all.h"
 #include "exec/cpu-common.h"
 #include "trace/mem.h"
@@ -1003,7 +1004,6 @@ static inline ram_addr_t qemu_ram_addr_from_host_nofail(struct uc_struct *uc, vo
 static void tlb_fill(CPUState *cpu, target_ulong addr, int size,
                      MMUAccessType access_type, int mmu_idx, uintptr_t retaddr)
 {
-    CPUClass *cc = CPU_GET_CLASS(cpu);
 #ifndef NDEBUG
     bool ok;
 
@@ -1011,10 +1011,11 @@ static void tlb_fill(CPUState *cpu, target_ulong addr, int size,
      * This is not a probe, so only valid return is success; failure
      * should result in exception + longjmp to the cpu loop.
      */
-    ok = cc->tlb_fill(cpu, addr, size, access_type, mmu_idx, false, retaddr);
+    ok = cpu_tcg_tlb_fill(cpu, addr, size, access_type, mmu_idx,
+                          false, retaddr);
     assert(ok);
 #else
-    cc->tlb_fill(cpu, addr, size, access_type, mmu_idx, false, retaddr);
+    cpu_tcg_tlb_fill(cpu, addr, size, access_type, mmu_idx, false, retaddr);
 #endif
 }
 
@@ -1331,9 +1332,8 @@ bool tlb_vaddr_to_paddr(CPUArchState *env, abi_ptr addr,
 
         if (!victim_tlb_hit(env, mmu_idx, index, elt_ofs, page)) {
             CPUState *cs = env_cpu(env);
-            CPUClass *cc = CPU_GET_CLASS(cs);
-
-            if (!cc->tlb_fill(cs, addr, 0, access_type, mmu_idx, true, 0)) {
+            if (!cpu_tcg_tlb_fill(cs, addr, 0, access_type, mmu_idx, true,
+                                  0)) {
                 /* Non-faulting page table read failed.  */
                 return false;
             }
@@ -1378,9 +1378,8 @@ void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
 
         if (!victim_tlb_hit(env, mmu_idx, index, elt_ofs, page)) {
             CPUState *cs = env_cpu(env);
-            CPUClass *cc = CPU_GET_CLASS(cs);
-
-            if (!cc->tlb_fill(cs, addr, 0, access_type, mmu_idx, true, 0)) {
+            if (!cpu_tcg_tlb_fill(cs, addr, 0, access_type, mmu_idx, true,
+                                  0)) {
                 /* Non-faulting page table read failed.  */
                 return NULL;
             }
@@ -1422,8 +1421,8 @@ static void *atomic_mmu_lookup(CPUArchState *env, target_ulong addr,
     /* Enforce guest required alignment.  */
     if (unlikely(a_bits > 0 && (addr & ((1 << a_bits) - 1)))) {
         /* ??? Maybe indicate atomic op to cpu_unaligned_access */
-        cpu_unaligned_access(env_cpu(env), addr, MMU_DATA_STORE,
-                             mmu_idx, retaddr);
+        cpu_tcg_unaligned_access(env_cpu(env), addr, MMU_DATA_STORE,
+                                 mmu_idx, retaddr);
     }
 
     /* Enforce qemu required alignment.  */
@@ -1589,8 +1588,8 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
 
     /* Handle CPU specific unaligned behaviour */
     if (addr & ((1 << a_bits) - 1)) {
-        cpu_unaligned_access(env_cpu(env), addr, access_type,
-                             mmu_idx, retaddr);
+        cpu_tcg_unaligned_access(env_cpu(env), addr, access_type,
+                                 mmu_idx, retaddr);
     }
 
     /* If the TLB entry is for a different page, reload and try again.  */
@@ -2217,8 +2216,8 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
 
     /* Handle CPU specific unaligned behaviour */
     if (addr & ((1 << a_bits) - 1)) {
-        cpu_unaligned_access(env_cpu(env), addr, MMU_DATA_STORE,
-                             mmu_idx, retaddr);
+        cpu_tcg_unaligned_access(env_cpu(env), addr, MMU_DATA_STORE,
+                                 mmu_idx, retaddr);
     }
 
     /* If the TLB entry is for a different page, reload and try again.  */

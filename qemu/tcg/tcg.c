@@ -2147,6 +2147,19 @@ TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *old_op, TCGOpcode opc)
     return new_op;
 }
 
+void tcg_remove_ops_after(TCGContext *tcg_ctx, TCGOp *op)
+{
+    TCGOp *last;
+
+    for (;;) {
+        last = tcg_last_op(tcg_ctx);
+        if (last == op) {
+            return;
+        }
+        tcg_op_remove(tcg_ctx, last);
+    }
+}
+
 /* Reachable analysis : remove unreachable code.  */
 static void reachable_code_pass(TCGContext *s)
 {
