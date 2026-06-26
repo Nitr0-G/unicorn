@@ -1014,8 +1014,7 @@ target_ulong helper_rdhwr_synci_step(CPUMIPSState *env)
 target_ulong helper_rdhwr_cc(CPUMIPSState *env)
 {
     check_hwrena(env, 2, GETPC());
-    // return (int32_t)cpu_mips_get_count(env);
-    return 0;
+    return (int32_t)cpu_mips_get_count(env);
 }
 
 target_ulong helper_rdhwr_ccres(CPUMIPSState *env)

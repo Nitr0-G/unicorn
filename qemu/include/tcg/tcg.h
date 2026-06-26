@@ -708,6 +708,7 @@ struct TCGContext {
 
     /* qemu/target/i386/translate.c: global register indexes */
     TCGv cpu_cc_dst, cpu_cc_src, cpu_cc_src2;
+    TCGv cpu_eip;
     TCGv_i32 cpu_cc_op;
     TCGv cpu_regs[56]; // 16 GRP for x64
     /* only x86 need cpu_seg_base[]. */
@@ -1171,6 +1172,7 @@ TCGOp *tcg_emit_op(TCGContext *tcg_ctx, TCGOpcode opc);
 void tcg_op_remove(TCGContext *s, TCGOp *op);
 TCGOp *tcg_op_insert_before(TCGContext *s, TCGOp *op, TCGOpcode opc);
 TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op, TCGOpcode opc);
+void tcg_remove_ops_after(TCGContext *tcg_ctx, TCGOp *op);
 
 void tcg_optimize(TCGContext *s);
 
@@ -1182,6 +1184,13 @@ TCGv_vec tcg_const_zeros_vec(TCGContext *tcg_ctx, TCGType);
 TCGv_vec tcg_const_ones_vec(TCGContext *tcg_ctx, TCGType);
 TCGv_vec tcg_const_zeros_vec_matching(TCGContext *tcg_ctx, TCGv_vec);
 TCGv_vec tcg_const_ones_vec_matching(TCGContext *tcg_ctx, TCGv_vec);
+TCGv_vec tcg_constant_vec_matching(TCGContext *tcg_ctx, TCGv_vec match,
+                                   unsigned vece, int64_t val);
+
+#define tcg_constant_i32(tcg_ctx, val) tcg_const_i32(tcg_ctx, val)
+#define tcg_constant_i64(tcg_ctx, val) tcg_const_i64(tcg_ctx, val)
+#define tcg_constant_tl(tcg_ctx, val) tcg_const_tl(tcg_ctx, val)
+#define tcg_constant_ptr(tcg_ctx, val) tcg_const_ptr(tcg_ctx, val)
 
 #if UINTPTR_MAX == UINT32_MAX
 # define tcg_const_ptr(tcg_ctx, x)        ((TCGv_ptr)tcg_const_i32(tcg_ctx, (intptr_t)(x)))

@@ -580,6 +580,7 @@ add_library(arm-softmmu STATIC
     qemu/target/arm/helper.c
     qemu/target/arm/iwmmxt_helper.c
     qemu/target/arm/m_helper.c
+    qemu/target/arm/mve_helper.c
     qemu/target/arm/neon_helper.c
     qemu/target/arm/op_helper.c
     qemu/target/arm/psci.c
@@ -624,14 +625,18 @@ add_library(aarch64-softmmu STATIC
     qemu/target/arm/helper.c
     qemu/target/arm/iwmmxt_helper.c
     qemu/target/arm/m_helper.c
+    qemu/target/arm/mte_helper.c
+    qemu/target/arm/mve_helper.c
     qemu/target/arm/neon_helper.c
     qemu/target/arm/op_helper.c
     qemu/target/arm/pauth_helper.c
     qemu/target/arm/psci.c
+    qemu/target/arm/sme_helper.c
     qemu/target/arm/sve_helper.c
     qemu/target/arm/tlb_helper.c
     qemu/target/arm/translate-a64.c
     qemu/target/arm/translate.c
+    qemu/target/arm/translate-sme.c
     qemu/target/arm/translate-sve.c
     qemu/target/arm/vec_helper.c
     qemu/target/arm/vfp_helper.c
@@ -1024,6 +1029,8 @@ add_library(riscv32-softmmu STATIC
     ${UNICORN_ARCH_COMMON}
 
     qemu/target/riscv/cpu.c
+    qemu/target/riscv/bitmanip_helper.c
+    qemu/target/riscv/crypto_helper.c
     qemu/target/riscv/cpu_helper.c
     qemu/target/riscv/csr.c
     qemu/target/riscv/fpu_helper.c
@@ -1031,6 +1038,7 @@ add_library(riscv32-softmmu STATIC
     qemu/target/riscv/pmp.c
     qemu/target/riscv/translate.c
     qemu/target/riscv/unicorn.c
+    qemu/target/riscv/vector_helper.c
 )
 
 if(MSVC)
@@ -1057,6 +1065,8 @@ add_library(riscv64-softmmu STATIC
     ${UNICORN_ARCH_COMMON}
 
     qemu/target/riscv/cpu.c
+    qemu/target/riscv/bitmanip_helper.c
+    qemu/target/riscv/crypto_helper.c
     qemu/target/riscv/cpu_helper.c
     qemu/target/riscv/csr.c
     qemu/target/riscv/fpu_helper.c
@@ -1064,6 +1074,7 @@ add_library(riscv64-softmmu STATIC
     qemu/target/riscv/pmp.c
     qemu/target/riscv/translate.c
     qemu/target/riscv/unicorn.c
+    qemu/target/riscv/vector_helper.c
 )
 
 if(MSVC)
@@ -1195,6 +1206,7 @@ set(UNICORN_COMMON_SRCS
     qemu/util/getauxval.c
     qemu/util/guest-random.c
     qemu/util/host-utils.c
+    qemu/util/int128.c
     qemu/util/osdep.c
     qemu/util/qdist.c
     qemu/util/qemu-timer.c
@@ -1205,6 +1217,7 @@ set(UNICORN_COMMON_SRCS
     qemu/util/cacheinfo.c
 
     qemu/crypto/aes.c
+    qemu/crypto/sm4.c
 )
 
 # A workaround to avoid circle dependency between unicorn and *-softmmu
@@ -1486,7 +1499,24 @@ if(UNICORN_FUZZ)
 endif()
 
 if(UNICORN_BUILD_TESTS)
+    set(UNICORN_CTEST_PARALLEL_LEVEL "40" CACHE STRING
+        "Default CTest parallel job count")
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.17 AND NOT CMAKE_CTEST_ARGUMENTS)
+        set(CMAKE_CTEST_ARGUMENTS
+            "--parallel;${UNICORN_CTEST_PARALLEL_LEVEL};--output-on-failure"
+            CACHE STRING "Default arguments for the CTest build target")
+    endif()
     enable_testing()
+    set(UNICORN_PARALLEL_CTEST_COMMAND
+        ${CMAKE_CTEST_COMMAND}
+        "--parallel" "${UNICORN_CTEST_PARALLEL_LEVEL}"
+        "--output-on-failure")
+    if(CMAKE_CONFIGURATION_TYPES)
+        list(APPEND UNICORN_PARALLEL_CTEST_COMMAND "-C" "$<CONFIG>")
+    endif()
+    add_custom_target(test_parallel
+        COMMAND ${UNICORN_PARALLEL_CTEST_COMMAND}
+        USES_TERMINAL)
     foreach(SAMPLE_FILE ${UNICORN_SAMPLE_FILE})
         add_executable(${SAMPLE_FILE}
             ${CMAKE_CURRENT_SOURCE_DIR}/samples/${SAMPLE_FILE}.c
@@ -1494,9 +1524,9 @@ if(UNICORN_BUILD_TESTS)
         target_link_libraries(${SAMPLE_FILE} PRIVATE
             ${SAMPLES_LIB}
         )
-        endforeach()
+    endforeach()
 
-        foreach(TEST_FILE ${UNICORN_TEST_FILE})
+    foreach(TEST_FILE ${UNICORN_TEST_FILE})
         add_executable(${TEST_FILE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/${TEST_FILE}.c
         )
@@ -1516,6 +1546,9 @@ if(UNICORN_BUILD_TESTS)
             target_compile_definitions(${TEST_FILE} PRIVATE TARGET_READ_INLINED)
         endif()
     endforeach()
+    if(UNICORN_TEST_FILE)
+        add_dependencies(test_parallel ${UNICORN_TEST_FILE})
+    endif()
 endif()
 
 
