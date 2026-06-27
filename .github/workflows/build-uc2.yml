@@ -168,7 +168,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip --config ${{ env.BUILD_TYPE }}
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
           mv ${{ env.BUILD_TYPE }} instdir
 
       - name: '🛠️ Win MSVC 32 setup'
@@ -195,7 +195,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip --config ${{ env.BUILD_TYPE }}
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
           mv ${{ env.BUILD_TYPE }} instdir
 
       - name: '🚧 Win MINGW build'
@@ -224,7 +224,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '📦 Pack artifact'
         if: always()
@@ -312,7 +312,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '🚧 Android x86_64 build'
         if: contains(matrix.config.name, 'android')
@@ -474,7 +474,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '🚧 Linux aarch64 build'
         if: contains(matrix.config.arch, 'aarch64')
@@ -492,7 +492,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX:PATH=instdir
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '🚧 Linux ppc64le build'
         if: contains(matrix.config.arch, 'ppc64le')
@@ -518,7 +518,7 @@ jobs:
               -DCMAKE_INSTALL_PREFIX:PATH=/instdir
             cmake --build . --config ${{ env.BUILD_TYPE }}
             cmake --install . --strip
-            ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+            ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '📦 Pack artifact'
         if: always()
@@ -620,7 +620,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ env.BUILD_TYPE }}
+          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '📦 Pack artifact'
         if: always()
