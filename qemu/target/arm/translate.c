@@ -6501,8 +6501,6 @@ static int disas_neon_data_insn(DisasContext *s, uint32_t insn)
                     neon_store_reg(tcg_ctx, rd, 1, tmp2);
 
                     tcg_temp_free_i64(tcg_ctx, tmp64);
-                    tcg_temp_free_i32(tcg_ctx, tmp2);
-                    tcg_temp_free_i32(tcg_ctx, tmp);
                     tcg_temp_free_ptr(tcg_ctx, fpst);
                     return 0;
                 }
