@@ -821,16 +821,14 @@ struct TCGContext {
     bool use_lsx_instructions;
 };
 
-extern uintptr_t tcg_splitwx_diff;
-
 static inline const void *tcg_splitwx_to_rx(void *rw)
 {
-    return rw ? (void *)((uintptr_t)rw + tcg_splitwx_diff) : NULL;
+    return rw;
 }
 
 static inline void *tcg_splitwx_to_rw(const void *rx)
 {
-    return rx ? (void *)((uintptr_t)rx - tcg_splitwx_diff) : NULL;
+    return (void *)rx;
 }
 
 static inline size_t temp_idx(TCGContext *tcg_ctx, TCGTemp *ts)
