@@ -169,7 +169,7 @@ jobs:
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip --config ${{ env.BUILD_TYPE }}
           ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
-          mv ${{ env.BUILD_TYPE }} instdir
+          cmake -E copy_directory "${{ env.BUILD_TYPE }}" "instdir/${{ env.BUILD_TYPE }}"
 
       - name: '🛠️ Win MSVC 32 setup'
         if: contains(matrix.config.name, 'MSVC 32')
@@ -196,7 +196,7 @@ jobs:
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip --config ${{ env.BUILD_TYPE }}
           ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
-          mv ${{ env.BUILD_TYPE }} instdir
+          cmake -E copy_directory "${{ env.BUILD_TYPE }}" "instdir/${{ env.BUILD_TYPE }}"
 
       - name: '🚧 Win MINGW build'
         if: contains(matrix.config.mingw, 'MINGW')
