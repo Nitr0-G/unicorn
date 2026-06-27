@@ -1289,6 +1289,7 @@ GEN_STFS(stfd, st64_i64, 0x16, PPC_FLOAT);
 /* stfs stfsu stfsux stfsx */
 GEN_STFS(stfs, st32fs, 0x14, PPC_FLOAT);
 
+#if defined(TARGET_PPC64)
 static void gen_plfs(DisasContext *ctx)
 {
     TCGContext *tcg_ctx = ctx->uc->tcg_ctx;
@@ -1376,6 +1377,7 @@ static void gen_pstfd(DisasContext *ctx)
     tcg_temp_free(tcg_ctx, ea);
     tcg_temp_free_i64(tcg_ctx, t0);
 }
+#endif
 
 /* stfdepx (external PID lfdx) */
 static void gen_stfdepx(DisasContext *ctx)

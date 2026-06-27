@@ -490,7 +490,7 @@ static void test_ppc64_power10_vmx_mask_materialize_extract(void)
     uc_engine *uc;
     uint64_t b_addr = code_start + 0x1000;
     uint64_t expand_addr = code_start + 0x1100;
-    uint64_t h_addr = code_start + 0x1200;
+    uint64_t half_addr = code_start + 0x1200;
     uint64_t w_addr = code_start + 0x1300;
     uint64_t d_addr = code_start + 0x1400;
     uint64_t q_addr = code_start + 0x1500;
@@ -570,7 +570,7 @@ static void test_ppc64_power10_vmx_mask_materialize_extract(void)
     OK(uc_reg_write(uc, UC_PPC_REG_16, &q_addr));
     OK(uc_reg_write(uc, UC_PPC_REG_27, &b_addr));
     OK(uc_reg_write(uc, UC_PPC_REG_28, &expand_addr));
-    OK(uc_reg_write(uc, UC_PPC_REG_29, &h_addr));
+    OK(uc_reg_write(uc, UC_PPC_REG_29, &half_addr));
     OK(uc_reg_write(uc, UC_PPC_REG_30, &w_addr));
     OK(uc_reg_write(uc, UC_PPC_REG_31, &d_addr));
 
@@ -580,7 +580,7 @@ static void test_ppc64_power10_vmx_mask_materialize_extract(void)
     TEST_CHECK(memcmp(dst, expected_b, sizeof(dst)) == 0);
     OK(uc_mem_read(uc, expand_addr, dst, sizeof(dst)));
     TEST_CHECK(memcmp(dst, expected_b, sizeof(dst)) == 0);
-    OK(uc_mem_read(uc, h_addr, dst, sizeof(dst)));
+    OK(uc_mem_read(uc, half_addr, dst, sizeof(dst)));
     TEST_CHECK(memcmp(dst, expected_h, sizeof(dst)) == 0);
     OK(uc_mem_read(uc, w_addr, dst, sizeof(dst)));
     TEST_CHECK(memcmp(dst, expected_w, sizeof(dst)) == 0);
