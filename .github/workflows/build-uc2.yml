@@ -312,7 +312,30 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
+          set +e
           ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest_status=$?
+          set -e
+          if [ "$ctest_status" -ne 0 ]; then
+            echo "::group::macOS lldb diagnostics"
+            uname -a
+            sysctl -a | grep -E 'machdep.cpu.brand_string|hw.optional.arm' || true
+            for item in \
+              "./test_s390x --no-exec --verbose=3 test_s390x_mie2_branch_indirect" \
+              "./test_arm --no-exec --verbose=3 test_arm_bf16"; do
+              set -- $item
+              exe="$1"
+              shift
+              echo "lldb $exe $*"
+              xcrun lldb -b \
+                -o "run $*" \
+                -o "thread backtrace all" \
+                -o "register read" \
+                -- "$exe" || true
+            done
+            echo "::endgroup::"
+          fi
+          exit "$ctest_status"
 
       - name: '🚧 Android x86_64 build'
         if: contains(matrix.config.name, 'android')
