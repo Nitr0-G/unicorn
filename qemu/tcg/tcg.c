@@ -63,6 +63,8 @@
 
 #include <uc_priv.h>
 
+uintptr_t tcg_splitwx_diff;
+
 /* Forward declarations for functions declared in tcg-target.inc.c and
    used here. */
 static void tcg_target_init(TCGContext *s);
@@ -251,7 +253,7 @@ static void tcg_out_label(TCGContext *s, TCGLabel *l, tcg_insn_unit *ptr)
 {
     tcg_debug_assert(!l->has_value);
     l->has_value = 1;
-    l->u.value_ptr = ptr;
+    l->u.value_ptr = (tcg_insn_unit *)tcg_splitwx_to_rx(ptr);
 }
 
 TCGLabel *gen_new_label(TCGContext *s)
@@ -835,7 +837,7 @@ void tcg_prologue_init(TCGContext *s)
     s->code_ptr = buf0;
     s->code_buf = buf0;
     s->data_gen_ptr = NULL;
-    s->code_gen_prologue = buf0;
+    s->code_gen_prologue = (void *)tcg_splitwx_to_rx(buf0);
 
     /* Compute a high-water mark, at which we voluntarily flush the buffer
        and start over.  The size here is arbitrary, significantly larger
@@ -858,7 +860,7 @@ void tcg_prologue_init(TCGContext *s)
 #endif
 
     buf1 = s->code_ptr;
-    flush_idcache_range((uintptr_t)buf0, (uintptr_t)buf0,
+    flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(buf0), (uintptr_t)buf0,
                         (uintptr_t)buf1 - (uintptr_t)buf0);
 
     /* Deduct the prologue from the buffer.  */
@@ -869,7 +871,8 @@ void tcg_prologue_init(TCGContext *s)
     total_size -= prologue_size;
     s->code_gen_buffer_size = total_size;
 
-    tcg_register_jit(s, s->code_gen_buffer, total_size);
+    tcg_register_jit(s, (void *)tcg_splitwx_to_rx(s->code_gen_buffer),
+                     total_size);
 
     /* Assert that goto_ptr is implemented completely.  */
     if (TCG_TARGET_HAS_goto_ptr) {
@@ -3765,8 +3768,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     //tcg_dump_ops(s, false, "after opt4:");
     tcg_reg_alloc_start(s);
 
-    s->code_buf = tb->tc.ptr;
-    s->code_ptr = tb->tc.ptr;
+    s->code_buf = tcg_splitwx_to_rw(tb->tc.ptr);
+    s->code_ptr = s->code_buf;
 
 #ifdef TCG_TARGET_NEED_LDST_LABELS
     QSIMPLEQ_INIT(&s->ldst_labels);
@@ -3872,7 +3875,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
     }
 
     /* flush instruction cache */
-    flush_idcache_range((uintptr_t)s->code_buf, (uintptr_t)s->code_buf,
+    flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(s->code_buf),
+                        (uintptr_t)s->code_buf,
                         (uintptr_t)s->code_ptr - (uintptr_t)s->code_buf);
 
     return tcg_current_code_size(s);
