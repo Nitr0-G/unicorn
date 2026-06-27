@@ -1402,7 +1402,7 @@ static void tcg_out_brcond(TCGContext *s, TCGType ext, TCGCond c, TCGArg a,
         tcg_out_reloc(s, s->code_ptr, R_AARCH64_CONDBR19, l, 0);
         offset = tcg_in32(s) >> 5;
     } else {
-        offset = l->u.value_ptr - s->code_ptr;
+        offset = tcg_pcrel_diff(s, l->u.value_ptr) >> 2;
         tcg_debug_assert(offset == sextract64(offset, 0, 19));
     }
 
