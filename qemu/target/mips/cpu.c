@@ -31,7 +31,7 @@ static void mips_cpu_set_pc(CPUState *cs, vaddr value)
     CPUMIPSState *env = &cpu->env;
 
     env->active_tc.PC = value & ~(target_ulong)1;
-    if (value & 1) {
+    if ((value & 1) || (cs->uc->mode & UC_MODE_MICRO)) {
         env->hflags |= MIPS_HFLAG_M16;
     } else {
         env->hflags &= ~(MIPS_HFLAG_M16);
@@ -157,7 +157,7 @@ MIPSCPU *cpu_mips_init(struct uc_struct *uc)
     CPUClass *cc;
     CPUMIPSState *env;
 
-    cpu = qemu_memalign(8, sizeof(*cpu));
+    cpu = qemu_memalign(16, sizeof(*cpu));
     if (cpu == NULL) {
         return NULL;
     }

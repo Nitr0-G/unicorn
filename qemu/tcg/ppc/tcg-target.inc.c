@@ -1726,13 +1726,13 @@ static void tcg_out_mb(TCGContext *s, TCGArg a0)
     tcg_out32(s, insn);
 }
 
-void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
-                              uintptr_t addr)
+void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
+                              uintptr_t jmp_rw, uintptr_t addr)
 {
     if (TCG_TARGET_REG_BITS == 64) {
         tcg_insn_unit i1, i2;
         intptr_t tb_diff = addr - tc_ptr;
-        intptr_t br_diff = addr - (jmp_addr + 4);
+        intptr_t br_diff = addr - (jmp_rx + 4);
         uint64_t pair;
 
         /* This does not exercise the range of the branch, but we do
@@ -1756,13 +1756,13 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
 
         /* As per the enclosing if, this is ppc64.  Avoid the _Static_assert
            within atomic_set that would fail to build a ppc32 host.  */
-        atomic_set__nocheck((uint64_t *)jmp_addr, pair);
-        flush_icache_range(jmp_addr, jmp_addr + 8);
+        atomic_set__nocheck((uint64_t *)jmp_rw, pair);
+        flush_icache_range(jmp_rx, jmp_rx + 8);
     } else {
-        intptr_t diff = addr - jmp_addr;
+        intptr_t diff = addr - jmp_rx;
         tcg_debug_assert(in_range_b(diff));
-        atomic_set((uint32_t *)jmp_addr, B | (diff & 0x3fffffc));
-        flush_icache_range(jmp_addr, jmp_addr + 4);
+        atomic_set((uint32_t *)jmp_rw, B | (diff & 0x3fffffc));
+        flush_icache_range(jmp_rx, jmp_rx + 4);
     }
 }
 
@@ -1816,28 +1816,28 @@ static void tcg_out_call(TCGContext *s, tcg_insn_unit *target)
 #endif
 }
 
-static const uint32_t qemu_ldx_opc[16] = {
+static const uint32_t qemu_ldx_opc[(MO_SSIZE + MO_BSWAP) + 1] = {
     [MO_UB] = LBZX,
     [MO_UW] = LHZX,
     [MO_UL] = LWZX,
-    [MO_Q]  = LDX,
+    [MO_UQ] = LDX,
     [MO_SW] = LHAX,
     [MO_SL] = LWAX,
     [MO_BSWAP | MO_UB] = LBZX,
     [MO_BSWAP | MO_UW] = LHBRX,
     [MO_BSWAP | MO_UL] = LWBRX,
-    [MO_BSWAP | MO_Q]  = LDBRX,
+    [MO_BSWAP | MO_UQ] = LDBRX,
 };
 
-static const uint32_t qemu_stx_opc[16] = {
+static const uint32_t qemu_stx_opc[(MO_SIZE + MO_BSWAP) + 1] = {
     [MO_UB] = STBX,
     [MO_UW] = STHX,
     [MO_UL] = STWX,
-    [MO_Q]  = STDX,
+    [MO_UQ] = STDX,
     [MO_BSWAP | MO_UB] = STBX,
     [MO_BSWAP | MO_UW] = STHBRX,
     [MO_BSWAP | MO_UL] = STWBRX,
-    [MO_BSWAP | MO_Q]  = STDBRX,
+    [MO_BSWAP | MO_UQ] = STDBRX,
 };
 
 static const uint32_t qemu_exts_opc[4] = {

@@ -1829,11 +1829,11 @@ void tcg_register_jit(TCGContext *s, void *buf, size_t buf_size)
     tcg_register_jit_int(s, buf, buf_size, &debug_frame, sizeof(debug_frame));
 }
 
-void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
-                              uintptr_t addr)
+void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
+                              uintptr_t jmp_rw, uintptr_t addr)
 {
     intptr_t tb_disp = addr - tc_ptr;
-    intptr_t br_disp = addr - jmp_addr;
+    intptr_t br_disp = addr - jmp_rx;
     tcg_insn_unit i1, i2;
 
     /* We can reach the entire address space for ILP32.
@@ -1842,8 +1842,8 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
     tcg_debug_assert(br_disp == (int32_t)br_disp);
 
     if (!USE_REG_TB) {
-        atomic_set((uint32_t *)jmp_addr, deposit32(CALL, 0, 30, br_disp >> 2));
-        flush_icache_range(jmp_addr, jmp_addr + 4);
+        atomic_set((uint32_t *)jmp_rw, deposit32(CALL, 0, 30, br_disp >> 2));
+        flush_icache_range(jmp_rx, jmp_rx + 4);
         return;
     }
 
@@ -1866,6 +1866,6 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
               | INSN_IMM13((tb_disp & 0x3ff) | -0x400));
     }
 
-    atomic_set((uint64_t *)jmp_addr, deposit64(i2, 32, 32, i1));
-    flush_icache_range(jmp_addr, jmp_addr + 8);
+    atomic_set((uint64_t *)jmp_rw, deposit64(i2, 32, 32, i1));
+    flush_icache_range(jmp_rx, jmp_rx + 8);
 }
