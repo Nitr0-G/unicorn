@@ -1,8 +1,14 @@
 #include "unicorn_test.h"
 #include "uc_priv.h"
+#ifndef NEED_CPU_H
 #define NEED_CPU_H
+#define TEST_ARM_LOCAL_NEED_CPU_H
+#endif
 #include "target/arm/cpu.h"
+#ifdef TEST_ARM_LOCAL_NEED_CPU_H
 #undef NEED_CPU_H
+#undef TEST_ARM_LOCAL_NEED_CPU_H
+#endif
 #include <string.h>
 
 const uint64_t code_start = 0x1000;
