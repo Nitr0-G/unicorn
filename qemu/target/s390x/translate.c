@@ -138,6 +138,7 @@ struct DisasFields {
 struct DisasContext {
     DisasContextBase base;
     const DisasInsn *insn;
+    TCGOp *insn_start;
     DisasFields fields;
     uint64_t ex_value;
     /*
@@ -6823,8 +6824,8 @@ static DisasJumpType translate_one(CPUS390XState *env, DisasContext *s)
     /* Search for the insn in the table.  */
     insn = extract_insn(env, s);
 
-    /* Emit insn_start now that we know the ILEN.  */
-    tcg_gen_insn_start(tcg_ctx, s->base.pc_next, s->cc_op, s->ilen);
+    /* Update insn_start now that we know the ILEN.  */
+    tcg_set_insn_start_param(s->insn_start, 2, s->ilen);
 
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, s->base.pc_next)) {
@@ -6985,6 +6986,11 @@ static void s390x_tr_tb_start(DisasContextBase *db, CPUState *cs)
 
 static void s390x_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
 {
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+    TCGContext *tcg_ctx = dc->uc->tcg_ctx;
+
+    tcg_gen_insn_start(tcg_ctx, dc->base.pc_next, dc->cc_op, 0);
+    dc->insn_start = tcg_last_op(tcg_ctx);
 }
 
 static bool s390x_tr_breakpoint_check(DisasContextBase *dcbase, CPUState *cs,
@@ -7040,7 +7046,6 @@ static void s390x_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
 
     switch (dc->base.is_jmp) {
     case DISAS_UNICORN_HALT:
-        tcg_gen_insn_start(tcg_ctx, dc->base.pc_next, 0, 0);
         update_psw_addr(dc);
         update_cc_op(dc);
         gen_helper_uc_s390x_exit(tcg_ctx, tcg_ctx->cpu_env);
