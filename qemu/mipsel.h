@@ -110,7 +110,6 @@
 #define qemu_target_page_size qemu_target_page_size_mipsel
 #define qemu_target_page_bits qemu_target_page_bits_mipsel
 #define qemu_target_page_bits_min qemu_target_page_bits_min_mipsel
-#define target_page_bits_state target_page_bits_state_mipsel
 #define target_words_bigendian target_words_bigendian_mipsel
 #define cpu_physical_memory_is_io cpu_physical_memory_is_io_mipsel
 #define ram_block_discard_range ram_block_discard_range_mipsel

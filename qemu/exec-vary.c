@@ -26,10 +26,6 @@
 
 #include <uc_priv.h>
 
-#ifdef TARGET_PAGE_BITS_VARY
-TargetPageBits target_page_bits_state;
-#endif
-
 bool set_preferred_target_page_bits(struct uc_struct *uc, int bits)
 {
     /*
@@ -82,11 +78,9 @@ void finalize_target_page_bits(struct uc_struct *uc)
         page->decided = true;
     }
 
-    target_page_bits_state = *page;
-
     /*
      * For the benefit of an -flto build, prevent the compiler from hoisting
-     * a read from target_page_bits_state before we finish initializing.
+     * a read from the target page data before we finish initializing.
      */
     barrier();
 #endif

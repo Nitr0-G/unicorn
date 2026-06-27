@@ -98,6 +98,9 @@ static inline target_ulong tlb_addr_write(const CPUTLBEntry *entry)
 static inline uintptr_t tlb_index(CPUArchState *env, uintptr_t mmu_idx,
                                   target_ulong addr)
 {
+#ifdef TARGET_ARM
+    struct uc_struct *uc = env->uc;
+#endif
     uintptr_t size_mask = env_tlb(env)->f[mmu_idx].mask >> CPU_TLB_ENTRY_BITS;
 
     return (addr >> TARGET_PAGE_BITS) & size_mask;
