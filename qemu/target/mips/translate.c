@@ -37,7 +37,7 @@
 #define MIPS_DEBUG_DISAS 0
 
 /* MIPS major opcodes */
-#define MASK_OP_MAJOR(op)       (op & (0x3FUL << 26))
+#define MASK_OP_MAJOR(op)       (op & (0x3Fu << 26))
 
 enum {
     /* indirect opcode tables */
@@ -5953,12 +5953,14 @@ no_rd:
 static void gen_loongson_lswc2(DisasContext *ctx, int rt, int rs)
 {
     TCGContext *tcg_ctx = ctx->uc->tcg_ctx;
-    int rt1 = ctx->opcode & 0x1f;
-    int lsq_offset = sextract32(ctx->opcode, 6, 9) << 4;
     int shf_offset = sextract32(ctx->opcode, 6, 8);
     uint32_t opc = MASK_LOONGSON_GSLSQ(ctx->opcode);
     TCGv t0, t1, t2;
     TCGv_i32 fp0;
+#if defined(TARGET_MIPS64)
+    int rt1 = ctx->opcode & 0x1f;
+    int lsq_offset = sextract32(ctx->opcode, 6, 9) << 4;
+#endif
 
     switch (opc) {
 #if defined(TARGET_MIPS64)
