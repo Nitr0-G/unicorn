@@ -2538,6 +2538,7 @@ typedef struct DisasContext {
     target_ulong page_start;
     uint32_t opcode;
     uint64_t insn_flags;
+    int32_t CP0_Config0;
     int32_t CP0_Config1;
     int32_t CP0_Config2;
     int32_t CP0_Config3;
@@ -2571,6 +2572,11 @@ typedef struct DisasContext {
     // Unicorn
     struct uc_struct *uc;
 } DisasContext;
+
+static inline bool cpu_is_bigendian(DisasContext *ctx)
+{
+    return extract32(ctx->CP0_Config0, CP0C0_BE, 1);
+}
 
 #define DISAS_STOP       DISAS_TARGET_0
 #define DISAS_EXIT       DISAS_TARGET_1
@@ -6034,9 +6040,9 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt, int rs)
             t1 = tcg_temp_new(tcg_ctx);
             tcg_gen_qemu_ld_tl(tcg_ctx, t1, t0, ctx->mem_idx, MO_UB);
             tcg_gen_andi_tl(tcg_ctx, t1, t0, 3);
-#ifndef TARGET_WORDS_BIGENDIAN
-            tcg_gen_xori_tl(tcg_ctx, t1, t1, 3);
-#endif
+            if (!cpu_is_bigendian(ctx)) {
+                tcg_gen_xori_tl(tcg_ctx, t1, t1, 3);
+            }
             tcg_gen_shli_tl(tcg_ctx, t1, t1, 3);
             tcg_gen_andi_tl(tcg_ctx, t0, t0, ~3);
             tcg_gen_qemu_ld_tl(tcg_ctx, t0, t0, ctx->mem_idx, MO_TEUL);
@@ -6064,9 +6070,9 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt, int rs)
             t1 = tcg_temp_new(tcg_ctx);
             tcg_gen_qemu_ld_tl(tcg_ctx, t1, t0, ctx->mem_idx, MO_UB);
             tcg_gen_andi_tl(tcg_ctx, t1, t0, 3);
-#ifdef TARGET_WORDS_BIGENDIAN
-            tcg_gen_xori_tl(tcg_ctx, t1, t1, 3);
-#endif
+            if (cpu_is_bigendian(ctx)) {
+                tcg_gen_xori_tl(tcg_ctx, t1, t1, 3);
+            }
             tcg_gen_shli_tl(tcg_ctx, t1, t1, 3);
             tcg_gen_andi_tl(tcg_ctx, t0, t0, ~3);
             tcg_gen_qemu_ld_tl(tcg_ctx, t0, t0, ctx->mem_idx, MO_TEUL);
@@ -6096,9 +6102,9 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt, int rs)
             t1 = tcg_temp_new(tcg_ctx);
             tcg_gen_qemu_ld_tl(tcg_ctx, t1, t0, ctx->mem_idx, MO_UB);
             tcg_gen_andi_tl(tcg_ctx, t1, t0, 7);
-#ifndef TARGET_WORDS_BIGENDIAN
-            tcg_gen_xori_tl(tcg_ctx, t1, t1, 7);
-#endif
+            if (!cpu_is_bigendian(ctx)) {
+                tcg_gen_xori_tl(tcg_ctx, t1, t1, 7);
+            }
             tcg_gen_shli_tl(tcg_ctx, t1, t1, 3);
             tcg_gen_andi_tl(tcg_ctx, t0, t0, ~7);
             tcg_gen_qemu_ld_tl(tcg_ctx, t0, t0, ctx->mem_idx, MO_TEUQ);
@@ -6118,9 +6124,9 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt, int rs)
             t1 = tcg_temp_new(tcg_ctx);
             tcg_gen_qemu_ld_tl(tcg_ctx, t1, t0, ctx->mem_idx, MO_UB);
             tcg_gen_andi_tl(tcg_ctx, t1, t0, 7);
-#ifdef TARGET_WORDS_BIGENDIAN
-            tcg_gen_xori_tl(tcg_ctx, t1, t1, 7);
-#endif
+            if (cpu_is_bigendian(ctx)) {
+                tcg_gen_xori_tl(tcg_ctx, t1, t1, 7);
+            }
             tcg_gen_shli_tl(tcg_ctx, t1, t1, 3);
             tcg_gen_andi_tl(tcg_ctx, t0, t0, ~7);
             tcg_gen_qemu_ld_tl(tcg_ctx, t0, t0, ctx->mem_idx, MO_TEUQ);
@@ -31494,6 +31500,7 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->page_start = ctx->base.pc_first & TARGET_PAGE_MASK;
     ctx->saved_pc = -1;
     ctx->insn_flags = env->insn_flags;
+    ctx->CP0_Config0 = env->CP0_Config0;
     ctx->CP0_Config1 = env->CP0_Config1;
     ctx->CP0_Config2 = env->CP0_Config2;
     ctx->CP0_Config3 = env->CP0_Config3;
