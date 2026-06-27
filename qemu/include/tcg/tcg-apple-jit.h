@@ -77,8 +77,9 @@ static inline void assert_executable(bool executable) {
     uint64_t v = read_sprr_perm();
 
     if (!v) {
-        assert(executable == thread_executable());
+        return;
     }
+    assert(executable == thread_executable());
 }
 
 #else

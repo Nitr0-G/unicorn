@@ -110,6 +110,7 @@
 #define qemu_target_page_size qemu_target_page_size_s390x
 #define qemu_target_page_bits qemu_target_page_bits_s390x
 #define qemu_target_page_bits_min qemu_target_page_bits_min_s390x
+#define target_page_bits_state target_page_bits_state_s390x
 #define target_words_bigendian target_words_bigendian_s390x
 #define cpu_physical_memory_is_io cpu_physical_memory_is_io_s390x
 #define ram_block_discard_range ram_block_discard_range_s390x

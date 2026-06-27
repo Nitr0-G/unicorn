@@ -1386,11 +1386,11 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
     }
 }
 
-void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
-                              uintptr_t addr)
+void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
+                              uintptr_t jmp_rw, uintptr_t addr)
 {
     uintptr_t d_addr = addr;
-    ptrdiff_t d_disp = (ptrdiff_t)(d_addr - jmp_addr) >> 2;
+    ptrdiff_t d_disp = (ptrdiff_t)(d_addr - jmp_rx) >> 2;
     tcg_insn_unit insn;
 
     /* Either directly branch, or load slot address for indirect branch. */
@@ -1398,13 +1398,13 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_addr,
         insn = encode_sd10k16_insn(OPC_B, d_disp);
     } else {
         uintptr_t i_addr = addr;
-        intptr_t i_disp = i_addr - jmp_addr;
+        intptr_t i_disp = i_addr - jmp_rx;
         insn = encode_dsj20_insn(OPC_PCADDU2I, TCG_REG_TMP0, i_disp >> 2);
     }
 
-    *(tcg_insn_unit *)jmp_addr =  insn;
+    *(tcg_insn_unit *)jmp_rw =  insn;
     // flush_idcache_range(jmp_rx, jmp_rw, 4);
-    flush_icache_range(jmp_addr, jmp_addr + 8);
+    flush_icache_range(jmp_rx, jmp_rx + 8);
 }
 
 static void tcg_out_op(TCGContext *s, TCGOpcode opc,
