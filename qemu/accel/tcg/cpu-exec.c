@@ -200,7 +200,7 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
         uintptr_t offset = tb->jmp_target_arg[n];
         uintptr_t tc_ptr = (uintptr_t)tb->tc.ptr;
         uintptr_t jmp_rx = tc_ptr + offset;
-        uintptr_t jmp_rw = jmp_rx;
+        uintptr_t jmp_rw = (uintptr_t)tcg_splitwx_to_rw((void *)jmp_rx);
         tb_target_set_jmp_target(tc_ptr, jmp_rx, jmp_rw, addr);
     } else {
         tb->jmp_target_arg[n] = addr;

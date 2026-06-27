@@ -821,6 +821,18 @@ struct TCGContext {
     bool use_lsx_instructions;
 };
 
+extern uintptr_t tcg_splitwx_diff;
+
+static inline const void *tcg_splitwx_to_rx(void *rw)
+{
+    return rw ? (void *)((uintptr_t)rw + tcg_splitwx_diff) : NULL;
+}
+
+static inline void *tcg_splitwx_to_rw(const void *rx)
+{
+    return rx ? (void *)((uintptr_t)rx - tcg_splitwx_diff) : NULL;
+}
+
 static inline size_t temp_idx(TCGContext *tcg_ctx, TCGTemp *ts)
 {
     ptrdiff_t n = ts - tcg_ctx->temps;
@@ -1240,7 +1252,7 @@ static inline TCGLabel *arg_label(TCGArg i)
  * correct result.
  */
 
-static inline ptrdiff_t tcg_ptr_byte_diff(void *a, void *b)
+static inline ptrdiff_t tcg_ptr_byte_diff(const void *a, const void *b)
 {
     return (char *)a - (char *)b;
 }
@@ -1254,9 +1266,9 @@ static inline ptrdiff_t tcg_ptr_byte_diff(void *a, void *b)
  * to the destination address.
  */
 
-static inline ptrdiff_t tcg_pcrel_diff(TCGContext *s, void *target)
+static inline ptrdiff_t tcg_pcrel_diff(TCGContext *s, const void *target)
 {
-    return tcg_ptr_byte_diff(target, s->code_ptr);
+    return tcg_ptr_byte_diff(target, tcg_splitwx_to_rx(s->code_ptr));
 }
 
 /**
