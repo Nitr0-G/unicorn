@@ -3540,17 +3540,27 @@ static DisasJumpType op_vfpso(DisasContext *s, DisasOps *o)
     switch (fpf) {
     case FPF_SHORT:
         if (!se) {
-            switch (m5) {
-            case 0:
-                gen_gvec_fn_2i(tcg_ctx, xori, ES_32, v1, v2, 1ull << 31);
-                break;
-            case 1:
-                gen_gvec_fn_2i(tcg_ctx, ori, ES_32, v1, v2, 1ull << 31);
-                break;
-            case 2:
-                gen_gvec_fn_2i(tcg_ctx, andi, ES_32, v1, v2, (1ull << 31) - 1);
-                break;
+            TCGv_i32 tmp32 = tcg_temp_new_i32(tcg_ctx);
+            int i;
+
+            for (i = 0; i < 4; i++) {
+                read_vec_element_i32(tcg_ctx, tmp32, v2, i, ES_32);
+                switch (m5) {
+                case 0:
+                    tcg_gen_xori_i32(tcg_ctx, tmp32, tmp32,
+                                      (int32_t)0x80000000u);
+                    break;
+                case 1:
+                    tcg_gen_ori_i32(tcg_ctx, tmp32, tmp32,
+                                    (int32_t)0x80000000u);
+                    break;
+                case 2:
+                    tcg_gen_andi_i32(tcg_ctx, tmp32, tmp32, 0x7fffffff);
+                    break;
+                }
+                write_vec_element_i32(tcg_ctx, tmp32, v1, i, ES_32);
             }
+            tcg_temp_free_i32(tcg_ctx, tmp32);
             return DISAS_NEXT;
         }
         break;

@@ -1546,23 +1546,6 @@ if(UNICORN_BUILD_TESTS)
         target_link_libraries(${TEST_FILE} PRIVATE
             ${SAMPLES_LIB}
         )
-        if(TEST_FILE STREQUAL "test_arm")
-            if(MSVC)
-                target_compile_options(${TEST_FILE} PRIVATE
-                    -DNEED_CPU_H
-                    /FIarm.h
-                    /I${CMAKE_CURRENT_SOURCE_DIR}/msvc/arm-softmmu
-                    /I${CMAKE_CURRENT_SOURCE_DIR}/qemu/target/arm
-                )
-            else()
-                target_compile_options(${TEST_FILE} PRIVATE
-                    -DNEED_CPU_H
-                    -include arm.h
-                    -I${CMAKE_BINARY_DIR}/arm-softmmu
-                    -I${CMAKE_CURRENT_SOURCE_DIR}/qemu/target/arm
-                )
-            endif()
-        endif()
         add_test(${TEST_FILE} ${TEST_FILE})
         if(ANDROID_ABI)
             file(APPEND ${CMAKE_BINARY_DIR}/adb.sh "adb push ${TEST_FILE} /data/local/tmp/build/\n")
