@@ -1843,7 +1843,7 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
 
     if (!USE_REG_TB) {
         atomic_set((uint32_t *)jmp_rw, deposit32(CALL, 0, 30, br_disp >> 2));
-        flush_icache_range(jmp_rx, jmp_rx + 4);
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
         return;
     }
 
@@ -1867,5 +1867,5 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
     }
 
     atomic_set((uint64_t *)jmp_rw, deposit64(i2, 32, 32, i1));
-    flush_icache_range(jmp_rx, jmp_rx + 8);
+    flush_idcache_range(jmp_rx, jmp_rw, 8);
 }
