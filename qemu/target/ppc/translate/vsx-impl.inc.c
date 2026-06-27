@@ -345,10 +345,12 @@ static void gen_##name(DisasContext *ctx)                   \
 VSX_VECTOR_LOAD(lxv, ld_i64, 0)
 VSX_VECTOR_LOAD(lxvx, ld_i64, 1)
 
+#if defined(TARGET_PPC64)
 static int prefixed_8ls_xt(DisasContext *ctx)
 {
     return ((opc1(ctx->opcode) & 1) << 5) | rD(ctx->opcode);
 }
+#endif
 
 static int vsx_tsxp_rt(DisasContext *ctx)
 {
@@ -478,6 +480,7 @@ static void gen_lxvpx(DisasContext *ctx)
     tcg_temp_free_i64(tcg_ctx, xtl);
 }
 
+#if defined(TARGET_PPC64)
 static void gen_plxv(DisasContext *ctx, bool paired)
 {
     TCGContext *tcg_ctx = ctx->uc->tcg_ctx;
@@ -506,6 +509,7 @@ static void gen_plxv(DisasContext *ctx, bool paired)
     tcg_temp_free_i64(tcg_ctx, xth);
     tcg_temp_free_i64(tcg_ctx, xtl);
 }
+#endif
 
 #define VSX_VECTOR_STORE(name, op, indexed)                 \
 static void gen_##name(DisasContext *ctx)                   \
@@ -609,6 +613,7 @@ static void gen_stxvpx(DisasContext *ctx)
     tcg_temp_free_i64(tcg_ctx, xtl);
 }
 
+#if defined(TARGET_PPC64)
 static void gen_pstxv(DisasContext *ctx, bool paired)
 {
     TCGContext *tcg_ctx = ctx->uc->tcg_ctx;
@@ -637,6 +642,7 @@ static void gen_pstxv(DisasContext *ctx, bool paired)
     tcg_temp_free_i64(tcg_ctx, xth);
     tcg_temp_free_i64(tcg_ctx, xtl);
 }
+#endif
 
 static void gen_lxvrx(DisasContext *ctx, MemOp mop)
 {
@@ -782,6 +788,7 @@ static void gen_##name(DisasContext *ctx)                         \
 VSX_LOAD_SCALAR_DS(lxsd, ld64_i64)
 VSX_LOAD_SCALAR_DS(lxssp, ld32fs)
 
+#if defined(TARGET_PPC64)
 static void gen_plxsd(DisasContext *ctx)
 {
     TCGContext *tcg_ctx = ctx->uc->tcg_ctx;
@@ -837,6 +844,7 @@ static void gen_plxssp(DisasContext *ctx)
     tcg_temp_free_i64(tcg_ctx, xth);
     tcg_temp_free_i64(tcg_ctx, xtl);
 }
+#endif
 
 #define VSX_STORE_SCALAR(name, operation)                     \
 static void gen_##name(DisasContext *ctx)                     \
@@ -1017,6 +1025,7 @@ static void gen_##name(DisasContext *ctx)                         \
 VSX_STORE_SCALAR_DS(stxsd, st64_i64)
 VSX_STORE_SCALAR_DS(stxssp, st32fs)
 
+#if defined(TARGET_PPC64)
 static void gen_pstxsd(DisasContext *ctx)
 {
     TCGContext *tcg_ctx = ctx->uc->tcg_ctx;
@@ -1060,6 +1069,7 @@ static void gen_pstxssp(DisasContext *ctx)
     tcg_temp_free(tcg_ctx, ea);
     tcg_temp_free_i64(tcg_ctx, xth);
 }
+#endif
 
 static void gen_mfvsrwz(DisasContext *ctx)
 {
