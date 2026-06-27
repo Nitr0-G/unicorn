@@ -1403,8 +1403,7 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
     }
 
     *(tcg_insn_unit *)jmp_rw =  insn;
-    // flush_idcache_range(jmp_rx, jmp_rw, 4);
-    flush_icache_range(jmp_rx, jmp_rx + 8);
+    flush_idcache_range(jmp_rx, jmp_rw, 4);
 }
 
 static void tcg_out_op(TCGContext *s, TCGOpcode opc,

@@ -1364,7 +1364,7 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
     }
     pair = (uint64_t)i2 << 32 | i1;
     atomic_set((uint64_t *)jmp_rw, pair);
-    flush_icache_range(jmp_rx, jmp_rx + 8);
+    flush_idcache_range(jmp_rx, jmp_rw, 8);
 }
 
 static inline void tcg_out_goto_label(TCGContext *s, TCGLabel *l)

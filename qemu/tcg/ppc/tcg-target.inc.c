@@ -1757,12 +1757,12 @@ void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
         /* As per the enclosing if, this is ppc64.  Avoid the _Static_assert
            within atomic_set that would fail to build a ppc32 host.  */
         atomic_set__nocheck((uint64_t *)jmp_rw, pair);
-        flush_icache_range(jmp_rx, jmp_rx + 8);
+        flush_idcache_range(jmp_rx, jmp_rw, 8);
     } else {
         intptr_t diff = addr - jmp_rx;
         tcg_debug_assert(in_range_b(diff));
         atomic_set((uint32_t *)jmp_rw, B | (diff & 0x3fffffc));
-        flush_icache_range(jmp_rx, jmp_rx + 4);
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
     }
 }
 
