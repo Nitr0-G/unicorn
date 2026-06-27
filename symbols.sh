@@ -110,7 +110,6 @@ cpu_memory_rw_debug \
 qemu_target_page_size \
 qemu_target_page_bits \
 qemu_target_page_bits_min \
-target_page_bits_state \
 target_words_bigendian \
 cpu_physical_memory_is_io \
 ram_block_discard_range \

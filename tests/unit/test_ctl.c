@@ -196,6 +196,33 @@ static void test_uc_ctl_change_page_size(void)
     OK(uc_close(uc));
     OK(uc_close(uc2));
 }
+
+static void test_uc_ctl_arm_page_size_per_engine(void)
+{
+    uc_engine *uc4k;
+    uc_engine *uc1k;
+    uint32_t page_size;
+    uint32_t r0 = 0;
+    const char code[] = "\x01\x00\xa0\xe3";
+
+    OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc4k));
+    OK(uc_ctl_set_page_size(uc4k, 4096));
+    OK(uc_mem_map(uc4k, 0x1000, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc4k, 0x1000, code, sizeof(code) - 1));
+
+    OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc1k));
+    OK(uc_ctl_set_page_size(uc1k, 1024));
+    OK(uc_mem_map(uc1k, 0x400, 0x400, UC_PROT_ALL));
+
+    OK(uc_ctl_get_page_size(uc4k, &page_size));
+    TEST_CHECK(page_size == 4096);
+    OK(uc_emu_start(uc4k, 0x1000, 0x1000 + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc4k, UC_ARM_REG_R0, &r0));
+    TEST_CHECK(r0 == 1);
+
+    OK(uc_close(uc1k));
+    OK(uc_close(uc4k));
+}
 #endif
 
 // Test requires UC_ARCH_ARM64.
@@ -438,6 +465,8 @@ TEST_LIST = {
     {"test_uc_ctl_tb_cache", test_uc_ctl_tb_cache},
 #ifdef UNICORN_HAS_ARM
     {"test_uc_ctl_change_page_size", test_uc_ctl_change_page_size},
+    {"test_uc_ctl_arm_page_size_per_engine",
+     test_uc_ctl_arm_page_size_per_engine},
     {"test_uc_ctl_arm_cpu", test_uc_ctl_arm_cpu},
 #endif
 #ifdef UNICORN_HAS_ARM64

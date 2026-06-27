@@ -221,16 +221,15 @@ typedef struct TargetPageBits {
     int bits;
     target_long mask;
 } TargetPageBits;
-extern TargetPageBits target_page_bits_state;
 
 #ifdef CONFIG_DEBUG_TCG
 #define TARGET_PAGE_BITS \
-    ({ assert(target_page_bits_state.decided); target_page_bits_state.bits; })
+    ({ assert(uc->init_target_page->decided); uc->init_target_page->bits; })
 #define TARGET_PAGE_MASK \
-    ({ assert(target_page_bits_state.decided); target_page_bits_state.mask; })
+    ({ assert(uc->init_target_page->decided); uc->init_target_page->mask; })
 #else
-#define TARGET_PAGE_BITS   target_page_bits_state.bits
-#define TARGET_PAGE_MASK   target_page_bits_state.mask
+#define TARGET_PAGE_BITS   uc->init_target_page->bits
+#define TARGET_PAGE_MASK   uc->init_target_page->mask
 #endif
 #define TARGET_PAGE_SIZE   (-(int)TARGET_PAGE_MASK)
 #else
