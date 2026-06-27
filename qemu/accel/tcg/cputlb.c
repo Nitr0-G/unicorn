@@ -1529,6 +1529,49 @@ static inline void tlb_hook_state_restore(CPUArchState *env,
 #endif
 }
 
+static inline target_ulong tlb_addr_for_access(const CPUTLBEntry *entry,
+                                               MMUAccessType access_type)
+{
+    switch (access_type) {
+    case MMU_DATA_STORE:
+        return tlb_addr_write(entry);
+    case MMU_INST_FETCH:
+        return entry->addr_code;
+    case MMU_DATA_LOAD:
+    default:
+        return entry->addr_read;
+    }
+}
+
+static inline void tlb_revalidate_entry(CPUArchState *env, uintptr_t mmu_idx,
+                                        target_ulong addr, size_t size,
+                                        MMUAccessType access_type,
+                                        size_t tlb_off, uintptr_t retaddr,
+                                        uintptr_t *index,
+                                        CPUTLBEntry **entry,
+                                        target_ulong *tlb_addr)
+{
+    struct uc_struct *uc = env->uc;
+    target_ulong page = addr & TARGET_PAGE_MASK;
+
+    (void)uc;
+
+    *index = tlb_index(env, mmu_idx, addr);
+    *entry = tlb_entry(env, mmu_idx, addr);
+    *tlb_addr = tlb_addr_for_access(*entry, access_type);
+
+    if (!tlb_hit(env->uc, *tlb_addr, addr)) {
+        if (!victim_tlb_hit(env, mmu_idx, *index, tlb_off, page)) {
+            tlb_fill(env_cpu(env), addr, size, access_type, mmu_idx, retaddr);
+            *index = tlb_index(env, mmu_idx, addr);
+            *entry = tlb_entry(env, mmu_idx, addr);
+        }
+        *tlb_addr = tlb_addr_for_access(*entry, access_type);
+    }
+
+    *tlb_addr &= ~TLB_INVALID_MASK;
+}
+
 static inline uint64_t
 load_memop(const void *haddr, MemOp op)
 {
@@ -1651,18 +1694,9 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
 
         if (handled) {
             uc->invalid_error = UC_ERR_OK;
-            /* If the TLB entry is for a different page, reload and try again.  */
-            if (!tlb_hit(env->uc, tlb_addr, addr)) {
-                if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                                    addr & TARGET_PAGE_MASK)) {
-                    tlb_fill(env_cpu(env), addr, size,
-                             access_type, mmu_idx, retaddr);
-                    index = tlb_index(env, mmu_idx, addr);
-                    entry = tlb_entry(env, mmu_idx, addr);
-                }
-                tlb_addr = code_read ? entry->addr_code : entry->addr_read;
-                tlb_addr &= ~TLB_INVALID_MASK;
-            }
+            tlb_revalidate_entry(env, mmu_idx, addr, size, access_type,
+                                 tlb_off, retaddr, &index, &entry,
+                                 &tlb_addr);
             paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
             mr = uc->memory_mapping(uc, paddr);
             if (mr == NULL) {
@@ -1713,14 +1747,10 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
                     A better approach is not always invalidating tlb but this
                     might cause more chaos regarding re-entry (nested uc_emu_start).
         */
-        if (tlb_entry_is_empty(entry)) {
-            tlb_fill(env_cpu(env), addr, size,
-                        access_type, mmu_idx, retaddr);
-            index = tlb_index(env, mmu_idx, addr);
-            entry = tlb_entry(env, mmu_idx, addr);
-            tlb_addr = code_read ? entry->addr_code : entry->addr_read;
-            tlb_addr &= ~TLB_INVALID_MASK;
-        }
+        tlb_revalidate_entry(env, mmu_idx, addr, size, access_type, tlb_off,
+                             retaddr, &index, &entry, &tlb_addr);
+        paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+        mr = uc->memory_mapping(uc, paddr);
 
         // callback on non-readable memory
         if (mr != NULL && !(mr->perms & UC_PROT_READ)) {  //non-readable
@@ -1743,18 +1773,11 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
 
             if (handled) {
                 uc->invalid_error = UC_ERR_OK;
-                /* If the TLB entry is for a different page, reload and try again.  */
-                if (!tlb_hit(env->uc, tlb_addr, addr)) {
-                    if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                                        addr & TARGET_PAGE_MASK)) {
-                        tlb_fill(env_cpu(env), addr, size,
-                                 access_type, mmu_idx, retaddr);
-                        index = tlb_index(env, mmu_idx, addr);
-                        entry = tlb_entry(env, mmu_idx, addr);
-                    }
-                    tlb_addr = code_read ? entry->addr_code : entry->addr_read;
-                    tlb_addr &= ~TLB_INVALID_MASK;
-                }
+                tlb_revalidate_entry(env, mmu_idx, addr, size, access_type,
+                                     tlb_off, retaddr, &index, &entry,
+                                     &tlb_addr);
+                paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+                mr = uc->memory_mapping(uc, paddr);
                 tlb_hook_state_restore(env, &hook_state);
             } else {
                 uc->invalid_addr = paddr;
@@ -1791,6 +1814,11 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
 
             if (handled) {
                 uc->invalid_error = UC_ERR_OK;
+                tlb_revalidate_entry(env, mmu_idx, addr, size, access_type,
+                                     tlb_off, retaddr, &index, &entry,
+                                     &tlb_addr);
+                paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+                mr = uc->memory_mapping(uc, paddr);
                 tlb_hook_state_restore(env, &hook_state);
             } else {
                 uc->invalid_addr = paddr;
@@ -2245,6 +2273,10 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
                 break;
         }
         tlb_hook_state_restore(env, &hook_state);
+        tlb_revalidate_entry(env, mmu_idx, addr, size, MMU_DATA_STORE,
+                             tlb_off, retaddr, &index, &entry, &tlb_addr);
+        paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+        mr = uc->memory_mapping(uc, paddr);
     }
 
     // Unicorn: callback on invalid memory
@@ -2275,17 +2307,9 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
             return;
         } else {
             uc->invalid_error = UC_ERR_OK;
-            /* If the TLB entry is for a different page, reload and try again.  */
-            if (!tlb_hit(env->uc, tlb_addr, addr)) {
-                if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                    addr & TARGET_PAGE_MASK)) {
-                    tlb_fill(env_cpu(env), addr, size, MMU_DATA_STORE,
-                             mmu_idx, retaddr);
-                    index = tlb_index(env, mmu_idx, addr);
-                    entry = tlb_entry(env, mmu_idx, addr);
-                }
-                tlb_addr = tlb_addr_write(entry) & ~TLB_INVALID_MASK;
-            }
+            tlb_revalidate_entry(env, mmu_idx, addr, size, MMU_DATA_STORE,
+                                 tlb_off, retaddr, &index, &entry,
+                                 &tlb_addr);
             paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
             mr = uc->memory_mapping(uc, paddr);
             if (mr == NULL) {
@@ -2318,17 +2342,11 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
         }
 
         if (handled) {
-            /* If the TLB entry is for a different page, reload and try again.  */
-            if (!tlb_hit(env->uc, tlb_addr, addr)) {
-                if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
-                    addr & TARGET_PAGE_MASK)) {
-                    tlb_fill(env_cpu(env), addr, size, MMU_DATA_STORE,
-                             mmu_idx, retaddr);
-                    index = tlb_index(env, mmu_idx, addr);
-                    entry = tlb_entry(env, mmu_idx, addr);
-                }
-                tlb_addr = tlb_addr_write(entry) & ~TLB_INVALID_MASK;
-            }
+            tlb_revalidate_entry(env, mmu_idx, addr, size, MMU_DATA_STORE,
+                                 tlb_off, retaddr, &index, &entry,
+                                 &tlb_addr);
+            paddr = entry->paddr | (addr & ~TARGET_PAGE_MASK);
+            mr = uc->memory_mapping(uc, paddr);
             uc->invalid_error = UC_ERR_OK;
             tlb_hook_state_restore(env, &hook_state);
         } else {
