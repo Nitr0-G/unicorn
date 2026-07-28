@@ -523,6 +523,10 @@ else()
         -D_LARGEFILE_SOURCE
         -Wall
         -fPIC
+        # QEMU relies on wrapping signed arithmetic in many helpers (e.g. the
+        # MVE DO_ABD macro subtracts extremal operands), which is undefined
+        # behaviour without this. Upstream QEMU's configure passes it too.
+        -fwrapv
     )
     if (ATOMIC_LINKAGE_FIX)
         add_compile_options(
