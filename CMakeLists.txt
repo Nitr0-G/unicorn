@@ -564,6 +564,7 @@ set(UNICORN_ARCH_COMMON
     qemu/accel/tcg/tcg-all.c
     qemu/accel/tcg/tcg-runtime.c
     qemu/accel/tcg/tcg-runtime-gvec.c
+    qemu/accel/tcg/tb-maint.c
     qemu/accel/tcg/translate-all.c
     qemu/accel/tcg/translator.c
 
@@ -1084,6 +1085,7 @@ add_library(riscv32-softmmu STATIC
     qemu/target/riscv/crypto_helper.c
     qemu/target/riscv/cpu_helper.c
     qemu/target/riscv/csr.c
+    qemu/target/riscv/debug.c
     qemu/target/riscv/fpu_helper.c
     qemu/target/riscv/op_helper.c
     qemu/target/riscv/pmp.c
@@ -1120,6 +1122,7 @@ add_library(riscv64-softmmu STATIC
     qemu/target/riscv/crypto_helper.c
     qemu/target/riscv/cpu_helper.c
     qemu/target/riscv/csr.c
+    qemu/target/riscv/debug.c
     qemu/target/riscv/fpu_helper.c
     qemu/target/riscv/op_helper.c
     qemu/target/riscv/pmp.c

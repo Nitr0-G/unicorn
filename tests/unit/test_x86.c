@@ -1879,6 +1879,116 @@ static void test_x86_clear_empty_tb(void)
     OK(uc_close(uc));
 }
 
+typedef struct TbLoopStop_t {
+    unsigned int block_count;
+    unsigned int stop_at;
+} TbLoopStop;
+
+static void test_x86_tb_loop_stop_cb(uc_engine *uc, uint64_t address,
+                                     uint32_t size, void *user_data)
+{
+    TbLoopStop *stop = user_data;
+
+    stop->block_count++;
+    if (stop->block_count == stop->stop_at) {
+        OK(uc_emu_stop(uc));
+    }
+}
+
+static void test_x86_self_linked_tb_guest_smc(void)
+{
+    uc_engine *uc;
+    uc_hook hook;
+    char loop[] = "\xeb\xfe";
+    char smc[] = "\xc6\x05\x00\x10\x00\x00\x40"
+                 "\xc6\x05\x01\x10\x00\x00\x90";
+    TbLoopStop stop = {0, 2};
+    uint32_t eax = 0x1234;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, loop, sizeof(loop) - 1);
+    OK(uc_mem_write(uc, code_start + 0x1000, smc, sizeof(smc) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_BLOCK, test_x86_tb_loop_stop_cb,
+                   &stop, code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, -1, 0, 0));
+    TEST_CHECK(stop.block_count == 2);
+
+    OK(uc_emu_start(uc, code_start + 0x1000,
+                    code_start + 0x1000 + sizeof(smc) - 1, 0, 0));
+    stop.stop_at = 4;
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_emu_start(uc, code_start, code_start + 1, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x1235);
+    TEST_CHECK(stop.block_count == 3);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_two_page_tb_invalidation(void)
+{
+    const uint64_t tb_start = 0x1ffe;
+    uc_engine *uc;
+    char code[] = "\xb8\x11\x11\x11\x11";
+    char second_page_byte = '\x22';
+    char first_page_byte = '\x33';
+    uint32_t eax;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, 0x1000, 0x2000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, tb_start, code, sizeof(code) - 1));
+
+    OK(uc_emu_start(uc, tb_start, tb_start + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x11111111);
+
+    OK(uc_mem_write(uc, tb_start + 2, &second_page_byte, 1));
+    OK(uc_emu_start(uc, tb_start, tb_start + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x11112211);
+
+    OK(uc_mem_write(uc, tb_start + 1, &first_page_byte, 1));
+    OK(uc_emu_start(uc, tb_start, tb_start + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x11112233);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_tb_cache_engine_isolation(void)
+{
+    uc_engine *uc1;
+    uc_engine *uc2;
+    char code1[] = "\xb8\x11\x11\x11\x11";
+    char code2[] = "\xb8\x22\x22\x22\x22";
+    char replacement[] = "\xb8\x33\x33\x33\x33";
+    uint32_t eax;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc1));
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc2));
+    OK(uc_mem_map(uc1, code_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc2, code_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc1, code_start, code1, sizeof(code1) - 1));
+    OK(uc_mem_write(uc2, code_start, code2, sizeof(code2) - 1));
+
+    OK(uc_emu_start(uc1, code_start, code_start + sizeof(code1) - 1, 0, 0));
+    OK(uc_emu_start(uc2, code_start, code_start + sizeof(code2) - 1, 0, 0));
+
+    OK(uc_ctl_flush_tb(uc1));
+    OK(uc_mem_write(uc1, code_start, replacement, sizeof(replacement) - 1));
+    OK(uc_emu_start(uc1, code_start,
+                    code_start + sizeof(replacement) - 1, 0, 0));
+    OK(uc_reg_read(uc1, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x33333333);
+
+    OK(uc_emu_start(uc2, code_start, code_start + sizeof(code2) - 1, 0, 0));
+    OK(uc_reg_read(uc2, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 0x22222222);
+
+    OK(uc_close(uc1));
+    OK(uc_close(uc2));
+}
+
 typedef struct _HOOK_TCG_OP_RESULT {
     uint64_t address;
     uint64_t arg1;
@@ -2579,6 +2689,100 @@ static void test_x86_invalid_vex_l(void)
 
     uc_assert_err(UC_ERR_INSN_INVALID,
                   uc_emu_start(uc, 0, sizeof(code) / sizeof(code[0]), 0, 0));
+    OK(uc_close(uc));
+}
+
+typedef struct {
+    uint32_t count;
+    uint32_t intno;
+} X86IntrCapture;
+
+static void test_x86_intr_capture_cb(uc_engine *uc, uint32_t intno, void *data)
+{
+    X86IntrCapture *capture = (X86IntrCapture *)data;
+
+    capture->count++;
+    capture->intno = intno;
+    uc_emu_stop(uc);
+}
+
+static void test_x86_sse_aligned_access(void)
+{
+    const uint64_t data_addr = 0x200008;
+    const uint8_t code[] = {
+        0x0f, 0x11, 0x00, /* movups [rax], xmm0 */
+        0x0f, 0x29, 0x00, /* movaps [rax], xmm0 */
+    };
+    const uint8_t xmm0[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    const uint8_t sentinel[16] = {
+        0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+        0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    };
+    uint8_t memory[16];
+    X86IntrCapture capture = { 0 };
+    uc_engine *uc;
+    uc_hook hook;
+    uint64_t rax = data_addr;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_X86_HASWELL));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_mem_map(uc, 0x200000, 0x1000, UC_PROT_ALL));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_INTR, test_x86_intr_capture_cb,
+                   &capture, 1, 0));
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_XMM0, &xmm0));
+
+    OK(uc_emu_start(uc, code_start, code_start + 3, 0, 1));
+    OK(uc_mem_read(uc, data_addr, memory, sizeof(memory)));
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(memcmp(memory, xmm0, sizeof(memory)) == 0);
+
+    OK(uc_mem_write(uc, data_addr, sentinel, sizeof(sentinel)));
+    OK(uc_emu_start(uc, code_start + 3, code_start + sizeof(code), 0, 1));
+    OK(uc_mem_read(uc, data_addr, memory, sizeof(memory)));
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == 13);
+    TEST_CHECK(memcmp(memory, sentinel, sizeof(memory)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_data_watchpoint(void)
+{
+    const uint64_t data_addr = 0x200000;
+    const uint8_t code[] = {
+        0xc7, 0x00, 0x44, 0x33, 0x22, 0x11, /* mov dword ptr [rax], 0x11223344 */
+    };
+    const uint64_t dr7_write_len4 = 1 | (1U << 16) | (3U << 18);
+    X86IntrCapture capture = { 0 };
+    uint32_t memory = 0;
+    uint64_t dr6 = 0;
+    uint64_t rax = data_addr;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_map(uc, data_addr, 0x1000, UC_PROT_ALL));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_INTR, test_x86_intr_capture_cb,
+                   &capture, 1, 0));
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_DR0, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_DR7, &dr7_write_len4));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, data_addr, &memory, sizeof(memory)));
+    OK(uc_reg_read(uc, UC_X86_REG_DR6, &dr6));
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == 1);
+    TEST_CHECK(memory == 0x11223344);
+    TEST_CHECK((dr6 & 1) != 0);
+
     OK(uc_close(uc));
 }
 
@@ -3811,6 +4015,11 @@ TEST_LIST = {
     {"test_x86_qemu72_msr_state", test_x86_qemu72_msr_state},
     {"test_x86_clear_tb_cache", test_x86_clear_tb_cache},
     {"test_x86_clear_empty_tb", test_x86_clear_empty_tb},
+    {"test_x86_self_linked_tb_guest_smc", test_x86_self_linked_tb_guest_smc},
+    {"test_x86_two_page_tb_invalidation",
+     test_x86_two_page_tb_invalidation},
+    {"test_x86_tb_cache_engine_isolation",
+     test_x86_tb_cache_engine_isolation},
     {"test_x86_hook_tcg_op", test_x86_hook_tcg_op},
     {"test_x86_cmpxchg", test_x86_cmpxchg},
     {"test_x86_cmpxchg32_accumulator", test_x86_cmpxchg32_accumulator},
@@ -3836,6 +4045,8 @@ TEST_LIST = {
     {"test_x86_correct_address_in_long_jump_hook",
      test_x86_correct_address_in_long_jump_hook},
     {"test_x86_invalid_vex_l", test_x86_invalid_vex_l},
+    {"test_x86_sse_aligned_access", test_x86_sse_aligned_access},
+    {"test_x86_data_watchpoint", test_x86_data_watchpoint},
 #if !defined(TARGET_READ_INLINED) && defined(BOOST_LITTLE_ENDIAN)
     {"test_x86_unaligned_access", test_x86_unaligned_access},
     {"test_x86_64_unaligned_access", test_x86_64_unaligned_access},

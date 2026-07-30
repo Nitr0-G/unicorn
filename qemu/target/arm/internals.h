@@ -579,6 +579,9 @@ void hw_breakpoint_update_all(ARMCPU *cpu);
 /* Callback function for checking if a watchpoint should trigger. */
 bool arm_debug_check_watchpoint(CPUState *cs, CPUWatchpoint *wp);
 
+/* Callback function for checking if a breakpoint should trigger. */
+bool arm_debug_check_breakpoint(CPUState *cs);
+
 /* Adjust addresses (in BE32 mode) before testing against watchpoint
  * addresses.
  */
@@ -1276,6 +1279,7 @@ static inline uint64_t arm_mdcr_el2_eff(CPUARMState *env)
 typedef struct ARMCacheAttrs {
     unsigned int attrs:8; /* as in the MAIR register encoding */
     unsigned int shareability:2; /* as in the SH field of the VMSAv8-64 PTEs */
+    bool guarded:1; /* guarded bit of the VMSAv8-64 PTE */
 } ARMCacheAttrs;
 
 bool get_phys_addr(CPUARMState *env, target_ulong address,
