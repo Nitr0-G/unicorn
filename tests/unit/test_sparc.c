@@ -165,11 +165,119 @@ static void test_sparc32_unaligned_access_sets_fault_address(void)
     OK(uc_close(uc));
 }
 
+static void test_sparc32_delay_slot_count(void)
+{
+    const uint8_t code[] = {
+        0x10, 0x80, 0x00, 0x03, /* ba code_start + 0xc */
+        0x82, 0x10, 0x20, 0x01, /* mov 1, %g1 */
+        0x82, 0x10, 0x20, 0x02, /* mov 2, %g1 */
+        0x84, 0x10, 0x20, 0x03, /* mov 3, %g2 */
+    };
+    uc_engine *uc;
+    uint32_t g1 = 0;
+    uint32_t g2 = 0;
+    uint32_t pc = 0;
+
+    OK(uc_open(UC_ARCH_SPARC,
+               UC_MODE_SPARC32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 1));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G1, &g1));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G2, &g2));
+    OK(uc_reg_read(uc, UC_SPARC_REG_PC, &pc));
+    TEST_CHECK(g1 == 0);
+    TEST_CHECK(g2 == 0);
+    TEST_CHECK(pc == (uint32_t)(code_start + 4));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 2));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G1, &g1));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G2, &g2));
+    OK(uc_reg_read(uc, UC_SPARC_REG_PC, &pc));
+    TEST_CHECK(g1 == 1);
+    TEST_CHECK(g2 == 0);
+    TEST_CHECK(pc == (uint32_t)(code_start + 12));
+
+    OK(uc_close(uc));
+}
+
+static void test_sparc32_branch_always_annul(void)
+{
+    const uint8_t code[] = {
+        0x30, 0x80, 0x00, 0x03, /* ba,a code_start + 0xc */
+        0x82, 0x10, 0x20, 0x01, /* mov 1, %g1 */
+        0x82, 0x10, 0x20, 0x02, /* mov 2, %g1 */
+        0x84, 0x10, 0x20, 0x03, /* mov 3, %g2 */
+    };
+    uc_engine *uc;
+    uint32_t g1 = 0;
+    uint32_t g2 = 0;
+    uint32_t pc = 0;
+
+    OK(uc_open(UC_ARCH_SPARC,
+               UC_MODE_SPARC32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 1));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G1, &g1));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G2, &g2));
+    OK(uc_reg_read(uc, UC_SPARC_REG_PC, &pc));
+    TEST_CHECK(g1 == 0);
+    TEST_CHECK(g2 == 0);
+    TEST_CHECK(pc == (uint32_t)(code_start + 12));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 2));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G1, &g1));
+    OK(uc_reg_read(uc, UC_SPARC_REG_G2, &g2));
+    OK(uc_reg_read(uc, UC_SPARC_REG_PC, &pc));
+    TEST_CHECK(g1 == 0);
+    TEST_CHECK(g2 == 3);
+    TEST_CHECK(pc == (uint32_t)(code_start + sizeof(code)));
+
+    OK(uc_close(uc));
+}
+
+static void test_sparc32_context_roundtrip(void)
+{
+    uc_engine *uc;
+    uc_context *context;
+    uint32_t g1 = 0x11223344;
+    uint32_t pc = code_start + 0x20;
+    uint32_t changed = 0;
+
+    OK(uc_open(UC_ARCH_SPARC,
+               UC_MODE_SPARC32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_reg_write(uc, UC_SPARC_REG_G1, &g1));
+    OK(uc_reg_write(uc, UC_SPARC_REG_PC, &pc));
+    OK(uc_context_alloc(uc, &context));
+    OK(uc_context_save(uc, context));
+
+    OK(uc_reg_write(uc, UC_SPARC_REG_G1, &changed));
+    OK(uc_reg_write(uc, UC_SPARC_REG_PC, &changed));
+    OK(uc_context_restore(uc, context));
+
+    OK(uc_reg_read(uc, UC_SPARC_REG_G1, &changed));
+    TEST_CHECK(changed == g1);
+    OK(uc_reg_read(uc, UC_SPARC_REG_PC, &changed));
+    TEST_CHECK(changed == pc);
+
+    OK(uc_context_free(context));
+    OK(uc_close(uc));
+}
+
 TEST_LIST = {
         {"test_virtual_read", test_virtual_read},
         {"test_sparc32_public_registers", test_sparc32_public_registers},
         {"test_sparc64_public_registers", test_sparc64_public_registers},
         {"test_sparc32_unaligned_access_sets_fault_address",
          test_sparc32_unaligned_access_sets_fault_address},
+        {"test_sparc32_delay_slot_count",
+         test_sparc32_delay_slot_count},
+        {"test_sparc32_branch_always_annul",
+         test_sparc32_branch_always_annul},
+        {"test_sparc32_context_roundtrip",
+         test_sparc32_context_roundtrip},
         {NULL, NULL}
 };

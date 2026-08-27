@@ -117,6 +117,9 @@ void helper_cpuid(CPUX86State *env)
     HOOK_FOREACH(env->uc, hook, UC_HOOK_INSN) {
         if (hook->to_delete)
             continue;
+        if (hook->insn != UC_X86_INS_CPUID) {
+            continue;
+        }
         if (!HOOK_BOUND_CHECK(hook, env->eip))
             continue;
         
@@ -132,7 +135,7 @@ void helper_cpuid(CPUX86State *env)
         }
 
         // the last callback may already asked to stop emulation
-        if (env->uc->stop_request)
+        if (uc_stop_requested(env->uc))
             break;
     }
 
@@ -241,6 +244,9 @@ void helper_rdtsc(CPUX86State *env)
     HOOK_FOREACH(env->uc, hook, UC_HOOK_INSN) {
         if (hook->to_delete)
             continue;
+        if (hook->insn != UC_X86_INS_RDTSC) {
+            continue;
+        }
         if (!HOOK_BOUND_CHECK(hook, env->eip))
             continue;
 
@@ -256,7 +262,7 @@ void helper_rdtsc(CPUX86State *env)
         }
 
         // the last callback may already asked to stop emulation
-        if (env->uc->stop_request)
+        if (uc_stop_requested(env->uc))
             break;
     }
 
@@ -285,6 +291,9 @@ void helper_rdtscp(CPUX86State *env)
     HOOK_FOREACH(env->uc, hook, UC_HOOK_INSN) {
         if (hook->to_delete)
             continue;
+        if (hook->insn != UC_X86_INS_RDTSCP) {
+            continue;
+        }
         if (!HOOK_BOUND_CHECK(hook, env->eip))
             continue;
 
@@ -300,7 +309,7 @@ void helper_rdtscp(CPUX86State *env)
         }
 
         // the last callback may already asked to stop emulation
-        if (env->uc->stop_request)
+        if (uc_stop_requested(env->uc))
             break;
     }
 
@@ -341,6 +350,9 @@ void helper_wrmsr(CPUX86State *env)
     {
         if (hook->to_delete)
             continue;
+        if (hook->insn != UC_X86_INS_WRMSR) {
+            continue;
+        }
         if (!HOOK_BOUND_CHECK(hook, env->eip))
             continue;
         if (hook->insn == UC_X86_INS_WRMSR) {
@@ -353,7 +365,7 @@ void helper_wrmsr(CPUX86State *env)
                 skip_wrmsr,
                 ((uc_cb_insn_cpuid_t)hook->callback)(env->uc, hook->user_data));
         }
-        if (env->uc->stop_request)
+        if (uc_stop_requested(env->uc))
             break;
     }
 
@@ -578,6 +590,9 @@ void helper_rdmsr(CPUX86State *env)
     {
         if (hook->to_delete)
             continue;
+        if (hook->insn != UC_X86_INS_RDMSR) {
+            continue;
+        }
         if (!HOOK_BOUND_CHECK(hook, env->eip))
             continue;
         if (hook->insn == UC_X86_INS_RDMSR) {
@@ -590,7 +605,7 @@ void helper_rdmsr(CPUX86State *env)
                 skip_rdmsr,
                 ((uc_cb_insn_cpuid_t)hook->callback)(env->uc, hook->user_data));
         }
-        if (env->uc->stop_request)
+        if (uc_stop_requested(env->uc))
             break;
     }
 

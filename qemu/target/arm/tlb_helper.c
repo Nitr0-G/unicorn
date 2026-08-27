@@ -183,7 +183,7 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
          * pass in the exact addresses.
          */
         if (page_size >= TARGET_PAGE_SIZE) {
-            full.phys_addr &= TARGET_PAGE_MASK;
+            full.phys_addr &= ~((hwaddr)TARGET_PAGE_SIZE - 1);
             address &= TARGET_PAGE_MASK;
         }
         tlb_set_page_full(cs, mmu_idx, address, &full);

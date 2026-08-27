@@ -6657,7 +6657,7 @@ static void sve_probe_write_addr(CPUARMState *env, target_ulong addr,
     while (size > 0) {
         target_ulong page_left = -(addr | TARGET_PAGE_MASK);
         int probe_size = MIN(size, (int)page_left);
-        target_ulong paddr;
+        hwaddr paddr;
         MemoryRegion *mr;
 
         if (!tlb_vaddr_to_paddr(env, addr, MMU_DATA_STORE, mmu_idx, &paddr)) {
@@ -6696,7 +6696,7 @@ static bool sve_can_read_addr(CPUARMState *env, target_ulong addr,
     while (size > 0) {
         target_ulong page_left = -(addr | TARGET_PAGE_MASK);
         int probe_size = MIN(size, (int)page_left);
-        target_ulong paddr;
+        hwaddr paddr;
         MemoryRegion *mr;
 
         if (!tlb_vaddr_to_paddr(env, addr, MMU_DATA_LOAD, mmu_idx, &paddr)) {

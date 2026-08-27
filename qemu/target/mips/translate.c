@@ -30741,16 +30741,6 @@ static void decode_opc(CPUMIPSState *env, DisasContext *ctx)
         return;
     }
 
-    /* Handle blikely not taken case */
-    if ((ctx->hflags & MIPS_HFLAG_BMASK_BASE) == MIPS_HFLAG_BL) {
-        TCGLabel *l1 = gen_new_label(tcg_ctx);
-
-        tcg_gen_brcondi_tl(tcg_ctx, TCG_COND_NE, tcg_ctx->bcond, 0, l1);
-        tcg_gen_movi_i32(tcg_ctx, tcg_ctx->hflags, ctx->hflags & ~MIPS_HFLAG_BMASK);
-        gen_goto_tb(ctx, 1, ctx->base.pc_next + 4);
-        gen_set_label(tcg_ctx, l1);
-    }
-
     op = MASK_OP_MAJOR(ctx->opcode);
     rs = (ctx->opcode >> 21) & 0x1f;
     rt = (ctx->opcode >> 16) & 0x1f;
@@ -31601,6 +31591,17 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     dyn_is_slot = tcg_const_i32(tcg_ctx, 0);
     slot_op = tcg_last_op(tcg_ctx);
     tcg_gen_mov_i32(tcg_ctx, tcg_ctx->delay_slot_flag, dyn_is_slot);
+
+    /* Annul a not-taken branch-likely slot before instrumenting it. */
+    if ((ctx->hflags & MIPS_HFLAG_BMASK_BASE) == MIPS_HFLAG_BL) {
+        TCGLabel *l1 = gen_new_label(tcg_ctx);
+
+        tcg_gen_brcondi_tl(tcg_ctx, TCG_COND_NE, tcg_ctx->bcond, 0, l1);
+        tcg_gen_movi_i32(tcg_ctx, tcg_ctx->hflags,
+                        ctx->hflags & ~MIPS_HFLAG_BMASK);
+        gen_goto_tb(ctx, 1, ctx->base.pc_next + 4);
+        gen_set_label(tcg_ctx, l1);
+    }
 
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE, ctx->base.pc_next)) {

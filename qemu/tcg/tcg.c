@@ -343,6 +343,7 @@ void tcg_tb_insert(TCGContext *tcg_ctx, TranslationBlock *tb)
 
 void tcg_tb_remove(TCGContext *tcg_ctx, TranslationBlock *tb)
 {
+    tcg_restore_state_cache_remove(tcg_ctx, tb);
     g_tree_remove(tcg_ctx->tree, &tb->tc);
 }
 
@@ -376,6 +377,7 @@ size_t tcg_nb_tbs(TCGContext *tcg_ctx)
 
 static void tcg_region_tree_reset_all(TCGContext *tcg_ctx)
 {
+    tcg_restore_state_cache_clear(tcg_ctx);
     g_tree_ref(tcg_ctx->tree);
     g_tree_destroy(tcg_ctx->tree);
 }
@@ -672,54 +674,96 @@ static void process_op_defs(TCGContext *s);
 static TCGTemp *tcg_global_reg_new_internal(TCGContext *s, TCGType type,
                                             TCGReg reg, const char *name);
 
-void uc_add_inline_hook(uc_engine *uc, struct hook *hk, void** args, int args_len)
+typedef struct UCInlineHookInfoKey {
+    void *func;
+    unsigned flags;
+    unsigned typemask;
+} UCInlineHookInfoKey;
+
+static guint uc_inline_hook_info_hash(gconstpointer data)
 {
-    TCGHelperInfo* info = g_malloc(sizeof(TCGHelperInfo));
-    char *name = g_malloc(64);
+    const UCInlineHookInfoKey *key = data;
+    uint64_t func = (uintptr_t)key->func;
+
+    return (guint)(func ^ (func >> 32) ^ key->flags ^ key->typemask);
+}
+
+static gboolean uc_inline_hook_info_equal(gconstpointer a, gconstpointer b)
+{
+    const UCInlineHookInfoKey *key_a = a;
+    const UCInlineHookInfoKey *key_b = b;
+
+    return key_a->func == key_b->func && key_a->flags == key_b->flags &&
+           key_a->typemask == key_b->typemask;
+}
+
+static void uc_free_inline_hook_info(void *p)
+{
+    TCGHelperInfo *info = p;
+
+    g_free((void *)info->name);
+    g_free(info);
+}
+
+static TCGHelperInfo *uc_get_inline_hook_info(TCGContext *tcg_ctx, void *func,
+                                              unsigned flags,
+                                              unsigned typemask)
+{
+    UCInlineHookInfoKey lookup_key = { func, flags, typemask };
+    UCInlineHookInfoKey *stored_key;
+    TCGHelperInfo *info;
+
+    info = g_hash_table_lookup(tcg_ctx->custom_helper_infos, &lookup_key);
+    if (info == NULL) {
+        stored_key = g_new(UCInlineHookInfoKey, 1);
+        *stored_key = lookup_key;
+
+        info = g_new(TCGHelperInfo, 1);
+        info->func = func;
+        info->name = g_strdup_printf("hookcode_%" PRIxPTR, (uintptr_t)func);
+        info->flags = flags;
+        info->typemask = typemask;
+        g_hash_table_insert(tcg_ctx->custom_helper_infos, stored_key, info);
+    }
+
+    if (g_hash_table_lookup(tcg_ctx->helper_table, func) != info) {
+        g_hash_table_insert(tcg_ctx->helper_table, func, info);
+    }
+
+    return info;
+}
+
+void uc_add_inline_hook(uc_engine *uc, struct hook *hk, void **args,
+                        int args_len)
+{
+    TCGHelperInfo *info;
+    unsigned flags = 0;
     unsigned typemask = 0xFFFFFFFF;
     TCGContext *tcg_ctx = uc->tcg_ctx;
-    GHashTable *helper_table = uc->tcg_ctx->helper_table;
 
-    info->func = hk->callback;
-    info->name = name;
-    info->flags = 0; // From helper-head.h
-
-    // Only UC_HOOK_BLOCK and UC_HOOK_CODE is generated into tcg code and can be inlined.
+    /* Only block and code hooks are generated into TCG code. */
     switch (hk->type) {
     case UC_HOOK_BLOCK:
     case UC_HOOK_CODE:
-        // (*uc_cb_hookcode_t)(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
         typemask = dh_typemask(void, 0) | dh_typemask(ptr, 1) |
                    dh_typemask(i64, 2) | dh_typemask(i32, 3) |
                    dh_typemask(ptr, 4);
-        snprintf(name, 63, "hookcode_%d_%" PRIxPTR , hk->type, (uintptr_t)hk->callback);
         break;
 
     default:
         break;
     }
 
-    name[63] = 0;
-    info->name = name;
-    info->typemask = typemask;
+    info = uc_get_inline_hook_info(tcg_ctx, hk->callback, flags, typemask);
 
-    g_hash_table_insert(helper_table, (gpointer)info->func, (gpointer)info);
-    g_hash_table_insert(uc->tcg_ctx->custom_helper_infos, (gpointer)info->func, (gpointer)info);
-
-    tcg_gen_callN(tcg_ctx, info->func, NULL, args_len, (TCGTemp**)args);
-}
-
-static void uc_free_inline_hook_info(void *p)
-{
-    TCGHelperInfo *info = (TCGHelperInfo *)p;
-
-    g_free((void*)(info->name));
-    g_free(info);
+    tcg_gen_callN(tcg_ctx, info->func, NULL, args_len, (TCGTemp **)args);
 }
 
 void uc_del_inline_hook(uc_engine *uc, struct hook *hk)
 {
-    g_hash_table_remove(uc->tcg_ctx->custom_helper_infos, hk->callback);
+    /* Metadata is shared by hooks and remains valid until engine teardown. */
+    (void)uc;
+    (void)hk;
 }
 
 void tcg_context_init(TCGContext *s)
@@ -764,8 +808,11 @@ void tcg_context_init(TCGContext *s)
     helper_table = g_hash_table_new(NULL, NULL);
     s->helper_table = helper_table;
 
-    // Unicorn: Store our custom inline hooks infomation
-    s->custom_helper_infos = g_hash_table_new_full(NULL, NULL, NULL, uc_free_inline_hook_info);
+    /* Cache custom inline hook metadata for the lifetime of the engine. */
+    s->custom_helper_infos =
+        g_hash_table_new_full(uc_inline_hook_info_hash,
+                              uc_inline_hook_info_equal, g_free,
+                              uc_free_inline_hook_info);
 
     for (i = 0; i < ARRAY_SIZE(all_helpers); ++i) {
         g_hash_table_insert(helper_table, (gpointer)all_helpers[i].func,

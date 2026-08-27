@@ -1,126 +1,96 @@
-#include <stdlib.h>
+#include <inttypes.h>
 #include <stdio.h>
-#include <assert.h>
 
 #include <unicorn/unicorn.h>
 
-#define X86_CODE32 "\x9C\x68\xFF\xFE\xFF\xFF\x9D\x9C\x58\x9D" // pushf; push ffffffeff; popf; pushf; pop eax; popf
-#define ADDRESS 0x1000000
-#define PAGE_8K (1 << 13)
-#define PAGE_4K (1 << 12)
-#define TARGET_PAGE_MASK ~(PAGE_4K - 1)
-#define TARGET_PAGE_PREPARE(addr) (((addr) + PAGE_4K - 1) & TARGET_PAGE_MASK)
-#define TARGET_PAGE_ALIGN(addr) (addr - (TARGET_PAGE_PREPARE(addr) - addr) & TARGET_PAGE_MASK)
+#define CODE_ADDRESS UINT64_C(0x1000000)
+#define INITIAL_EFLAGS UINT32_C(0x00000206)
+#define POPPED_EFLAGS UINT32_C(0x00247ed7)
 
-#if defined(__i386__)
-typedef uint32_t puint;
-#define PRIX3264 PRIX32
-#else
-typedef uint64_t puint;
-#define PRIX3264 PRIX64
-#endif
-
-uint32_t realEflags(void)
+int main(void)
 {
-    puint val = 0;
-
-#if defined(__i386__)
-    puint i = 0xFFFFFEFF; //attempt to set ALL bits except trap flag.
-
-    __asm__("pushf\n\t"
-    "push %0\n\t"
-    "popf\n\t" 
-    "pushf\n\t"
-    "pop %0\n\t"
-    "popf"
-    : "=r"(val)
-    : "r"(i)
-    : "%0");
-#elif defined(__x86_64__)
-    puint i = 0xFFFFFEFF; //attempt to set ALL bits except trap flag.
-
-    __asm__("pushfq\n\t"
-    "pushq %0\n\t"
-    "popfq\n\t" 
-    "pushfq\n\t"
-    "popq %0\n\t"
-    "popfq"
-    : "=r"(val)
-    : "r"(i)
-    : "%0"); 
-#endif
-
-    printf("Real system eflags: 0x%08"PRIX3264"\n", val);
-
-    return (uint32_t)val & 0xFFFFFFFF;
-}
-
-static void VM_exec(void)
-{
-#if defined(__i386__) || defined(__x86_64__)
-    uc_engine *uc;
+    const uint8_t code[] = {
+        0x9c,                         /* pushfd */
+        0x68, 0xff, 0xfe, 0xff, 0xff, /* push 0xfffffeff */
+        0x9d,                         /* popfd */
+        0x9c,                         /* pushfd */
+        0x58,                         /* pop eax */
+        0x9d,                         /* popfd */
+    };
+    uint32_t eax = 0;
+    uint32_t eflags = INITIAL_EFLAGS;
+    uint32_t esp = (uint32_t)CODE_ADDRESS + 0x800;
+    uint32_t final_esp = 0;
+    uc_engine *uc = NULL;
     uc_err err;
-    unsigned int r_eax, eflags, r_esp, realflags = 0;
 
-    r_eax = 0;
-    r_esp = ADDRESS+0x100; //some safe distance from main code.
-    eflags = 0x00000206;
-
-    // Initialize emulator in X86-32bit mode
     err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc);
-    if(err)
-    {
-        printf("Failed on uc_open() with error returned: %s\n", uc_strerror(err));
-        return;
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_open failed: %s\n", uc_strerror(err));
+        return 1;
+    }
+    err = uc_ctl_set_cpu_model(uc, UC_CPU_X86_QEMU64);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_ctl_set_cpu_model failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_mem_map(uc, CODE_ADDRESS, 0x1000, UC_PROT_ALL);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_map failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code));
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_write failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_write(uc, UC_X86_REG_ESP, &esp);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_write(ESP) failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_write(EFLAGS) failed: %s\n", uc_strerror(err));
+        goto fail;
     }
 
-    err = uc_mem_map(uc, ADDRESS, (2 * 1024 * 1024), UC_PROT_ALL);
-    if(err != UC_ERR_OK)
-    {
-        printf("Failed to map memory %s\n", uc_strerror(err));
-        return;
+    err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code), 0, 0);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_emu_start failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_read(uc, UC_X86_REG_EAX, &eax);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_read(EAX) failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_read(EFLAGS) failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_read(uc, UC_X86_REG_ESP, &final_esp);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_read(ESP) failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    if (eax != POPPED_EFLAGS || eflags != INITIAL_EFLAGS || final_esp != esp) {
+        fprintf(stderr,
+                "unexpected flags state: EAX=0x%08" PRIx32
+                " EFLAGS=0x%08" PRIx32 " ESP=0x%08" PRIx32 "\n",
+                eax, eflags, final_esp);
+        goto fail;
     }
 
-    // write machine code to be emulated to memory
-    err = uc_mem_write(uc, ADDRESS, X86_CODE32, sizeof(X86_CODE32) - 1);
-    if(err != UC_ERR_OK)
-    {
-        printf("Failed to write emulation code to memory, quit!: %s(len %lu)\n", uc_strerror(err), (unsigned long)sizeof(X86_CODE32) - 1);
-        return;
+    err = uc_close(uc);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_close failed: %s\n", uc_strerror(err));
+        return 1;
     }
-
-    // initialize machine registers
-    uc_reg_write(uc, UC_X86_REG_EAX, &r_eax);
-    uc_reg_write(uc, UC_X86_REG_ESP, &r_esp); //make stack pointer point to already mapped memory so we don't need to hook.
-    uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags);
-
-    // emulate machine code in infinite time
-    err = uc_emu_start(uc, ADDRESS, ADDRESS + (sizeof(X86_CODE32) - 1), 0, 0);
-    if(err)
-    {
-        printf("Failed on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
-
-        uc_close(uc);
-        return;
-    }
-
-    uc_reg_read(uc, UC_X86_REG_EAX, &r_eax);
-    uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags);
-
-    uc_close(uc);
-
-    printf(">>> Emulation done. Below is the CPU context\n");
-    printf(">>> EAX = 0x%08X\n", r_eax);
-    printf(">>> EFLAGS = 0x%08X\n", eflags);
-
-    realflags = realEflags();
-
-    assert(r_eax == realflags);
-#endif
-}
-
-int main(int argc, char *argv[])
-{
-    VM_exec();
     return 0;
+
+fail:
+    uc_close(uc);
+    return 1;
 }

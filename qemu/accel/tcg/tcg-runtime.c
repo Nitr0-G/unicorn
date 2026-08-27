@@ -28,7 +28,9 @@
 #include "exec/cpu_ldst.h"
 #include "exec/exec-all.h"
 #include "exec/tb-lookup.h"
+#include "hw/core/tcg-cpu-ops.h"
 #include "tcg/tcg.h"
+#include "tcg/tcg-apple-jit.h"
 
 #include <uc_priv.h>
 
@@ -153,7 +155,8 @@ void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     uint32_t flags;
     struct uc_struct *uc = (struct uc_struct *)cpu->uc;
 
-    tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, curr_cflags());
+    tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags,
+                              curr_cflags(cpu->uc));
     if (tb == NULL) {
         return uc->tcg_ctx->code_gen_epilogue;
     }
@@ -169,7 +172,7 @@ void HELPER(emu_stop)(void *p)
 {
     uc_engine *uc = p;
 
-    uc->stop_request = true;
+    uc_set_stop_request(uc, true);
     break_translation_loop(uc);
 }
 
@@ -178,10 +181,49 @@ void HELPER(exit_atomic)(CPUArchState *env)
     cpu_loop_exit_atomic(env_cpu(env), GETPC());
 }
 
-void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
-    uc_engine *uc = p;
+void HELPER(uc_tracecode_single)(void *item, uint32_t size, void *handle,
+                                 uint64_t address)
+{
+    struct uc_struct *uc = handle;
+    struct list_item *cur = item;
+    struct hook *hook;
 
-    if (cpu_loop_exit_requested(uc->cpu) && !in_delay_slot) {
+    if (size == 0) {
+        return;
+    }
+    if (!uc_stop_requested(uc)) {
+        for (; cur != NULL && (hook = (struct hook *)cur->data);
+             cur = cur->next) {
+            if (HOOK_BOUND_CHECK(hook, (uint64_t)address)) {
+                JIT_CALLBACK_GUARD(((uc_cb_hookcode_t)hook->callback)(
+                    uc, address, size, hook->user_data));
+            }
+            if (uc_stop_requested(uc)) {
+                break;
+            }
+        }
+    }
+    if (cpu_loop_exit_requested(uc->cpu)) {
+        if (uc->nested_level == 1) {
+            tb_exec_unlock(uc);
+        }
+        qatomic_set(&uc->cpu->tcg_exit_req, 0);
+        if (uc->skip_sync_pc_on_exit) {
+            cpu_restore_icount(uc->cpu, GETPC());
+            uc->skip_sync_pc_on_exit = false;
+            cpu_loop_exit(uc->cpu);
+        } else {
+            cpu_loop_exit_restore(uc->cpu, GETPC());
+        }
+    }
+}
+
+void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot,
+                                void *tb_ptr, uint32_t num_insns) {
+    uc_engine *uc = p;
+    CPUState *cpu = uc->cpu;
+
+    if (cpu_loop_exit_requested(cpu) && !in_delay_slot) {
         // There are stil something we have to before exiting to be compatible with previous behaviors
 
         // from cpu_tb_exec
@@ -189,13 +231,38 @@ void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
             // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
             tb_exec_unlock(uc);
         }
-        uc->cpu->tcg_exit_req = 0;
+        qatomic_set(&cpu->tcg_exit_req, 0);
 
         if (uc->skip_sync_pc_on_exit) {
+            cpu_restore_icount(cpu, GETPC());
             uc->skip_sync_pc_on_exit = false;
-            cpu_loop_exit(uc->cpu);
+            cpu_loop_exit(cpu);
         } else {
-            cpu_loop_exit_restore(uc->cpu, GETPC());
+            cpu_loop_exit_restore(cpu, GETPC());
+        }
+    }
+
+    if (num_insns != 0 && uc->emu_count != 0) {
+        size_t remaining = cpu->icount_decr_ptr->u16.low + uc->emu_counter;
+
+        if (remaining >= num_insns) {
+            size_t chunk = MIN((size_t)UINT16_MAX, remaining);
+
+            cpu->icount_decr_ptr->u16.low = chunk - num_insns;
+            uc->emu_counter = remaining - chunk;
+        } else {
+            cpu_tcg_synchronize_from_tb(cpu, (TranslationBlock *)tb_ptr);
+            cpu->icount_decr_ptr->u16.low = remaining;
+            uc->emu_counter = 0;
+            if (remaining == 0) {
+                uc_set_stop_request(uc, true);
+            } else {
+                cpu->cflags_next_tb =
+                    CF_USE_ICOUNT | (uint32_t)remaining;
+                uc->quit_request = true;
+            }
+            cpu_exit(cpu);
+            cpu_loop_exit(cpu);
         }
     }
 }

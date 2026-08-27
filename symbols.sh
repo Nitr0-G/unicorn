@@ -5,6 +5,8 @@ SOURCE_DIR=$(dirname ${CMD_PATH})
 
 COMMON_SYMBOLS="
 gen_helper_check_exit_request \
+helper_uc_tracecode_single \
+cpu_restore_icount \
 unicorn_fill_tlb \
 reg_read \
 reg_write \
@@ -1371,6 +1373,7 @@ tcg_exec_init \
 tb_htable_init \
 tb_cleanup \
 tb_flush \
+tb_flush_jit \
 tb_phys_invalidate \
 tb_gen_code \
 tb_reset_jump \

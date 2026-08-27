@@ -133,7 +133,7 @@ def hook_syscall64(mu, user_data):
 
 
 # Test X86 32 bit
-def test_i386(mode, code):
+def run_i386(mode, code):
     if mode == UC_MODE_32:
         print("Emulate x86_32 code")
     elif mode == UC_MODE_64:
@@ -177,8 +177,8 @@ def test_i386(mode, code):
 
 
 if __name__ == '__main__':
-    test_i386(UC_MODE_32, X86_CODE32_SELF)
+    run_i386(UC_MODE_32, X86_CODE32_SELF)
     print("=" * 20)
-    test_i386(UC_MODE_32, X86_CODE32)
+    run_i386(UC_MODE_32, X86_CODE32)
     print("=" * 20)
-    test_i386(UC_MODE_64, X86_CODE64)
+    run_i386(UC_MODE_64, X86_CODE64)

@@ -207,14 +207,16 @@ static int encode_search(struct uc_struct *uc, TranslationBlock *tb, uint8_t *bl
  * When reset_icount is true, current TB will be interrupted and
  * icount should be recalculated.
  */
-int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
-                              uintptr_t searched_pc, bool reset_icount)
+static int cpu_unwind_state_data_from_tb(TranslationBlock *tb,
+                                         uintptr_t searched_pc,
+                                         target_ulong *data)
 {
-    target_ulong data[TARGET_INSN_START_WORDS] = { tb->pc };
     uintptr_t host_pc = (uintptr_t)tb->tc.ptr;
-    CPUArchState *env = cpu->env_ptr;
     uint8_t *p = (uint8_t *)tb->tc.ptr + tb->tc.size;
     int i, j, num_insns = tb->icount;
+
+    memset(data, 0, sizeof(*data) * TARGET_INSN_START_WORDS);
+    data[0] = tb->pc;
 
     searched_pc -= GETPC_ADJ;
 
@@ -230,25 +232,51 @@ int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
         }
         host_pc += decode_sleb128(&p);
         if (host_pc > searched_pc) {
-            goto found;
+            return num_insns - i;
         }
     }
     return -1;
+}
 
- found:
+static void cpu_restore_state_from_data(CPUState *cpu, TranslationBlock *tb,
+                                        target_ulong *data, int insns_left,
+                                        bool reset_icount)
+{
+    CPUArchState *env = cpu->env_ptr;
+
     if (reset_icount && (tb_cflags(tb) & CF_USE_ICOUNT)) {
         /* Reset the cycle counter to the start of the block
            and shift if to the number of actually executed instructions */
-        cpu_neg(cpu)->icount_decr.u16.low += num_insns - i;
+        cpu_neg(cpu)->icount_decr.u16.low += insns_left;
     }
     restore_state_to_opc(env, tb, data);
+}
+
+int cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
+                              uintptr_t searched_pc, bool reset_icount)
+{
+    target_ulong data[TARGET_INSN_START_WORDS];
+    int insns_left;
+
+    insns_left = cpu_unwind_state_data_from_tb(tb, searched_pc, data);
+    if (insns_left < 0) {
+        return -1;
+    }
+    cpu_restore_state_from_data(cpu, tb, data, insns_left, reset_icount);
 
     return 0;
+}
+
+static inline unsigned restore_state_cache_index(uintptr_t host_pc)
+{
+    return ((host_pc >> 4) ^ (host_pc >> 12)) &
+           (TCG_RESTORE_STATE_CACHE_SIZE - 1);
 }
 
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc, bool will_exit)
 {
     TCGContext *tcg_ctx = cpu->uc->tcg_ctx;
+    TCGRestoreStateCacheEntry *entry;
     TranslationBlock *tb;
     bool r = false;
     uintptr_t check_offset;
@@ -271,9 +299,34 @@ bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc, bool will_exit)
         (uintptr_t)uc->tcg_ctx->code_gen_buffer;
 
     if (check_offset < uc->tcg_ctx->code_gen_buffer_size) {
+        entry = &tcg_ctx->restore_state_cache[
+            restore_state_cache_index(host_pc)];
+        if (entry->host_pc == host_pc && entry->tb != NULL &&
+            !(tb_cflags(entry->tb) & CF_INVALID)) {
+            target_ulong data[TARGET_INSN_START_WORDS];
+
+            memcpy(data, entry->data, sizeof(data));
+            cpu_restore_state_from_data(cpu, entry->tb, data,
+                                        entry->insns_left, will_exit);
+            return true;
+        }
+
         tb = tcg_tb_lookup(tcg_ctx, host_pc);
         if (tb) {
-            cpu_restore_state_from_tb(cpu, tb, host_pc, will_exit);
+            target_ulong data[TARGET_INSN_START_WORDS];
+            int insns_left;
+
+            insns_left = cpu_unwind_state_data_from_tb(tb, host_pc, data);
+            if (insns_left >= 0) {
+                cpu_restore_state_from_data(cpu, tb, data, insns_left,
+                                            will_exit);
+                if (!(tb_cflags(tb) & (CF_NOCACHE | CF_INVALID))) {
+                    entry->host_pc = host_pc;
+                    entry->tb = tb;
+                    entry->insns_left = insns_left;
+                    memcpy(entry->data, data, sizeof(entry->data));
+                }
+            }
             if (tb_cflags(tb) & CF_NOCACHE) {
                 /* one-shot translation, invalidate it immediately */
                 tb_phys_invalidate(tcg_ctx, tb, -1);
@@ -284,6 +337,54 @@ bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc, bool will_exit)
     }
 
     return r;
+}
+
+bool cpu_restore_icount(CPUState *cpu, uintptr_t host_pc)
+{
+    TCGContext *tcg_ctx = cpu->uc->tcg_ctx;
+    TCGRestoreStateCacheEntry *entry;
+    TranslationBlock *tb;
+    uintptr_t check_offset;
+    target_ulong data[TARGET_INSN_START_WORDS];
+    int insns_left;
+
+    check_offset = (uintptr_t)tcg_splitwx_to_rw((void *)host_pc) -
+        (uintptr_t)tcg_ctx->code_gen_buffer;
+    if (check_offset >= tcg_ctx->code_gen_buffer_size) {
+        return false;
+    }
+
+    entry = &tcg_ctx->restore_state_cache[
+        restore_state_cache_index(host_pc)];
+    if (entry->host_pc == host_pc && entry->tb != NULL &&
+        !(tb_cflags(entry->tb) & CF_INVALID)) {
+        if (tb_cflags(entry->tb) & CF_USE_ICOUNT) {
+            cpu_neg(cpu)->icount_decr.u16.low += entry->insns_left;
+        }
+        return true;
+    }
+
+    tb = tcg_tb_lookup(tcg_ctx, host_pc);
+    if (tb == NULL) {
+        return false;
+    }
+    insns_left = cpu_unwind_state_data_from_tb(tb, host_pc, data);
+    if (insns_left < 0) {
+        return false;
+    }
+    if (tb_cflags(tb) & CF_USE_ICOUNT) {
+        cpu_neg(cpu)->icount_decr.u16.low += insns_left;
+    }
+    if (!(tb_cflags(tb) & (CF_NOCACHE | CF_INVALID))) {
+        entry->host_pc = host_pc;
+        entry->tb = tb;
+        entry->insns_left = insns_left;
+        memcpy(entry->data, data, sizeof(entry->data));
+    } else {
+        tb_phys_invalidate(tcg_ctx, tb, -1);
+        tcg_tb_remove(tcg_ctx, tb);
+    }
+    return true;
 }
 
 static void page_init(struct uc_struct *uc)
@@ -965,10 +1066,18 @@ static void uc_tb_flush(struct uc_struct *uc) {
     tb_exec_lock(uc);
 }
 
+static void uc_tb_flush_deferred(struct uc_struct *uc)
+{
+    tb_exec_unlock(uc);
+    tb_flush_jit(uc->cpu);
+    tb_exec_lock(uc);
+}
+
 static void uc_invalidate_tb(struct uc_struct *uc, uint64_t start_addr, size_t len) 
 {
     tb_page_addr_t start, end;
 
+    g_assert(uc->nested_level < UC_MAX_NESTED_JMP_LEVEL);
     uc->nested_level++;
     if (sigsetjmp(uc->jmp_bufs[uc->nested_level - 1], 0) != 0) {
         // We a get cpu fault in get_page_addr_code, ignore it.
@@ -1009,7 +1118,7 @@ static uc_err uc_gen_tb(struct uc_struct *uc, uint64_t addr, uc_tb *out_tb)
     uint32_t cflags = cpu->cflags_next_tb;
 
     if (cflags == -1) {
-        cflags = curr_cflags();
+        cflags = curr_cflags(uc);
     }
 
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
@@ -1079,6 +1188,7 @@ void tcg_exec_init(struct uc_struct *uc, uint32_t tb_size)
     uc->uc_invalidate_tb = uc_invalidate_tb;
     uc->uc_gen_tb = uc_gen_tb;
     uc->tb_flush = uc_tb_flush;
+    uc->tb_flush_deferred = uc_tb_flush_deferred;
 
     /* Inline hooks optimization */
     uc->add_inline_hook = uc_add_inline_hook;
@@ -1130,6 +1240,14 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb = tcg_tb_alloc(tcg_ctx);
     if (unlikely(!tb)) {
         /* flush must be done */
+        if (cpu->uc->tb_exec_depth != 0) {
+            cpu->uc->tb_flush_pending = true;
+            cpu->uc->invalid_error = UC_ERR_NOMEM;
+            mmap_unlock();
+            tb_flush_jit(cpu);
+            cpu->exception_index = EXCP_INTERRUPT;
+            cpu_loop_exit(cpu);
+        }
         tb_flush(cpu);
         mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */
@@ -1331,7 +1449,7 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 #endif
 
     /* Generate a new TB executing the I/O insn.  */
-    cpu->cflags_next_tb = curr_cflags() | CF_LAST_IO | n;
+    cpu->cflags_next_tb = curr_cflags(cpu->uc) | CF_LAST_IO | n;
 
     if (tb_cflags(tb) & CF_NOCACHE) {
         if (tb->orig_tb) {

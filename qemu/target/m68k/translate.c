@@ -5019,8 +5019,7 @@ DISAS_INSN(wdebug)
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
-    /* TODO: Implement wdebug.  */
-    cpu_abort(env_cpu(env), "WDEBUG not implemented");
+    gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
 }
 
 DISAS_INSN(trap)

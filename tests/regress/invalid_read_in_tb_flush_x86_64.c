@@ -1,27 +1,32 @@
 #include <unicorn/unicorn.h>
 
-#define HARDWARE_ARCHITECTURE UC_ARCH_X86
-#define HARDWARE_MODE UC_MODE_64
+#define ADDRESS 0x1000000
 
-#define MEMORY_STARTING_ADDRESS 0x1000000
-#define MEMORY_SIZE 2 * 1024 * 1024
-#define MEMORY_PERMISSIONS UC_PROT_READ
+int main(void)
+{
+    const uint8_t code[] = {0x90};
+    uint64_t rip = 0;
+    uc_engine *uc;
+    uc_err err;
 
-#define BINARY_CODE "\x90"
+    err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc);
+    if (err != UC_ERR_OK) {
+        return 1;
+    }
+    if (uc_mem_map(uc, ADDRESS, 0x200000, UC_PROT_READ) != UC_ERR_OK ||
+        uc_mem_write(uc, ADDRESS, code, sizeof(code)) != UC_ERR_OK) {
+        uc_close(uc);
+        return 1;
+    }
 
-int main(int argc, char **argv, char **envp) {
-  uc_engine *uc;
-  if (uc_open(HARDWARE_ARCHITECTURE, HARDWARE_MODE, &uc)) {
-    printf("uc_open(…) failed\n");
-    return 1;
-  }
-  uc_mem_map(uc, MEMORY_STARTING_ADDRESS, MEMORY_SIZE, MEMORY_PERMISSIONS);
-  if (uc_mem_write(uc, MEMORY_STARTING_ADDRESS, BINARY_CODE, sizeof(BINARY_CODE) - 1)) {
-    printf("uc_mem_write(…) failed\n");
-    return 1;
-  }
-  printf("uc_emu_start(…)\n");
-  uc_emu_start(uc, MEMORY_STARTING_ADDRESS, MEMORY_STARTING_ADDRESS + sizeof(BINARY_CODE) - 1, 0, 20);
-  printf("done\n");
-  return 0;
+    err = uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(code), 0, 1);
+    if (err != UC_ERR_FETCH_PROT ||
+        uc_reg_read(uc, UC_X86_REG_RIP, &rip) != UC_ERR_OK) {
+        uc_close(uc);
+        return 1;
+    }
+    if (uc_close(uc) != UC_ERR_OK) {
+        return 1;
+    }
+    return rip == ADDRESS ? 0 : 1;
 }

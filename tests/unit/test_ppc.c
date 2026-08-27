@@ -53,6 +53,261 @@ static void test_ppc32_add(void)
     OK(uc_close(uc));
 }
 
+static void run_ppc_instruction_count(uc_mode mode)
+{
+    static const size_t counts[] = {
+        1, 2, 3,
+        32766, 32767, 32768, 32769,
+        65534, 65535, 65536, 65537,
+        70000,
+    };
+    const char code[] =
+        "\x38\x63\x00\x01" /* addi r3,r3,1 */
+        "\x4b\xff\xff\xfc"; /* b .-4 */
+    uc_engine *uc;
+    size_t i;
+
+    uc_common_setup(&uc, UC_ARCH_PPC, mode | UC_MODE_BIG_ENDIAN,
+                    code, sizeof(code) - 1);
+
+    for (i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        uint64_t expected = (counts[i] + 1) / 2;
+
+        if (mode == UC_MODE_64) {
+            uint64_t pc;
+            uint64_t r3 = 0;
+
+            OK(uc_reg_write(uc, UC_PPC_REG_3, &r3));
+            OK(uc_emu_start(uc, code_start, 0, 0, counts[i]));
+            OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+            OK(uc_reg_read(uc, UC_PPC_REG_PC, &pc));
+            TEST_CHECK_(r3 == expected, "count=%zu r3=%llu",
+                        counts[i], (unsigned long long)r3);
+            TEST_CHECK_(pc == code_start + (counts[i] & 1) * 4,
+                        "count=%zu pc=0x%llx", counts[i],
+                        (unsigned long long)pc);
+        } else {
+            uint32_t pc;
+            uint32_t r3 = 0;
+
+            OK(uc_reg_write(uc, UC_PPC_REG_3, &r3));
+            OK(uc_emu_start(uc, code_start, 0, 0, counts[i]));
+            OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+            OK(uc_reg_read(uc, UC_PPC_REG_PC, &pc));
+            TEST_CHECK_(r3 == expected, "count=%zu r3=%u",
+                        counts[i], r3);
+            TEST_CHECK_(pc == code_start + (counts[i] & 1) * 4,
+                        "count=%zu pc=0x%x", counts[i], pc);
+        }
+    }
+
+    OK(uc_close(uc));
+}
+
+static void test_ppc32_instruction_count_boundary(void)
+{
+    run_ppc_instruction_count(UC_MODE_32);
+}
+
+static void test_ppc64_instruction_count_boundary(void)
+{
+    run_ppc_instruction_count(UC_MODE_64);
+}
+
+static void test_ppc32_reservation(void)
+{
+    const uint64_t data_address = 0x8000;
+    const uint64_t other_address = 0x9000;
+    const char code[] =
+        "\x7c\x60\x20\x28" /* lwarx r3,0,r4 */
+        "\x7c\xa0\x21\x2d" /* stwcx. r5,0,r4 */
+        "\x7c\xc0\x21\x2d" /* stwcx. r6,0,r4 */
+        "\x7c\x60\x20\x28" /* lwarx r3,0,r4 */
+        "\x7c\xa0\x39\x2d" /* stwcx. r5,0,r7 */
+        "\x7c\xc0\x21\x2d"; /* stwcx. r6,0,r4 */
+    const uint8_t initial[] = { 0x11, 0x22, 0x33, 0x44 };
+    const uint8_t other[] = { 0x55, 0x66, 0x77, 0x88 };
+    const uint8_t stored[] = { 0xaa, 0xbb, 0xcc, 0xdd };
+    uint8_t memory[sizeof(initial)];
+    uint32_t r3;
+    uint32_t r4 = (uint32_t)data_address;
+    uint32_t r5 = 0xaabbccdd;
+    uint32_t r6 = 0xdeadbeef;
+    uint32_t r7 = (uint32_t)other_address;
+    uint32_t cr0;
+    uint32_t xer = 0;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_PPC, UC_MODE_32 | UC_MODE_BIG_ENDIAN,
+                    code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x2000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, initial, sizeof(initial)));
+    OK(uc_mem_write(uc, other_address, other, sizeof(other)));
+    OK(uc_reg_write(uc, UC_PPC_REG_4, &r4));
+    OK(uc_reg_write(uc, UC_PPC_REG_5, &r5));
+    OK(uc_reg_write(uc, UC_PPC_REG_6, &r6));
+    OK(uc_reg_write(uc, UC_PPC_REG_7, &r7));
+    OK(uc_reg_write(uc, UC_PPC_REG_XER, &xer));
+
+    OK(uc_emu_start(uc, code_start, 0, 0, 2));
+    OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+    TEST_CHECK(r3 == 0x11223344);
+    TEST_CHECK(cr0 == 0x2);
+    TEST_CHECK(memcmp(memory, stored, sizeof(memory)) == 0);
+
+    OK(uc_emu_start(uc, code_start + 8, 0, 0, 1));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+    TEST_CHECK(cr0 == 0);
+    TEST_CHECK(memcmp(memory, stored, sizeof(memory)) == 0);
+
+    OK(uc_emu_start(uc, code_start + 12, 0, 0, 2));
+    OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, other_address, memory, sizeof(memory)));
+    TEST_CHECK(r3 == 0xaabbccdd);
+    TEST_CHECK(cr0 == 0);
+    TEST_CHECK(memcmp(memory, other, sizeof(memory)) == 0);
+
+    OK(uc_emu_start(uc, code_start + 20, 0, 0, 1));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+    TEST_CHECK(cr0 == 0);
+    TEST_CHECK(memcmp(memory, stored, sizeof(memory)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_ppc64_reservation(void)
+{
+    const uint64_t data_address = 0x8000;
+    const uint64_t other_address = 0x9000;
+    const char code[] =
+        "\x7c\x60\x20\xa8" /* ldarx r3,0,r4 */
+        "\x7c\xa0\x21\xad" /* stdcx. r5,0,r4 */
+        "\x7c\xc0\x21\xad" /* stdcx. r6,0,r4 */
+        "\x7c\x60\x20\xa8" /* ldarx r3,0,r4 */
+        "\x7c\xa0\x39\xad" /* stdcx. r5,0,r7 */
+        "\x7c\xc0\x21\xad"; /* stdcx. r6,0,r4 */
+    const uint8_t initial[] = {
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    };
+    const uint8_t other[] = {
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    };
+    const uint8_t stored[] = {
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+    };
+    uint8_t memory[sizeof(initial)];
+    uint64_t r3;
+    uint64_t r4 = data_address;
+    uint64_t r5 = 0xaabbccddeeff0011ull;
+    uint64_t r6 = 0xdeadbeefcafebabeull;
+    uint64_t r7 = other_address;
+    uint32_t cr0;
+    uint32_t xer = 0;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_PPC, UC_MODE_64 | UC_MODE_BIG_ENDIAN,
+                    code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x2000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, initial, sizeof(initial)));
+    OK(uc_mem_write(uc, other_address, other, sizeof(other)));
+    OK(uc_reg_write(uc, UC_PPC_REG_4, &r4));
+    OK(uc_reg_write(uc, UC_PPC_REG_5, &r5));
+    OK(uc_reg_write(uc, UC_PPC_REG_6, &r6));
+    OK(uc_reg_write(uc, UC_PPC_REG_7, &r7));
+    OK(uc_reg_write(uc, UC_PPC_REG_XER, &xer));
+
+    OK(uc_emu_start(uc, code_start, 0, 0, 2));
+    OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+    TEST_CHECK(r3 == 0x0123456789abcdefull);
+    TEST_CHECK(cr0 == 0x2);
+    TEST_CHECK(memcmp(memory, stored, sizeof(memory)) == 0);
+
+    OK(uc_emu_start(uc, code_start + 8, 0, 0, 1));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+    TEST_CHECK(cr0 == 0);
+    TEST_CHECK(memcmp(memory, stored, sizeof(memory)) == 0);
+
+    OK(uc_emu_start(uc, code_start + 12, 0, 0, 2));
+    OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, other_address, memory, sizeof(memory)));
+    TEST_CHECK(r3 == 0xaabbccddeeff0011ull);
+    TEST_CHECK(cr0 == 0);
+    TEST_CHECK(memcmp(memory, other, sizeof(memory)) == 0);
+
+    OK(uc_emu_start(uc, code_start + 20, 0, 0, 1));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR0, &cr0));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+    TEST_CHECK(cr0 == 0);
+    TEST_CHECK(memcmp(memory, stored, sizeof(memory)) == 0);
+
+    OK(uc_close(uc));
+}
+
+typedef struct PpcRestoreCacheHookData {
+    uint32_t expected_pc;
+    uint32_t count;
+} PpcRestoreCacheHookData;
+
+static void test_ppc_restore_cache_memory_hook(uc_engine *uc,
+                                               uc_mem_type type,
+                                               uint64_t address, int size,
+                                               int64_t value, void *user_data)
+{
+    PpcRestoreCacheHookData *data =
+        (PpcRestoreCacheHookData *)user_data;
+    uint32_t pc;
+
+    OK(uc_reg_read(uc, UC_PPC_REG_PC, &pc));
+    TEST_CHECK_(pc == data->expected_pc, "pc=0x%x", pc);
+    data->count++;
+}
+
+static void test_ppc32_memory_hook_restore_cache(void)
+{
+    const uint64_t data_address = 0x200000;
+    const char code[] = "\x80\x64\x00\x00"; /* lwz r3, 0(r4) */
+    const uint32_t expected = 0x11223344;
+    uint32_t memory_value = BEINT32(expected);
+    uint32_t r3;
+    uint32_t r4 = (uint32_t)data_address;
+    PpcRestoreCacheHookData data = {
+        .expected_pc = code_start,
+    };
+    size_t i;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_PPC, UC_MODE_32 | UC_MODE_BIG_ENDIAN,
+                    code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &memory_value,
+                    sizeof(memory_value)));
+    OK(uc_reg_write(uc, UC_PPC_REG_4, &r4));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_ppc_restore_cache_memory_hook, &data,
+                   data_address, data_address + sizeof(memory_value) - 1));
+
+    for (i = 0; i < 8; i++) {
+        OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1,
+                        0, 0));
+    }
+
+    OK(uc_reg_read(uc, UC_PPC_REG_3, &r3));
+    TEST_CHECK(r3 == expected);
+    TEST_CHECK(data.count == 8);
+
+    OK(uc_close(uc));
+}
+
 /* IBM AIX fadd/floating-add instruction reference. */
 static void test_ppc32_fadd(void)
 {
@@ -162,6 +417,162 @@ static void test_ppc32_cr(void)
     OK(uc_reg_read(uc, UC_PPC_REG_CR, &r_cr));
 
     TEST_CHECK(r_cr == 0x12345678);
+
+    OK(uc_close(uc));
+}
+
+static void ppc32_spe_setup(uc_engine **uc, uc_cpu_ppc cpu_model,
+                            const char *code, size_t code_size)
+{
+    uint32_t msr;
+
+    OK(uc_open(UC_ARCH_PPC, UC_MODE_32 | UC_MODE_BIG_ENDIAN, uc));
+    OK(uc_ctl_set_cpu_model(*uc, cpu_model));
+    OK(uc_mem_map(*uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(*uc, code_start, code, code_size));
+
+    OK(uc_reg_read(*uc, UC_PPC_REG_MSR, &msr));
+    msr |= 1u << 25; /* MSR[SPE] */
+    OK(uc_reg_write(*uc, UC_PPC_REG_MSR, &msr));
+    OK(uc_reg_read(*uc, UC_PPC_REG_MSR, &msr));
+    TEST_CHECK((msr & (1u << 25)) != 0);
+}
+
+static void test_ppc32_spe_vector_arithmetic_and_cr(void)
+{
+    const uint64_t data_address = 0x8000;
+    const char code[] =
+        "\x10\x83\x03\x01" /* evldd r4,0(r3) */
+        "\x10\xa3\x0b\x01" /* evldd r5,8(r3) */
+        "\x10\xc4\x2a\x00" /* evaddw r6,r4,r5 */
+        "\x10\xc3\x13\x21" /* evstdd r6,16(r3) */
+        "\x11\x84\x2a\x31"; /* evcmpgts cr3,r4,r5 */
+    const uint8_t operands[] = {
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+    };
+    const uint8_t expected[] = {
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    uint8_t result[sizeof(expected)];
+    uint32_t r3 = (uint32_t)data_address;
+    uint32_t r6;
+    uint32_t cr3;
+    uc_engine *uc;
+
+    ppc32_spe_setup(&uc, UC_CPU_PPC32_E500V2_V22, code,
+                    sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, operands, sizeof(operands)));
+    OK(uc_reg_write(uc, UC_PPC_REG_3, &r3));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1,
+                    0, 0));
+
+    OK(uc_reg_read(uc, UC_PPC_REG_6, &r6));
+    OK(uc_reg_read(uc, UC_PPC_REG_CR3, &cr3));
+    OK(uc_mem_read(uc, data_address + sizeof(operands), result,
+                   sizeof(result)));
+    TEST_CHECK_(r6 == 1, "r6=0x%08x", r6);
+    TEST_CHECK_(cr3 == 0xa, "cr3=0x%x", cr3);
+    TEST_CHECK_(memcmp(result, expected, sizeof(result)) == 0,
+                "result=%02x%02x%02x%02x%02x%02x%02x%02x",
+                result[0], result[1], result[2], result[3],
+                result[4], result[5], result[6], result[7]);
+
+    OK(uc_close(uc));
+}
+
+static void test_ppc32_spe_enable_and_model_gating(void)
+{
+    const char code[] = "\x10\xc4\x2a\x00"; /* evaddw r6,r4,r5 */
+    uint32_t r4 = 0xffffffff;
+    uint32_t r5 = 2;
+    uint32_t r6 = 0xdeadbeef;
+    uint32_t msr;
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_PPC, UC_MODE_32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_PPC32_E500V2_V22));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code) - 1));
+    OK(uc_reg_read(uc, UC_PPC_REG_MSR, &msr));
+    msr &= ~(1u << 25);
+    OK(uc_reg_write(uc, UC_PPC_REG_MSR, &msr));
+    OK(uc_reg_write(uc, UC_PPC_REG_4, &r4));
+    OK(uc_reg_write(uc, UC_PPC_REG_5, &r5));
+    OK(uc_reg_write(uc, UC_PPC_REG_6, &r6));
+
+    TEST_CHECK(uc_emu_start(uc, code_start,
+                            code_start + sizeof(code) - 1, 0, 0) ==
+               UC_ERR_EXCEPTION);
+    OK(uc_reg_read(uc, UC_PPC_REG_6, &r6));
+    TEST_CHECK(r6 == 0xdeadbeef);
+
+    OK(uc_close(uc));
+
+    r6 = 0xdeadbeef;
+    OK(uc_open(UC_ARCH_PPC, UC_MODE_32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_PPC32_E500MC));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code) - 1));
+    OK(uc_reg_read(uc, UC_PPC_REG_MSR, &msr));
+    msr |= 1u << 25;
+    OK(uc_reg_write(uc, UC_PPC_REG_MSR, &msr));
+    OK(uc_reg_read(uc, UC_PPC_REG_MSR, &msr));
+    TEST_CHECK((msr & (1u << 25)) == 0);
+    OK(uc_reg_write(uc, UC_PPC_REG_4, &r4));
+    OK(uc_reg_write(uc, UC_PPC_REG_5, &r5));
+    OK(uc_reg_write(uc, UC_PPC_REG_6, &r6));
+
+    TEST_CHECK(uc_emu_start(uc, code_start,
+                            code_start + sizeof(code) - 1, 0, 0) ==
+               UC_ERR_EXCEPTION);
+    OK(uc_reg_read(uc, UC_PPC_REG_6, &r6));
+    TEST_CHECK(r6 == 0xdeadbeef);
+
+    OK(uc_close(uc));
+}
+
+static void test_ppc32_spe_double_arithmetic(void)
+{
+    const uint64_t data_address = 0x8000;
+    const char code[] =
+        "\x10\x83\x03\x01" /* evldd r4,0(r3) */
+        "\x10\xa3\x0b\x01" /* evldd r5,8(r3) */
+        "\x10\xc4\x2a\xe0" /* efdadd r6,r4,r5 */
+        "\x10\xc3\x13\x21"; /* evstdd r6,16(r3) */
+    const uint8_t operands[] = {
+        0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x40, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    const uint8_t expected[] = {
+        0x40, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    uint8_t result[sizeof(expected)];
+    uint32_t r3 = (uint32_t)data_address;
+    uint32_t r4;
+    uint32_t r6;
+    uc_engine *uc;
+
+    ppc32_spe_setup(&uc, UC_CPU_PPC32_E500V2_V22, code,
+                    sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, operands, sizeof(operands)));
+    OK(uc_reg_write(uc, UC_PPC_REG_3, &r3));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1,
+                    0, 0));
+    OK(uc_reg_read(uc, UC_PPC_REG_4, &r4));
+    OK(uc_reg_read(uc, UC_PPC_REG_6, &r6));
+    OK(uc_mem_read(uc, data_address + sizeof(operands), result,
+                   sizeof(result)));
+    TEST_CHECK(r4 == 2);
+    TEST_CHECK(r6 == 1);
+    TEST_CHECK_(memcmp(result, expected, sizeof(result)) == 0,
+                "result=%02x%02x%02x%02x%02x%02x%02x%02x",
+                result[0], result[1], result[2], result[3],
+                result[4], result[5], result[6], result[7]);
 
     OK(uc_close(uc));
 }
@@ -4952,11 +5363,25 @@ static void test_ppc64_power9_xvp_rejected(void)
 }
 
 TEST_LIST = {{"test_ppc32_add", test_ppc32_add},
+             {"test_ppc32_instruction_count_boundary",
+              test_ppc32_instruction_count_boundary},
+             {"test_ppc64_instruction_count_boundary",
+              test_ppc64_instruction_count_boundary},
+             {"test_ppc32_reservation", test_ppc32_reservation},
+             {"test_ppc64_reservation", test_ppc64_reservation},
+             {"test_ppc32_memory_hook_restore_cache",
+              test_ppc32_memory_hook_restore_cache},
              {"test_ppc32_fadd", test_ppc32_fadd},
              {"test_ppc32_sc", test_ppc32_sc},
              {"test_ppc32_unaligned_access_sets_dar",
               test_ppc32_unaligned_access_sets_dar},
              {"test_ppc32_cr", test_ppc32_cr},
+             {"test_ppc32_spe_vector_arithmetic_and_cr",
+              test_ppc32_spe_vector_arithmetic_and_cr},
+             {"test_ppc32_spe_enable_and_model_gating",
+              test_ppc32_spe_enable_and_model_gating},
+             {"test_ppc32_spe_double_arithmetic",
+              test_ppc32_spe_double_arithmetic},
              {"test_ppc32_spr_time", test_ppc32_spr_time},
              {"test_ppc32_spr_mftb", test_ppc32_spr_mftb},
              {"test_ppc64_power10_brd", test_ppc64_power10_brd},

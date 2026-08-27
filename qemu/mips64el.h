@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _mips64el
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_mips64el
+#define helper_uc_tracecode_single helper_uc_tracecode_single_mips64el
+#define cpu_restore_icount cpu_restore_icount_mips64el
 #define unicorn_fill_tlb unicorn_fill_tlb_mips64el
 #define reg_read reg_read_mips64el
 #define reg_write reg_write_mips64el
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_mips64el
 #define tb_cleanup tb_cleanup_mips64el
 #define tb_flush tb_flush_mips64el
+#define tb_flush_jit tb_flush_jit_mips64el
 #define tb_phys_invalidate tb_phys_invalidate_mips64el
 #define tb_gen_code tb_gen_code_mips64el
 #define tb_reset_jump tb_reset_jump_mips64el

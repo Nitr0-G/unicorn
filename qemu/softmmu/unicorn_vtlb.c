@@ -121,7 +121,9 @@ bool unicorn_fill_tlb(CPUState *cs, vaddr address, int size,
     }
 
     if (ret) {
-        tlb_set_page(cs, address & TARGET_PAGE_MASK, e.paddr & TARGET_PAGE_MASK, perms_to_prot(e.perms), mmu_idx, TARGET_PAGE_SIZE);
+        tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                     e.paddr & ~((hwaddr)TARGET_PAGE_SIZE - 1),
+                     perms_to_prot(e.perms), mmu_idx, TARGET_PAGE_SIZE);
         return true;
     }
 

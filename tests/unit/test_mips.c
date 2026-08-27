@@ -12,6 +12,7 @@ const uint64_t code_len = 0x4000;
 
 #define MIPS_CP0_STATUS_FR (1u << 26)
 #define MIPS_CP0_STATUS_CU1 (1u << 29)
+#define MIPS_CP0_STATUS_MX (1u << 24)
 
 static uint32_t mips_bitswap32(uint32_t value)
 {
@@ -63,6 +64,15 @@ static void enable_mips64_fpu(uc_engine *uc)
 
     OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
     status |= MIPS_CP0_STATUS_FR | MIPS_CP0_STATUS_CU1;
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+}
+
+static void enable_mips32_dsp(uc_engine *uc)
+{
+    uint32_t status;
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= MIPS_CP0_STATUS_MX;
     OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
 }
 
@@ -148,6 +158,64 @@ static void test_mips_stop_at_delay_slot(void)
     // The branch instruction isn't committed and the PC is not updated.
     // Users is responsible to restart emulation at the branch instruction.
     TEST_CHECK(r_pc == code_start);
+
+    OK(uc_close(uc));
+}
+
+typedef struct MipsCodeTrace {
+    uint64_t address[3];
+    uint32_t size[3];
+    uint32_t count;
+} MipsCodeTrace;
+
+static void mips_code_trace_hook(uc_engine *uc, uint64_t address,
+                                 uint32_t size, void *user_data)
+{
+    MipsCodeTrace *trace = (MipsCodeTrace *)user_data;
+
+    (void)uc;
+    if (trace->count < 3) {
+        trace->address[trace->count] = address;
+        trace->size[trace->count] = size;
+    }
+    trace->count++;
+}
+
+static void test_mips_not_taken_branch_likely_code_hook(void)
+{
+    const uint32_t code[] = {
+        BEINT32(0x55090001), /* bnel t0, t1, +1 */
+        BEINT32(0x24420001), /* addiu v0, v0, 1 */
+        BEINT32(0x24630001), /* addiu v1, v1, 1 */
+    };
+    MipsCodeTrace trace = { 0 };
+    uc_engine *uc;
+    uc_hook hook;
+    uint32_t equal = 0x12345678;
+    uint32_t v0 = 0;
+    uint32_t v1 = 0;
+
+    uc_common_setup(&uc, UC_ARCH_MIPS,
+                    UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &equal));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T1, &equal));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, mips_code_trace_hook, &trace,
+                   1, 0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    TEST_CHECK(v0 == 0);
+    TEST_CHECK(v1 == 1);
+    TEST_CHECK_(trace.count == 2, "trace.count=%u", trace.count);
+    TEST_CHECK(trace.address[0] == code_start);
+    TEST_CHECK_(trace.address[1] == code_start + 8,
+                "trace.address[1]=0x%llx",
+                (unsigned long long)trace.address[1]);
+    TEST_CHECK(trace.size[0] == 4);
+    TEST_CHECK(trace.size[1] == 4);
 
     OK(uc_close(uc));
 }
@@ -343,6 +411,190 @@ static void test_mips_msa_w_reg_roundtrip(void)
     OK(uc_reg_write(uc, UC_MIPS_REG_W31, w31));
     OK(uc_reg_read(uc, UC_MIPS_REG_W31, out));
     TEST_CHECK(memcmp(out, w31, sizeof(w31)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_msa_addv_b(void)
+{
+    const uint8_t addv_code[] = {
+        0xce, 0x08, 0x02, 0x78, /* addv.b w3, w1, w2 */
+    };
+    const uint8_t enable_code[] = {
+        0x05, 0x80, 0x88, 0x40, /* mtc0 t0, Config5, 5 */
+        0xce, 0x08, 0x02, 0x78, /* addv.b w3, w1, w2 */
+    };
+    const uint8_t disable_code[] = {
+        0x05, 0x80, 0x88, 0x40, /* mtc0 t0, Config5, 5 */
+        0xce, 0x08, 0x02, 0x78, /* addv.b w3, w1, w2 */
+    };
+    const uint8_t lhs[16] = {
+        0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0x10, 0x20,
+        0x30, 0x40, 0x50, 0x60, 0x70, 0x90, 0xa0, 0xf0,
+    };
+    const uint8_t rhs[16] = {
+        0x01, 0xff, 0x01, 0x80, 0x02, 0x01, 0xf0, 0xe0,
+        0xd0, 0xc0, 0xb0, 0xa0, 0x90, 0x70, 0x60, 0x20,
+    };
+    uint8_t expected[16];
+    uint8_t result[16] = { 0 };
+    uint32_t status;
+    uint32_t t0;
+    uc_engine *uc;
+    size_t i;
+
+    for (i = 0; i < sizeof(expected); i++) {
+        expected[i] = (uint8_t)(lhs[i] + rhs[i]);
+    }
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, enable_code, sizeof(enable_code)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= (1u << 29) | (1u << 26);
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    t0 = 1u << 27;
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &t0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W1, lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W2, rhs));
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(enable_code), 0, 0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_W3, result));
+    TEST_CHECK(memcmp(result, expected, sizeof(expected)) == 0);
+    OK(uc_close(uc));
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, disable_code, sizeof(disable_code)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= (1u << 29) | (1u << 26);
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    t0 = 0;
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &t0));
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start,
+                               code_start + sizeof(disable_code), 0, 0));
+    OK(uc_close(uc));
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_24KC));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, addv_code, sizeof(addv_code)));
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start,
+                               code_start + sizeof(addv_code), 0, 0));
+    OK(uc_close(uc));
+}
+
+static void test_mips_dsp_arithmetic_control(void)
+{
+    uc_engine *uc;
+    uint32_t control = 0x0b004aaa;
+    uint32_t control_result = 0;
+    uint32_t packed_lhs = 0xff00ff80;
+    uint32_t packed_rhs = 0x02030190;
+    uint32_t add_lhs = UINT32_MAX;
+    uint32_t add_rhs = 1;
+    uint32_t packed_result = 0;
+    uint32_t saturated_result = 0;
+    uint32_t add_result = UINT32_MAX;
+    uint32_t flags = 0;
+    uint32_t code[] = {
+        BEINT32(0x7d01fcf8), /* wrdsp t0, 0x3f */
+        BEINT32(0x7c3f4cb8), /* rddsp t1, 0x3f */
+        BEINT32(0x7d4b6010), /* addu.qb t4, t2, t3 */
+        BEINT32(0x7d4b6910), /* addu_s.qb t5, t2, t3 */
+        BEINT32(0x7dcf8410), /* addsc s0, t6, t7 */
+        BEINT32(0x7c0c8cb8), /* rddsp s1, 0x0c */
+    };
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_74KF));
+    enable_mips32_dsp(uc);
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &control));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T2, &packed_lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T3, &packed_rhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T6, &add_lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T7, &add_rhs));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_T1, &control_result));
+    OK(uc_reg_read(uc, UC_MIPS_REG_T4, &packed_result));
+    OK(uc_reg_read(uc, UC_MIPS_REG_T5, &saturated_result));
+    OK(uc_reg_read(uc, UC_MIPS_REG_S0, &add_result));
+    OK(uc_reg_read(uc, UC_MIPS_REG_S1, &flags));
+
+    TEST_CHECK(control_result == control);
+    TEST_CHECK(packed_result == 0x01030010);
+    TEST_CHECK(saturated_result == 0xff03ffff);
+    TEST_CHECK(add_result == 0);
+    TEST_CHECK(flags == ((1u << 20) | (1u << 13)));
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_dsp_accumulator(void)
+{
+    uc_engine *uc;
+    uint32_t acc_hi = 1;
+    uint32_t acc_lo = 0xfffffffe;
+    uint32_t lhs = 0x00020003;
+    uint32_t rhs = 0x00040005;
+    uint32_t result_hi = 0;
+    uint32_t result_lo = 0;
+    uint32_t code[] = {
+        BEINT32(0x01000811), /* mthi t0, ac1 */
+        BEINT32(0x01200813), /* mtlo t1, ac1 */
+        BEINT32(0x7d4b0830), /* dpa.w.ph ac1, t2, t3 */
+        BEINT32(0x00206010), /* mfhi t4, ac1 */
+        BEINT32(0x00206812), /* mflo t5, ac1 */
+    };
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_74KF));
+    enable_mips32_dsp(uc);
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &acc_hi));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T1, &acc_lo));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T2, &lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T3, &rhs));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_T4, &result_hi));
+    OK(uc_reg_read(uc, UC_MIPS_REG_T5, &result_lo));
+    TEST_CHECK(result_hi == 2);
+    TEST_CHECK(result_lo == 0x15);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_dsp_requires_dsp_model(void)
+{
+    uc_engine *uc;
+    uint32_t lhs = 0x01020304;
+    uint32_t rhs = 0x05060708;
+    uint32_t code[] = {
+        BEINT32(0x7d4b6010), /* addu.qb t4, t2, t3 */
+    };
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_24KC));
+    enable_mips32_dsp(uc);
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T2, &lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T3, &rhs));
+
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start,
+                               code_start + sizeof(code), 0, 0));
 
     OK(uc_close(uc));
 }
@@ -1067,6 +1319,8 @@ static void test_mips_cp0_count_compare(void)
 TEST_LIST = {
     {"test_mips_stop_at_branch", test_mips_stop_at_branch},
     {"test_mips_stop_at_delay_slot", test_mips_stop_at_delay_slot},
+    {"test_mips_not_taken_branch_likely_code_hook",
+     test_mips_not_taken_branch_likely_code_hook},
     {"test_mips_el_ori", test_mips_el_ori},
     {"test_mips_eb_ori", test_mips_eb_ori},
     {"test_mips_lwx_exception_issue_1314", test_mips_lwx_exception_issue_1314},
@@ -1075,7 +1329,13 @@ TEST_LIST = {
     {"test_mips_micro_mode_li16", test_mips_micro_mode_li16},
     {"test_mips_nanomips_model_move16", test_mips_nanomips_model_move16},
     {"test_mips_mips3_mode_opens", test_mips_mips3_mode_opens},
-    {"test_mips_msa_w_reg_roundtrip", test_mips_msa_w_reg_roundtrip},
+     {"test_mips_msa_w_reg_roundtrip", test_mips_msa_w_reg_roundtrip},
+     {"test_mips_msa_addv_b", test_mips_msa_addv_b},
+    {"test_mips_dsp_arithmetic_control",
+     test_mips_dsp_arithmetic_control},
+    {"test_mips_dsp_accumulator", test_mips_dsp_accumulator},
+    {"test_mips_dsp_requires_dsp_model",
+     test_mips_dsp_requires_dsp_model},
     {"test_mips_mips_fpr", test_mips_mips_fpr},
     {"test_mips_stop_delay_slot_from_qiling",
      test_mips_stop_delay_slot_from_qiling},

@@ -55,10 +55,16 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
     TranslationBlock *last_tb;
     int tb_exit;
     uint8_t *tb_ptr = itb->tc.ptr;
+    unsigned int level = cpu->uc->nested_level - 1;
 
     UC_TRACE_START(UC_TRACE_TB_EXEC);
     tb_exec_lock(cpu->uc);
+    g_assert(!cpu->uc->tb_exec_active[level]);
+    cpu->uc->tb_exec_active[level] = true;
+    cpu->uc->tb_exec_depth++;
     ret = tcg_qemu_tb_exec(env, tb_ptr);
+    cpu->uc->tb_exec_active[level] = false;
+    cpu->uc->tb_exec_depth--;
     if (cpu->uc->nested_level == 1) {
         // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
         tb_exec_unlock(cpu->uc);
@@ -96,7 +102,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
             }
         }
 
-        cpu->tcg_exit_req = 0;
+        qatomic_set(&cpu->tcg_exit_req, 0);
     }
     return ret;
 }
@@ -107,7 +113,7 @@ static void cpu_exec_nocache(CPUState *cpu, int max_cycles,
                              TranslationBlock *orig_tb, bool ignore_icount)
 {
     TranslationBlock *tb;
-    uint32_t cflags = curr_cflags() | CF_NOCACHE;
+    uint32_t cflags = curr_cflags(cpu->uc) | CF_NOCACHE;
 
     if (ignore_icount) {
         cflags &= ~CF_USE_ICOUNT;
@@ -252,6 +258,9 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
     uc_engine *uc = cpu->uc;
     struct list_item *cur;
     struct hook *hook;
+    bool notify_edge = true;
+
+ retry:
 
     tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
     if (tb == NULL) {
@@ -261,9 +270,12 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
         /* We add the TB in the virtual pc hash table for the fast lookup */
         cpu->tb_jmp_cache[tb_jmp_cache_hash_func(cpu->uc, pc)] = tb;
 
-        if (uc->last_tb) {
+        if (uc->last_tb_valid && notify_edge) {
+            unsigned int flush_count =
+                uc->tcg_ctx->tb_ctx.tb_flush_count;
+
             UC_TB_COPY(&cur_tb, tb);
-            UC_TB_COPY(&prev_tb, uc->last_tb);
+            prev_tb = uc->last_tb;
             for (cur = uc->hook[UC_HOOK_EDGE_GENERATED_IDX].head;
                 cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
                 if (hook->to_delete) {
@@ -273,6 +285,19 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
                 if (HOOK_BOUND_CHECK(hook, (uint64_t)tb->pc)) {
                     JIT_CALLBACK_GUARD(((uc_hook_edge_gen_t)hook->callback)(uc, &cur_tb, &prev_tb, hook->user_data));
                 }
+            }
+            notify_edge = false;
+            if (unlikely(qatomic_read(&cpu->exit_request))) {
+                return NULL;
+            }
+            if (unlikely(flush_count !=
+                         uc->tcg_ctx->tb_ctx.tb_flush_count)) {
+                last_tb = NULL;
+                goto retry;
+            }
+            if (unlikely(tb_cflags(tb) & CF_INVALID)) {
+                last_tb = NULL;
+                goto retry;
             }
         }
     }
@@ -443,7 +468,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
      * Ensure zeroing happens before reading cpu->exit_request or
      * cpu->interrupt_request (see also smp_wmb in cpu_exit())
      */
-    cpu_neg(cpu)->icount_decr.u16.high = 0;
+    qatomic_set(&cpu_neg(cpu)->icount_decr.u16.high, 0);
 
     if (unlikely(cpu->interrupt_request)) {
         int interrupt_request;
@@ -497,8 +522,8 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     }
 
     /* Finally, check if we need to exit to the main loop.  */
-    if (unlikely(cpu->exit_request)) {
-        cpu->exit_request = 0;
+    if (unlikely(qatomic_read(&cpu->exit_request))) {
+        qatomic_set(&cpu->exit_request, 0);
         if (cpu->exception_index == -1) {
             cpu->exception_index = EXCP_INTERRUPT;
         }
@@ -513,12 +538,38 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 {
     uintptr_t ret;
     int32_t insns_left;
+    TranslationBlock *executed_tb = tb;
+    TranslationBlock *snapshot_tb;
+    uc_tb executed_snapshot;
+    bool track_edge = HOOK_EXISTS(cpu->uc, UC_HOOK_EDGE_GENERATED);
+    unsigned int flush_count = cpu->uc->tcg_ctx->tb_ctx.tb_flush_count;
+
+    if (track_edge) {
+        UC_TB_COPY(&executed_snapshot, executed_tb);
+    }
 
     // trace_exec_tb(tb, tb->pc);
     ret = cpu_tb_exec(cpu, tb);
-    cpu->uc->last_tb = tb; // Trace the last tb we executed.
     tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
+    snapshot_tb = tb != NULL ? tb : executed_tb;
+    if (track_edge) {
+        if (tb != NULL &&
+            flush_count == cpu->uc->tcg_ctx->tb_ctx.tb_flush_count) {
+            UC_TB_COPY(&cpu->uc->last_tb, snapshot_tb);
+        } else {
+            cpu->uc->last_tb = executed_snapshot;
+        }
+        cpu->uc->last_tb_valid = true;
+    } else {
+        cpu->uc->last_tb_valid = false;
+    }
     *tb_exit = ret & TB_EXIT_MASK;
+    if (cpu->uc->tb_flush_pending && cpu->uc->tb_exec_depth == 0) {
+        cpu->uc->tb_flush_pending = false;
+        cpu->uc->tb_flush(cpu->uc);
+        *last_tb = NULL;
+        return;
+    }
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
         return;
@@ -591,6 +642,10 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
 #endif /* buggy compiler */
 
         assert_no_pages_locked();
+        if (uc->tb_flush_pending && uc->tb_exec_depth == 0) {
+            uc->tb_flush_pending = false;
+            uc->tb_flush(uc);
+        }
     }
 
     /* if an exception is pending, we execute it here */
@@ -608,13 +663,13 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
                have CF_INVALID set, -1 is a convenient invalid value that
                does not require tcg headers for cpu_common_reset.  */
             if (cflags == -1) {
-                cflags = curr_cflags();
+                cflags = curr_cflags(uc);
             } else {
                 cpu->cflags_next_tb = -1;
             }
 
             tb = tb_find(cpu, last_tb, tb_exit, cflags);
-            if (unlikely(cpu->exit_request)) {
+            if (unlikely(qatomic_read(&cpu->exit_request))) {
                 continue;
             }
             cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
@@ -625,7 +680,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
     }
 
     // Unicorn: Clear any TCG exit flag that might have been left set by exit requests
-    uc->cpu->tcg_exit_req = 0;
+    qatomic_set(&uc->cpu->tcg_exit_req, 0);
 
     cpu_tcg_exec_exit(cpu);
     // rcu_read_unlock();

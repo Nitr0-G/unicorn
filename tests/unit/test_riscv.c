@@ -1397,6 +1397,15 @@ static uint32_t riscv_encode_csr(uint32_t csr, uint32_t rs1,
     return riscv_encode_i(csr, rs1, funct3, rd, 0x73);
 }
 
+static uint32_t riscv_encode_atomic(uint32_t funct5, uint32_t rs2,
+                                    uint32_t rs1, uint32_t width,
+                                    uint32_t rd)
+{
+    return ((funct5 & 0x1f) << 27) | ((rs2 & 0x1f) << 20) |
+           ((rs1 & 0x1f) << 15) | ((width & 0x7) << 12) |
+           ((rd & 0x1f) << 7) | 0x2f;
+}
+
 static uint32_t riscv_encode_k_aes(uint32_t funct5, uint32_t shamt,
                                    uint32_t rs2, uint32_t rs1, uint32_t rd)
 {
@@ -1532,6 +1541,270 @@ static void riscv_insn_to_code(uint8_t code[4], uint32_t insn)
     code[1] = insn >> 8;
     code[2] = insn >> 16;
     code[3] = insn >> 24;
+}
+
+static void test_riscv32_lr_sc(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_atomic(0x02, 0, 10, 2, 5),
+        riscv_encode_atomic(0x03, 11, 10, 2, 6),
+        riscv_encode_atomic(0x03, 12, 10, 2, 7),
+    };
+    uint8_t code[sizeof(insns)];
+    uint32_t address = riscv_data_start;
+    uint32_t initial = 0x11223344;
+    uint32_t first_store = 0x55667788;
+    uint32_t second_store = 0xaabbccdd;
+    uint32_t loaded = 0;
+    uint32_t first_status = 1;
+    uint32_t second_status = 0;
+    uint32_t memory = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV32,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, riscv_data_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, riscv_data_start, &initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A0, &address));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A1, &first_store));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A2, &second_store));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_RISCV_REG_T0, &loaded));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T1, &first_status));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T2, &second_status));
+    OK(uc_mem_read(uc, riscv_data_start, &memory, sizeof(memory)));
+    TEST_CHECK(loaded == initial);
+    TEST_CHECK(first_status == 0);
+    TEST_CHECK(second_status == 1);
+    TEST_CHECK(memory == first_store);
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_lr_sc(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_atomic(0x02, 0, 10, 3, 5),
+        riscv_encode_atomic(0x03, 11, 10, 3, 6),
+        riscv_encode_atomic(0x02, 0, 10, 3, 7),
+        riscv_encode_atomic(0x03, 12, 13, 3, 28),
+        riscv_encode_atomic(0x03, 12, 10, 3, 29),
+    };
+    uint8_t code[sizeof(insns)];
+    uint64_t address = riscv_data_start;
+    uint64_t other_address = riscv_data_start + sizeof(uint64_t);
+    uint64_t initial[] = {
+        0x1122334455667788ull,
+        0x99aabbccddeeff00ull,
+    };
+    uint64_t first_store = 0x0123456789abcdefull;
+    uint64_t second_store = 0xfedcba9876543210ull;
+    uint64_t loaded = 0;
+    uint64_t reloaded = 0;
+    uint64_t success_status = 1;
+    uint64_t mismatch_status = 0;
+    uint64_t second_status = 0;
+    uint64_t memory[2] = { 0 };
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, riscv_data_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, riscv_data_start, initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A0, &address));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A1, &first_store));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A2, &second_store));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A3, &other_address));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_RISCV_REG_T0, &loaded));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T1, &success_status));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T2, &reloaded));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T3, &mismatch_status));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T4, &second_status));
+    OK(uc_mem_read(uc, riscv_data_start, memory, sizeof(memory)));
+    TEST_CHECK(loaded == initial[0]);
+    TEST_CHECK(success_status == 0);
+    TEST_CHECK(reloaded == first_store);
+    TEST_CHECK(mismatch_status == 1);
+    TEST_CHECK(second_status == 1);
+    TEST_CHECK(memory[0] == first_store);
+    TEST_CHECK(memory[1] == initial[1]);
+    OK(uc_close(uc));
+}
+
+static void test_riscv32_amo(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_atomic(0x00, 11, 10, 2, 5),
+        riscv_encode_atomic(0x01, 12, 10, 2, 6),
+        riscv_encode_atomic(0x10, 13, 10, 2, 7),
+        riscv_encode_atomic(0x18, 14, 10, 2, 28),
+    };
+    uint8_t code[sizeof(insns)];
+    uint32_t address = riscv_data_start;
+    uint32_t initial = 10;
+    uint32_t addend = 5;
+    uint32_t swap = 20;
+    uint32_t signed_min = 0xfffffffd;
+    uint32_t unsigned_min = 2;
+    uint32_t old_add = 0;
+    uint32_t old_swap = 0;
+    uint32_t old_signed_min = 0;
+    uint32_t old_unsigned_min = 0;
+    uint32_t memory = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV32,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, riscv_data_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, riscv_data_start, &initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A0, &address));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A1, &addend));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A2, &swap));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A3, &signed_min));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A4, &unsigned_min));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_RISCV_REG_T0, &old_add));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T1, &old_swap));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T2, &old_signed_min));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T3, &old_unsigned_min));
+    OK(uc_mem_read(uc, riscv_data_start, &memory, sizeof(memory)));
+    TEST_CHECK(old_add == 10);
+    TEST_CHECK(old_swap == 15);
+    TEST_CHECK(old_signed_min == 20);
+    TEST_CHECK(old_unsigned_min == signed_min);
+    TEST_CHECK(memory == unsigned_min);
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_amo(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_atomic(0x00, 11, 10, 3, 5),
+        riscv_encode_atomic(0x01, 12, 10, 3, 6),
+        riscv_encode_atomic(0x10, 13, 10, 3, 7),
+        riscv_encode_atomic(0x18, 14, 10, 3, 28),
+        riscv_encode_atomic(0x00, 15, 16, 2, 29),
+    };
+    uint8_t code[sizeof(insns)];
+    uint64_t address = riscv_data_start;
+    uint64_t word_address = riscv_data_start + sizeof(uint64_t);
+    uint64_t initial = 10;
+    uint32_t initial_word = 0x80000005;
+    uint64_t addend = 5;
+    uint64_t swap = 20;
+    uint64_t signed_min = 0xfffffffffffffffdull;
+    uint64_t unsigned_min = 2;
+    uint64_t word_addend = 3;
+    uint64_t old_add = 0;
+    uint64_t old_swap = 0;
+    uint64_t old_signed_min = 0;
+    uint64_t old_unsigned_min = 0;
+    uint64_t old_word = 0;
+    uint64_t memory = 0;
+    uint32_t memory_word = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, riscv_data_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, riscv_data_start, &initial, sizeof(initial)));
+    OK(uc_mem_write(uc, word_address, &initial_word, sizeof(initial_word)));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A0, &address));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A1, &addend));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A2, &swap));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A3, &signed_min));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A4, &unsigned_min));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A5, &word_addend));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A6, &word_address));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_RISCV_REG_T0, &old_add));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T1, &old_swap));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T2, &old_signed_min));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T3, &old_unsigned_min));
+    OK(uc_reg_read(uc, UC_RISCV_REG_T4, &old_word));
+    OK(uc_mem_read(uc, riscv_data_start, &memory, sizeof(memory)));
+    OK(uc_mem_read(uc, word_address, &memory_word, sizeof(memory_word)));
+    TEST_CHECK(old_add == 10);
+    TEST_CHECK(old_swap == 15);
+    TEST_CHECK(old_signed_min == 20);
+    TEST_CHECK(old_unsigned_min == signed_min);
+    TEST_CHECK(old_word == 0xffffffff80000005ull);
+    TEST_CHECK(memory == unsigned_min);
+    TEST_CHECK(memory_word == 0x80000008);
+    OK(uc_close(uc));
+}
+
+static void test_riscv32_atomic_misaligned(void)
+{
+    uc_engine *uc;
+    uint32_t insn = riscv_encode_atomic(0x02, 0, 10, 2, 5);
+    uint8_t code[4];
+    uint32_t address = riscv_data_start + 1;
+
+    riscv_insn_to_code(code, insn);
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV32,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, riscv_data_start, 0x1000, UC_PROT_ALL));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A0, &address));
+
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start, code_start + sizeof(code),
+                               0, 0));
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_atomic_misaligned(void)
+{
+    uc_engine *uc;
+    uint32_t insn = riscv_encode_atomic(0x00, 11, 10, 3, 5);
+    uint8_t code[4];
+    uint64_t address = riscv_data_start + 4;
+    uint64_t addend = 1;
+    uint64_t initial = 0x1122334455667788ull;
+    uint64_t memory = 0;
+
+    riscv_insn_to_code(code, insn);
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, riscv_data_start, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, address, &initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A0, &address));
+    OK(uc_reg_write(uc, UC_RISCV_REG_A1, &addend));
+
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start, code_start + sizeof(code),
+                               0, 0));
+    OK(uc_mem_read(uc, address, &memory, sizeof(memory)));
+    TEST_CHECK(memory == initial);
+    OK(uc_close(uc));
 }
 
 static void test_riscv64_sstc_stimecmp(void)
@@ -11397,6 +11670,12 @@ static void test_riscv64_rvv_requires_vs(void)
 TEST_LIST = {
     {"test_riscv32_nop", test_riscv32_nop},
     {"test_riscv64_nop", test_riscv64_nop},
+    {"test_riscv32_lr_sc", test_riscv32_lr_sc},
+    {"test_riscv64_lr_sc", test_riscv64_lr_sc},
+    {"test_riscv32_amo", test_riscv32_amo},
+    {"test_riscv64_amo", test_riscv64_amo},
+    {"test_riscv32_atomic_misaligned", test_riscv32_atomic_misaligned},
+    {"test_riscv64_atomic_misaligned", test_riscv64_atomic_misaligned},
     {"test_riscv64_sstc_stimecmp", test_riscv64_sstc_stimecmp},
     {"test_riscv32_zihintpause", test_riscv32_zihintpause},
     {"test_riscv64_zihintpause", test_riscv64_zihintpause},

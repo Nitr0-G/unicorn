@@ -83,9 +83,11 @@ include(cmake/bundle_static.cmake)
 option(BUILD_SHARED_LIBS "Build shared instead of static library" ${PROJECT_IS_TOP_LEVEL})
 option(UNICORN_LEGACY_STATIC_ARCHIVE "Enable Unicorn v1 style all-in-one objects archive for libunicorn.a" ${PROJECT_IS_TOP_LEVEL})
 option(UNICORN_FUZZ "Enable fuzzing" OFF)
+option(UNICORN_FUZZ_LIBFUZZER "Build fuzz targets with libFuzzer" OFF)
 option(UNICORN_LOGGING "Enable logging" OFF)
 option(UNICORN_BUILD_TESTS "Build unicorn tests" ${PROJECT_IS_TOP_LEVEL})
 option(UNICORN_INSTALL "Enable unicorn installation" ${PROJECT_IS_TOP_LEVEL})
+option(UNICORN_ENABLE_LTO "Enable interprocedural optimization" OFF)
 set(UNICORN_ARCH "x86;arm;aarch64;riscv;mips;sparc;m68k;ppc;s390x;tricore" CACHE STRING "Enabled unicorn architectures")
 option(UNICORN_TRACER "Trace unicorn execution" OFF)
 # On Windows the code generation buffer is committed lazily through a
@@ -93,6 +95,17 @@ option(UNICORN_TRACER "Trace unicorn execution" OFF)
 # the VEH and makes preallocation (commit upfront) mandatory. No effect on
 # non-Windows platforms.
 option(WIN32_ENABLE_VEH "Enable the Windows vectored exception handler for lazy code buffer commit" ON)
+
+if(UNICORN_ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT UNICORN_LTO_SUPPORTED
+                        OUTPUT UNICORN_LTO_ERROR)
+    if(NOT UNICORN_LTO_SUPPORTED)
+        message(FATAL_ERROR
+                "Interprocedural optimization is not supported: ${UNICORN_LTO_ERROR}")
+    endif()
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
 
 foreach(ARCH_LOOP ${UNICORN_ARCH})
     string(TOUPPER "${ARCH_LOOP}" ARCH_LOOP)
@@ -1435,6 +1448,11 @@ endif()
 
 if(MINGW)
     set(UNICORN_LINK_LIBRARIES ${UNICORN_LINK_LIBRARIES} pthread)
+    if(BUILD_SHARED_LIBS)
+        target_compile_definitions(unicorn PRIVATE UNICORN_SHARED)
+        set_property(TARGET unicorn APPEND_STRING PROPERTY LINK_FLAGS
+            " -Wl,--exclude-all-symbols")
+    endif()
 endif()
 
 if(ATOMIC_LINKAGE_FIX)
@@ -1537,19 +1555,88 @@ if (UNICORN_LEGACY_STATIC_ARCHIVE)
 endif()
 
 if(UNICORN_FUZZ)
-    set(UNICORN_FUZZ_SUFFIX "arm_arm;arm_armbe;arm_thumb;arm64_arm;arm64_armbe;m68k_be;mips_32be;mips_32le;sparc_32be;x86_16;x86_32;x86_64;s390x_be")
-    if (NOT APPLE)
+    set(UNICORN_FUZZ_SUFFIX)
+    if(UNICORN_HAS_ARM)
+        list(APPEND UNICORN_FUZZ_SUFFIX
+            arm_arm arm_armbe arm_thumb)
+    endif()
+    if(UNICORN_HAS_AARCH64)
+        list(APPEND UNICORN_FUZZ_SUFFIX arm64_arm arm64_armbe)
+    endif()
+    if(UNICORN_HAS_M68K)
+        list(APPEND UNICORN_FUZZ_SUFFIX m68k_be)
+    endif()
+    if(UNICORN_HAS_MIPS)
+        list(APPEND UNICORN_FUZZ_SUFFIX
+            mips_32be mips_32le mips_64be mips_64le)
+    endif()
+    if(UNICORN_HAS_PPC)
+        list(APPEND UNICORN_FUZZ_SUFFIX ppc_32be ppc_64be)
+    endif()
+    if(UNICORN_HAS_RISCV)
+        list(APPEND UNICORN_FUZZ_SUFFIX riscv_32le riscv_64le)
+    endif()
+    if(UNICORN_HAS_SPARC)
+        list(APPEND UNICORN_FUZZ_SUFFIX sparc_32be sparc_64be)
+    endif()
+    if(UNICORN_HAS_TRICORE)
+        list(APPEND UNICORN_FUZZ_SUFFIX tricore_le)
+    endif()
+    if(UNICORN_HAS_X86)
+        list(APPEND UNICORN_FUZZ_SUFFIX x86_16 x86_32 x86_64)
+    endif()
+    if(UNICORN_HAS_S390X)
+        list(APPEND UNICORN_FUZZ_SUFFIX s390x_be)
+    endif()
+    if (UNIX AND NOT APPLE AND NOT ANDROID_ABI)
         set(SAMPLES_LIB ${SAMPLES_LIB} rt)
+    endif()
+    if(UNICORN_FUZZ_LIBFUZZER)
+        if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+            message(FATAL_ERROR
+                "UNICORN_FUZZ_LIBFUZZER requires a Clang compiler")
+        endif()
+        foreach(FUZZ_LIBRARY unicorn unicorn-common ${UNICORN_LINK_LIBRARIES})
+            if(TARGET ${FUZZ_LIBRARY})
+                target_compile_options(${FUZZ_LIBRARY} PRIVATE
+                    -fsanitize=fuzzer-no-link)
+            endif()
+        endforeach()
+        set(UNICORN_FUZZ_DRIVER)
+    else()
+        set(UNICORN_FUZZ_DRIVER
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/onedir.c)
     endif()
     foreach(SUFFIX ${UNICORN_FUZZ_SUFFIX})
         add_executable(fuzz_emu_${SUFFIX}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/fuzz_emu_${SUFFIX}.c
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/onedir.c
+            ${UNICORN_FUZZ_DRIVER}
         )
         target_link_libraries(fuzz_emu_${SUFFIX} PRIVATE
             ${SAMPLES_LIB}
         )
+        if(UNICORN_FUZZ_LIBFUZZER)
+            target_compile_options(fuzz_emu_${SUFFIX} PRIVATE
+                -fsanitize=fuzzer-no-link)
+            set_property(TARGET fuzz_emu_${SUFFIX} APPEND_STRING
+                PROPERTY LINK_FLAGS " -fsanitize=fuzzer")
+        endif()
     endforeach()
+    if(UNICORN_HAS_X86)
+        add_executable(fuzz_uc_api
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/fuzz_uc_api.c
+            ${UNICORN_FUZZ_DRIVER}
+        )
+        target_link_libraries(fuzz_uc_api PRIVATE
+            ${SAMPLES_LIB}
+        )
+        if(UNICORN_FUZZ_LIBFUZZER)
+            target_compile_options(fuzz_uc_api PRIVATE
+                -fsanitize=fuzzer-no-link)
+            set_property(TARGET fuzz_uc_api APPEND_STRING
+                PROPERTY LINK_FLAGS " -fsanitize=fuzzer")
+        endif()
+    endif()
 endif()
 
 if(UNICORN_BUILD_TESTS)
@@ -1591,6 +1678,7 @@ if(UNICORN_BUILD_TESTS)
             ${SAMPLES_LIB}
         )
         add_test(${TEST_FILE} ${TEST_FILE})
+        set_tests_properties(${TEST_FILE} PROPERTIES TIMEOUT 900)
         if(ANDROID_ABI)
             file(APPEND ${CMAKE_BINARY_DIR}/adb.sh "adb push ${TEST_FILE} /data/local/tmp/build/\n")
             file(APPEND ${CMAKE_BINARY_DIR}/adb.sh "adb shell \"chmod +x /data/local/tmp/build/${TEST_FILE}\"\n")
@@ -1600,8 +1688,12 @@ if(UNICORN_BUILD_TESTS)
             target_compile_definitions(${TEST_FILE} PRIVATE TARGET_READ_INLINED)
         endif()
     endforeach()
-    if(UNICORN_TEST_FILE)
-        add_dependencies(test_parallel ${UNICORN_TEST_FILE})
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tests/regress/CMakeLists.txt)
+    if(UNICORN_TEST_FILE OR UNICORN_REGRESSION_TARGETS)
+        add_dependencies(test_parallel
+            ${UNICORN_TEST_FILE}
+            ${UNICORN_REGRESSION_TARGETS}
+        )
     endif()
 endif()
 

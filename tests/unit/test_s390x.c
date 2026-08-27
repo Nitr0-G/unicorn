@@ -176,6 +176,25 @@ static uint32_t s390x_read_cc(uc_engine *uc)
     return (pswm >> 44) & 3;
 }
 
+typedef struct S390xExrlTrace {
+    uint64_t code_address[2];
+    uint32_t code_size[2];
+    uint32_t code_count;
+} S390xExrlTrace;
+
+static void s390x_exrl_code_hook(uc_engine *uc, uint64_t address,
+                                 uint32_t size, void *user_data)
+{
+    S390xExrlTrace *trace = (S390xExrlTrace *)user_data;
+
+    (void)uc;
+    if (trace->code_count < 2) {
+        trace->code_address[trace->code_count] = address;
+        trace->code_size[trace->code_count] = size;
+    }
+    trace->code_count++;
+}
+
 static void run_s390x_chrl_case(const uint8_t code[6],
                                 const uint8_t data[8], uint64_t r4,
                                 uint32_t expected_cc)
@@ -249,6 +268,253 @@ static void s390x_setup_scalar_case(uc_engine **uc, const uint8_t *code,
     OK(uc_ctl_set_cpu_model(*uc, UC_CPU_S390X_GEN15A));
     OK(uc_mem_map(*uc, code_start, code_len, UC_PROT_ALL));
     OK(uc_mem_write(*uc, code_start, code, code_size));
+}
+
+static void test_s390x_instruction_count_pc_boundary(void)
+{
+    static const size_t counts[] = {
+        1, 2, 3,
+        32766, 32767, 32768, 32769,
+        65534, 65535, 65536, 65537,
+        70000,
+    };
+    const uint8_t code[] = {
+        0xa7, 0x3b, 0x00, 0x01,
+        0xa7, 0xf4, 0xff, 0xfe,
+    };
+    uc_engine *uc;
+    uint64_t r3;
+    uint64_t pc;
+    size_t i;
+
+    s390x_setup_scalar_case(&uc, code, sizeof(code));
+
+    for (i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        uint64_t expected = (counts[i] + 1) / 2;
+
+        r3 = 0;
+        OK(uc_reg_write(uc, UC_S390X_REG_R3, &r3));
+        OK(uc_emu_start(uc, code_start, 0, 0, counts[i]));
+        OK(uc_reg_read(uc, UC_S390X_REG_R3, &r3));
+        OK(uc_reg_read(uc, UC_S390X_REG_PC, &pc));
+        TEST_CHECK_(r3 == expected, "count=%zu r3=%llu",
+                    counts[i], (unsigned long long)r3);
+        TEST_CHECK_(pc == code_start + (counts[i] & 1) * 4,
+                    "count=%zu pc=0x%llx", counts[i],
+                    (unsigned long long)pc);
+    }
+
+    OK(uc_close(uc));
+}
+
+static void test_s390x_compare_and_swap_32(void)
+{
+    const uint8_t code[] = { 0xba, 0x45, 0x20, 0x00 };
+    const uint8_t initial[] = { 0x11, 0x22, 0x33, 0x44 };
+    const uint8_t replacement[] = { 0xaa, 0xbb, 0xcc, 0xdd };
+    const uint8_t mismatch[] = { 0x10, 0x20, 0x30, 0x40 };
+    uint8_t actual[sizeof(initial)];
+    uc_engine *uc;
+    uint64_t r2 = s390x_data_start;
+    uint64_t r4 = 0xdeadbeef11223344ull;
+    uint64_t r5 = 0x01234567aabbccddull;
+
+    s390x_setup_scalar_case(&uc, code, sizeof(code));
+    OK(uc_reg_write(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_mem_write(uc, s390x_data_start, initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_reg_write(uc, UC_S390X_REG_R5, &r5));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_mem_read(uc, s390x_data_start, actual, sizeof(actual)));
+    TEST_CHECK(r4 == 0xdeadbeef11223344ull);
+    TEST_CHECK(s390x_read_cc(uc) == 0);
+    s390x_check_bytes("cs success", actual, replacement, sizeof(actual));
+
+    r4 = 0xdeadbeef11223344ull;
+    OK(uc_mem_write(uc, s390x_data_start, mismatch, sizeof(mismatch)));
+    OK(uc_reg_write(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_mem_read(uc, s390x_data_start, actual, sizeof(actual)));
+    TEST_CHECK(r4 == 0xdeadbeef10203040ull);
+    TEST_CHECK(s390x_read_cc(uc) == 1);
+    s390x_check_bytes("cs failure", actual, mismatch, sizeof(actual));
+
+    OK(uc_close(uc));
+}
+
+static void test_s390x_compare_and_swap_64(void)
+{
+    const uint8_t code[] = { 0xeb, 0x45, 0x20, 0x00, 0x00, 0x30 };
+    const uint8_t initial[] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    };
+    const uint8_t replacement[] = {
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+    };
+    const uint8_t mismatch[] = {
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+    };
+    uint8_t actual[sizeof(initial)];
+    uc_engine *uc;
+    uint64_t r2 = s390x_data_start;
+    uint64_t r4 = 0x1122334455667788ull;
+    uint64_t r5 = 0xaabbccddeeff0011ull;
+
+    s390x_setup_scalar_case(&uc, code, sizeof(code));
+    OK(uc_reg_write(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_mem_write(uc, s390x_data_start, initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_reg_write(uc, UC_S390X_REG_R5, &r5));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_mem_read(uc, s390x_data_start, actual, sizeof(actual)));
+    TEST_CHECK(r4 == 0x1122334455667788ull);
+    TEST_CHECK(s390x_read_cc(uc) == 0);
+    s390x_check_bytes("csg success", actual, replacement, sizeof(actual));
+
+    r4 = 0x1122334455667788ull;
+    OK(uc_mem_write(uc, s390x_data_start, mismatch, sizeof(mismatch)));
+    OK(uc_reg_write(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_mem_read(uc, s390x_data_start, actual, sizeof(actual)));
+    TEST_CHECK(r4 == 0x1020304050607080ull);
+    TEST_CHECK(s390x_read_cc(uc) == 1);
+    s390x_check_bytes("csg failure", actual, mismatch, sizeof(actual));
+
+    OK(uc_close(uc));
+}
+
+static void test_s390x_laalg(void)
+{
+    const uint8_t code[] = { 0xeb, 0x43, 0x20, 0x00, 0x00, 0xea };
+    const uint8_t initial[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28,
+    };
+    const uint8_t expected[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a,
+    };
+    const uint8_t maximum[] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    const uint8_t zero[8] = { 0 };
+    uint8_t actual[sizeof(initial)];
+    uc_engine *uc;
+    uint64_t r2 = s390x_data_start;
+    uint64_t r3 = 2;
+    uint64_t r4 = 0;
+
+    s390x_setup_scalar_case(&uc, code, sizeof(code));
+    OK(uc_reg_write(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_S390X_REG_R3, &r3));
+    OK(uc_mem_write(uc, s390x_data_start, initial, sizeof(initial)));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_mem_read(uc, s390x_data_start, actual, sizeof(actual)));
+    TEST_CHECK(r4 == 40);
+    TEST_CHECK(s390x_read_cc(uc) == 1);
+    s390x_check_bytes("laalg no carry", actual, expected, sizeof(actual));
+
+    r3 = 1;
+    OK(uc_reg_write(uc, UC_S390X_REG_R3, &r3));
+    OK(uc_mem_write(uc, s390x_data_start, maximum, sizeof(maximum)));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_mem_read(uc, s390x_data_start, actual, sizeof(actual)));
+    TEST_CHECK(r4 == UINT64_MAX);
+    TEST_CHECK(s390x_read_cc(uc) == 2);
+    s390x_check_bytes("laalg carry", actual, zero, sizeof(actual));
+
+    OK(uc_close(uc));
+}
+
+static void test_s390x_exrl_trt(void)
+{
+    const uint8_t code[] = {
+        0xdd, 0x00, 0x30, 0x00, 0x40, 0x00,
+        0xc6, 0x50, 0xff, 0xff, 0xff, 0xfd,
+    };
+    const uint8_t operand[] = { 'h', 'e', 'l', 'l', 'o', 0 };
+    uint8_t table[256] = { 0 };
+    uint8_t actual_target[6];
+    S390xExrlTrace trace = { 0 };
+    uc_engine *uc;
+    uc_hook code_hook;
+    uint64_t r1 = UINT64_MAX;
+    uint64_t r2 = UINT64_MAX;
+    uint64_t r3 = s390x_data_start;
+    uint64_t r4 = s390x_data_start + 0x100;
+    uint64_t r5 = 5;
+    uint64_t pc;
+    uint64_t pswm;
+
+    table[0] = 0xaa;
+    s390x_setup_scalar_case(&uc, code, sizeof(code));
+    OK(uc_mem_write(uc, r3, operand, sizeof(operand)));
+    OK(uc_mem_write(uc, r4, table, sizeof(table)));
+    OK(uc_reg_read(uc, UC_S390X_REG_PSWM, &pswm));
+    pswm |= 1ull << 32;
+    OK(uc_reg_write(uc, UC_S390X_REG_PSWM, &pswm));
+    OK(uc_reg_write(uc, UC_S390X_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_S390X_REG_R3, &r3));
+    OK(uc_reg_write(uc, UC_S390X_REG_R4, &r4));
+    OK(uc_reg_write(uc, UC_S390X_REG_R5, &r5));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE,
+                   s390x_exrl_code_hook, &trace, 1, 0));
+
+    OK(uc_emu_start(uc, code_start + 6, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_reg_read(uc, UC_S390X_REG_PC, &pc));
+    OK(uc_mem_read(uc, code_start, actual_target, sizeof(actual_target)));
+    TEST_CHECK_(r1 == r3 + 5, "r1=0x%llx expected=0x%llx",
+                (unsigned long long)r1,
+                (unsigned long long)(r3 + 5));
+    TEST_CHECK(r2 == 0xffffffffffffffaaull);
+    TEST_CHECK(s390x_read_cc(uc) == 2);
+    TEST_CHECK(pc == code_start + sizeof(code));
+    TEST_CHECK(trace.code_count == 1);
+    TEST_CHECK(trace.code_address[0] == code_start + 6);
+    TEST_CHECK(trace.code_size[0] == 6);
+    s390x_check_bytes("exrl target", actual_target, code,
+                      sizeof(actual_target));
+
+    memset(&trace, 0, sizeof(trace));
+    r1 = UINT64_MAX;
+    r2 = UINT64_MAX;
+    r4 = 0x6000;
+    OK(uc_reg_write(uc, UC_S390X_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_S390X_REG_R4, &r4));
+
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start + 6,
+                               code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_S390X_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_S390X_REG_R2, &r2));
+    OK(uc_reg_read(uc, UC_S390X_REG_PC, &pc));
+    TEST_CHECK(r1 == UINT64_MAX);
+    TEST_CHECK(r2 == UINT64_MAX);
+    TEST_CHECK(pc == code_start + 6);
+    TEST_CHECK(trace.code_count == 1);
+    TEST_CHECK(trace.code_address[0] == code_start + 6);
+    TEST_CHECK(trace.code_size[0] == 6);
+
+    OK(uc_close(uc));
 }
 
 static void test_s390x_mie2_add_sub_halfword(void)
@@ -1515,6 +1781,14 @@ static void test_s390x_ve2_double_shift(void)
 
 TEST_LIST = {
     {"test_s390x_lr", test_s390x_lr},
+    {"test_s390x_instruction_count_pc_boundary",
+     test_s390x_instruction_count_pc_boundary},
+    {"test_s390x_compare_and_swap_32",
+     test_s390x_compare_and_swap_32},
+    {"test_s390x_compare_and_swap_64",
+     test_s390x_compare_and_swap_64},
+    {"test_s390x_laalg", test_s390x_laalg},
+    {"test_s390x_exrl_trt", test_s390x_exrl_trt},
     {"test_s390x_compare_halfword_relative_long",
      test_s390x_compare_halfword_relative_long},
     {"test_s390x_compare_logical_immediate_trap",

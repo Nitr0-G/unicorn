@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _aarch64
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_aarch64
+#define helper_uc_tracecode_single helper_uc_tracecode_single_aarch64
+#define cpu_restore_icount cpu_restore_icount_aarch64
 #define unicorn_fill_tlb unicorn_fill_tlb_aarch64
 #define reg_read reg_read_aarch64
 #define reg_write reg_write_aarch64
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_aarch64
 #define tb_cleanup tb_cleanup_aarch64
 #define tb_flush tb_flush_aarch64
+#define tb_flush_jit tb_flush_jit_aarch64
 #define tb_phys_invalidate tb_phys_invalidate_aarch64
 #define tb_gen_code tb_gen_code_aarch64
 #define tb_reset_jump tb_reset_jump_aarch64

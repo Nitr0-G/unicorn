@@ -2018,7 +2018,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     MemOp opc = get_memop(oi);
     TCGReg hi, lo, arg = TCG_REG_R3;
 
-    const int type = tcg_uc_has_hookmem(s) ? R_PPC_REL24 : R_PPC_REL14;
+    const int type = R_PPC_REL14;
     if (!patch_reloc(lb->label_ptr[0], type, (intptr_t)s->code_ptr, 0)) {
         return false;
     }
@@ -2067,7 +2067,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     MemOp s_bits = opc & MO_SIZE;
     TCGReg hi, lo, arg = TCG_REG_R3;
 
-    const int type = tcg_uc_has_hookmem(s) ? R_PPC_REL24 : R_PPC_REL14;
+    const int type = R_PPC_REL14;
     if (!patch_reloc(lb->label_ptr[0], type, (intptr_t)s->code_ptr, 0)) {
         return false;
     }
@@ -2148,11 +2148,7 @@ static void tcg_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
 
     /* Load a pointer into the current opcode w/conditional branch-link. */
     label_ptr = s->code_ptr;
-    // Unicorn: fast path if hookmem is not enabled
-    if (!tcg_uc_has_hookmem(s))
-        tcg_out32(s, BC | BI(7, CR_EQ) | BO_COND_FALSE | LK);
-    else
-        tcg_out32(s, B | LK);
+    tcg_out32(s, BC | BI(7, CR_EQ) | BO_COND_FALSE | LK);
 
     rbase = TCG_REG_R3;
 #else  /* !CONFIG_SOFTMMU */
@@ -2227,11 +2223,7 @@ static void tcg_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
 
     /* Load a pointer into the current opcode w/conditional branch-link. */
     label_ptr = s->code_ptr;
-    // Unicorn: fast path if hookmem is not enabled
-    if (!tcg_uc_has_hookmem(s))
-        tcg_out32(s, BC | BI(7, CR_EQ) | BO_COND_FALSE | LK);
-    else
-        tcg_out32(s, B | LK);
+    tcg_out32(s, BC | BI(7, CR_EQ) | BO_COND_FALSE | LK);
 
     rbase = TCG_REG_R3;
 #else  /* !CONFIG_SOFTMMU */

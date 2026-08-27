@@ -112,7 +112,6 @@ typedef struct CPUTLBEntry {
             target_ulong addr_read;
             target_ulong addr_write;
             target_ulong addr_code;
-            hwaddr paddr;
             /* Addend to virtual address to get host address.  IO accesses
                use the corresponding iotlb value.  */
             uintptr_t addend;
@@ -153,6 +152,12 @@ typedef struct CPUTLBEntryFull {
     /* Base-2 logarithm of the translated page size. */
     uint8_t lg_page_size;
 
+    /* Additional flags used only after entering the slow path. */
+    uint8_t slow_flags[MMU_ACCESS_COUNT];
+
+    /* Index of the translated MemoryRegionSection. */
+    uint16_t section_index;
+
     /* Target-specific page-table metadata. */
 #ifdef TARGET_PAGE_ENTRY_EXTRA
     TARGET_PAGE_ENTRY_EXTRA
@@ -177,6 +182,10 @@ typedef struct CPUTLBDesc {
     /* maximum number of entries observed in the window */
     size_t window_max_entries;
     size_t n_used_entries;
+    size_t collision_misses;
+    size_t collision_min_size;
+    size_t collision_floor;
+    int64_t collision_floor_expires_ns;
     /* The next index to use in the tlb victim table.  */
     size_t vindex;
     /* The tlb victim table, in two parts.  */
@@ -206,6 +215,8 @@ typedef struct CPUTLBCommon {
      * Protected by tlb_c.lock.
      */
     uint16_t dirty;
+    uint64_t mutation_epoch;
+    uint64_t table_epoch;
     /*
      * Statistics.  These are not lock protected, but are read and
      * written atomically.  This allows the monitor to print a snapshot

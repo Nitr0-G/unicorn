@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _mips
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_mips
+#define helper_uc_tracecode_single helper_uc_tracecode_single_mips
+#define cpu_restore_icount cpu_restore_icount_mips
 #define unicorn_fill_tlb unicorn_fill_tlb_mips
 #define reg_read reg_read_mips
 #define reg_write reg_write_mips
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_mips
 #define tb_cleanup tb_cleanup_mips
 #define tb_flush tb_flush_mips
+#define tb_flush_jit tb_flush_jit_mips
 #define tb_phys_invalidate tb_phys_invalidate_mips
 #define tb_gen_code tb_gen_code_mips
 #define tb_reset_jump tb_reset_jump_mips

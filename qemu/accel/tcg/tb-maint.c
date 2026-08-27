@@ -226,6 +226,7 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
                    CODE_GEN_HTABLE_SIZE);
     page_flush_tb(cpu->uc);
 
+    cpu->uc->last_tb_valid = false;
     tcg_region_reset_all(cpu->uc->tcg_ctx);
     /* XXX: flush processor icache at this point if cache flush is
        expensive */
@@ -339,6 +340,45 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     dest->jmp_list_head = (uintptr_t)NULL;
 }
 
+static gboolean tb_flush_jit_unlink(gpointer key, gpointer value,
+                                    gpointer data)
+{
+    TranslationBlock *tb = value;
+
+    (void)key;
+    (void)data;
+    if (tb->cflags & CF_INVALID) {
+        return false;
+    }
+    tb->cflags |= CF_INVALID;
+    tb_remove_from_jmp_list(tb, 0);
+    tb_remove_from_jmp_list(tb, 1);
+    tb_jmp_unlink(tb);
+    return false;
+}
+
+void tb_flush_jit(CPUState *cpu)
+{
+    struct uc_struct *uc = cpu->uc;
+    TCGContext *tcg_ctx = uc->tcg_ctx;
+    bool code_gen_locked;
+
+    mmap_lock();
+    code_gen_locked = tb_exec_is_locked(uc);
+    tb_exec_unlock(uc);
+
+    g_tree_foreach(tcg_ctx->tree, tb_flush_jit_unlink, NULL);
+    tcg_restore_state_cache_clear(tcg_ctx);
+    cpu_tb_jmp_cache_clear(cpu);
+    qht_reset_size(uc, &tcg_ctx->tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
+    page_flush_tb(uc);
+    uc->last_tb_valid = false;
+    tcg_ctx->tb_ctx.tb_flush_count++;
+
+    tb_exec_change(uc, code_gen_locked);
+    mmap_unlock();
+}
+
 /*
  * If @rm_from_page_list is set, call with logical ownership of the TB pages.
  */
@@ -359,6 +399,7 @@ static void do_tb_phys_invalidate(TCGContext *tcg_ctx,
 
     /* make sure no further incoming jumps will be chained to this TB */
     tb->cflags = tb->cflags | CF_INVALID;
+    tcg_restore_state_cache_remove(tcg_ctx, tb);
 
     /* remove the TB from the hash list */
     phys_pc = tb->page_addr[0] + (tb->pc & ~TARGET_PAGE_MASK);
@@ -634,7 +675,7 @@ static void tb_invalidate_phys_page_range__locked(
     if (current_tb_modified) {
         page_collection_unlock(pages);
         /* Force execution of one insn next time.  */
-        cpu->cflags_next_tb = 1 | curr_cflags();
+        cpu->cflags_next_tb = 1 | curr_cflags(cpu->uc);
         mmap_unlock();
         cpu_loop_exit_noexc(cpu);
     }

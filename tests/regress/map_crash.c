@@ -1,32 +1,35 @@
-#include <unicorn/unicorn.h>
-#include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define UC_BUG_WRITE_SIZE 13000
-#define UC_BUG_WRITE_ADDR 0x1000
+#include <unicorn/unicorn.h>
+
+#define ADDRESS 0x1000
+#define INVALID_SIZE 13000
+#define VALID_SIZE 0x4000
 
 int main(void)
 {
-    int size;
-    uint8_t *buf;
+    uint8_t *data;
     uc_engine *uc;
-    uc_err err = uc_open (UC_ARCH_X86, UC_MODE_64, &uc);
-    if (err) {
-        fprintf (stderr, "Cannot initialize unicorn\n");
+
+    data = malloc(VALID_SIZE);
+    if (data == NULL) {
         return 1;
     }
-    size = UC_BUG_WRITE_SIZE;
-    buf = malloc (size);
-    if (!buf) {
-        fprintf (stderr, "Cannot allocate\n");
+    memset(data, 0xa5, VALID_SIZE);
+
+    if (uc_open(UC_ARCH_X86, UC_MODE_64, &uc) != UC_ERR_OK) {
+        free(data);
         return 1;
     }
-    memset (buf, 0, size);
-    if (!uc_mem_map (uc, UC_BUG_WRITE_ADDR, size, UC_PROT_ALL)) {
-        uc_mem_write (uc, UC_BUG_WRITE_ADDR, buf, size);
+    if (uc_mem_map(uc, ADDRESS, INVALID_SIZE, UC_PROT_ALL) != UC_ERR_ARG ||
+        uc_mem_map(uc, ADDRESS, VALID_SIZE, UC_PROT_ALL) != UC_ERR_OK ||
+        uc_mem_write(uc, ADDRESS, data, VALID_SIZE) != UC_ERR_OK) {
+        uc_close(uc);
+        free(data);
+        return 1;
     }
-    uc_close(uc);
-    free(buf);
-    return 0;
+
+    free(data);
+    return uc_close(uc) == UC_ERR_OK ? 0 : 1;
 }

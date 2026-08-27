@@ -1,82 +1,92 @@
-#include <sys/types.h>
-#include <stdlib.h>
-#include <string.h>
-
+#include <stdbool.h>
+#include <stdio.h>
 #include <unicorn/unicorn.h>
 
-static int count = 1;
+#define CODE_ADDRESS UINT64_C(0x1000000)
+#define LOOP_ADDRESS (CODE_ADDRESS + UINT64_C(4))
 
-// Callback function for tracing code (UC_HOOK_CODE & UC_HOOK_BLOCK)
-// @address: address where the code is being executed
-// @size: size of machine instruction being executed
-// @user_data: user data passed to tracing APIs.
-void cb_hookblock(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-   fprintf(stderr, "# >>> Tracing basic block at 0x%"PRIx64", block size = 0x%x\n", address, size);
-   if (address != 0x1000000 && address != 0x1000200) {
-      fprintf(stderr, "not ok %d - address != 0x1000000 && address != 0x1000200\n", count++);
-      _exit(1);
-   }
-   fprintf(stderr, "ok %d - address (0x%x) is start of basic block\n", count++, (uint32_t)address);
-   if (size != 0x200) {
-      fprintf(stderr, "not ok %d - basic block size != 0x200\n", count++);
-      _exit(1);
-   }
-   fprintf(stderr, "ok %d - basic block size is correct\n", count++);
+typedef struct BlockState {
+    unsigned int count;
+    bool failed;
+} BlockState;
+
+static void hook_block(uc_engine *uc, uint64_t address, uint32_t size,
+                       void *user_data)
+{
+    const uint64_t expected_addresses[] = {
+        CODE_ADDRESS,
+        LOOP_ADDRESS,
+        LOOP_ADDRESS,
+    };
+    BlockState *state = user_data;
+
+    if (state->count >= 3 || address != expected_addresses[state->count] ||
+        size != 3) {
+        state->failed = true;
+        uc_emu_stop(uc);
+        return;
+    }
+    state->count++;
+    if (state->count == 3) {
+        if (uc_emu_stop(uc) != UC_ERR_OK) {
+            state->failed = true;
+        }
+    }
 }
+int main(void)
+{
+    const uint8_t code[] = {
+        0x90,       /* nop */
+        0xeb, 0x01, /* jmp LOOP_ADDRESS */
+        0x90,       /* unreachable nop */
+        0x90,       /* nop */
+        0xeb, 0xfd, /* jmp LOOP_ADDRESS */
+    };
+    BlockState state = {0};
+    uc_engine *uc = NULL;
+    uc_hook hook;
+    uc_err err;
 
-int main(void) {
-   uc_engine *uc;
+    err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_open failed: %s\n", uc_strerror(err));
+        return 1;
+    }
+    err = uc_mem_map(uc, CODE_ADDRESS, 0x1000, UC_PROT_ALL);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_map failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code));
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_write failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_hook_add(uc, &hook, UC_HOOK_BLOCK, hook_block, &state, 1, 0);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_hook_add failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
 
-   fprintf(stderr, "# basic block callback test\n");
-   fprintf(stderr, "# there are only two basic blocks 0x1000000-0x10001ff and 0x1000200-0x10003ff\n");
-   
-   uc_err err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc);
-   if (err != UC_ERR_OK) {
-      fprintf(stderr, "not ok %d - %s\n", count++, uc_strerror(err));
-      exit(0);
-   }
-   fprintf(stderr, "ok %d - uc_open\n", count++);
+    err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code), 0, 0);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_emu_start failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    if (state.failed || state.count != 3) {
+        fprintf(stderr, "unexpected block trace: count=%u failed=%d\n",
+                state.count, state.failed);
+        goto fail;
+    }
 
-   err = uc_mem_map(uc, 0x1000000, 4096, UC_PROT_ALL);
-   if (err != UC_ERR_OK) {
-      fprintf(stderr, "not ok %d - %s\n", count++, uc_strerror(err));
-      exit(0);
-   }
-   fprintf(stderr, "ok %d - uc_mem_map\n", count++);
+    err = uc_close(uc);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_close failed: %s\n", uc_strerror(err));
+        return 1;
+    }
+    return 0;
 
-   uint8_t code[1024];
-   //build a program that consists of 1019 nops followed by a jump -512
-   //this program contains exactly 2 basic blocks, a block of 512 nops, followed
-   //by a loop body containing 507 nops and jump to the top of the loop
-   //the first basic block begins at address 0x1000000, and the second
-   //basic block begins at address 0x1000200
-   memset(code, 0x90, sizeof(code));
-   memcpy(code + 1024 - 5, "\xe9\x00\xfe\xff\xff", 5);
-
-   err = uc_mem_write(uc, 0x1000000, code, sizeof(code));
-   if (err != UC_ERR_OK) {
-      fprintf(stderr, "not ok %d - %s\n", count++, uc_strerror(err));
-      exit(0);
-   }
-   fprintf(stderr, "ok %d - uc_mem_write\n", count++);
-   
-   uc_hook h1;
-
-   err = uc_hook_add(uc, &h1, UC_HOOK_BLOCK, cb_hookblock, NULL, 1, 0);
-   if (err != UC_ERR_OK) {
-      fprintf(stderr, "not ok %d - %s\n", count++, uc_strerror(err));
-      exit(0);
-   }
-   fprintf(stderr, "ok %d - uc_hook_add\n", count++);
-
-   err = uc_emu_start(uc, 0x1000000, 0x1000000 + sizeof(code), 0, 1030);
-   if (err != UC_ERR_OK) {
-      fprintf(stderr, "not ok %d - %s\n", count++, uc_strerror(err));
-      exit(0);
-   }
-   fprintf(stderr, "ok %d - uc_emu_start\n", count++);
-
-   fprintf(stderr, "ok %d - Done", count++);
-
-   return 0;
+fail:
+    uc_close(uc);
+    return 1;
 }

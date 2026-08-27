@@ -293,6 +293,10 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
     HOOK_FOREACH(env->uc, hook, UC_HOOK_INSN) {
         if (hook->to_delete)
             continue;
+        if (hook->insn !=
+            (env->aarch64 ? UC_ARM64_INS_WFI : UC_ARM_INS_WFI)) {
+            continue;
+        }
         if (!HOOK_BOUND_CHECK(hook, env->pc))
             continue;
         if (hook->insn == (env->aarch64 ? UC_ARM64_INS_WFI : UC_ARM_INS_WFI)) {
@@ -305,7 +309,7 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
         }
 
         // the last callback may already asked to stop emulation
-        if (env->uc->stop_request)
+        if (uc_stop_requested(env->uc))
             break;
     }
 

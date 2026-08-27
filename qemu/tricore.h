@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _tricore
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_tricore
+#define helper_uc_tracecode_single helper_uc_tracecode_single_tricore
+#define cpu_restore_icount cpu_restore_icount_tricore
 #define unicorn_fill_tlb unicorn_fill_tlb_tricore
 #define reg_read reg_read_tricore
 #define reg_write reg_write_tricore
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_tricore
 #define tb_cleanup tb_cleanup_tricore
 #define tb_flush tb_flush_tricore
+#define tb_flush_jit tb_flush_jit_tricore
 #define tb_phys_invalidate tb_phys_invalidate_tricore
 #define tb_gen_code tb_gen_code_tricore
 #define tb_reset_jump tb_reset_jump_tricore

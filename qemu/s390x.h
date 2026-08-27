@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _s390x
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_s390x
+#define helper_uc_tracecode_single helper_uc_tracecode_single_s390x
+#define cpu_restore_icount cpu_restore_icount_s390x
 #define unicorn_fill_tlb unicorn_fill_tlb_s390x
 #define reg_read reg_read_s390x
 #define reg_write reg_write_s390x
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_s390x
 #define tb_cleanup tb_cleanup_s390x
 #define tb_flush tb_flush_s390x
+#define tb_flush_jit tb_flush_jit_s390x
 #define tb_phys_invalidate tb_phys_invalidate_s390x
 #define tb_gen_code tb_gen_code_s390x
 #define tb_reset_jump tb_reset_jump_s390x

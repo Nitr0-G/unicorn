@@ -147,6 +147,99 @@ static void test_mem_protect_map_ptr(void)
     free(data1);
 }
 
+static void test_mem_cross_region_access(void)
+{
+    const uint64_t first_address = 0x1000;
+    const uint64_t hole_address = 0x4000;
+    uint8_t input[16];
+    uint8_t output[16];
+    uint8_t *first = calloc(1, 0x1000);
+    uint8_t *second = calloc(1, 0x1000);
+    uint8_t *before_hole = calloc(1, 0x1000);
+    uc_engine *uc;
+    size_t i;
+
+    TEST_CHECK(first != NULL);
+    TEST_CHECK(second != NULL);
+    TEST_CHECK(before_hole != NULL);
+    for (i = 0; i < sizeof(input); i++) {
+        input[i] = (uint8_t)(0x40 + i);
+    }
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    OK(uc_mem_map_ptr(uc, first_address, 0x1000, UC_PROT_ALL, first));
+    OK(uc_mem_map_ptr(uc, first_address + 0x1000, 0x1000,
+                      UC_PROT_ALL, second));
+    OK(uc_mem_map_ptr(uc, hole_address, 0x1000, UC_PROT_ALL,
+                      before_hole));
+
+    OK(uc_mem_write(uc, first_address + 0xff8, input, sizeof(input)));
+    TEST_CHECK(memcmp(first + 0xff8, input, 8) == 0);
+    TEST_CHECK(memcmp(second, input + 8, 8) == 0);
+    memset(output, 0, sizeof(output));
+    OK(uc_mem_read(uc, first_address + 0xff8, output, sizeof(output)));
+    TEST_CHECK(memcmp(output, input, sizeof(input)) == 0);
+
+    memset(before_hole + 0xff8, 0x5a, 8);
+    uc_assert_err(UC_ERR_WRITE_UNMAPPED,
+                  uc_mem_write(uc, hole_address + 0xff8,
+                               input, sizeof(input)));
+    for (i = 0; i < 8; i++) {
+        TEST_CHECK(before_hole[0xff8 + i] == 0x5a);
+    }
+    memset(output, 0xa5, sizeof(output));
+    uc_assert_err(UC_ERR_READ_UNMAPPED,
+                  uc_mem_read(uc, hole_address + 0xff8,
+                              output, sizeof(output)));
+    for (i = 0; i < sizeof(output); i++) {
+        TEST_CHECK(output[i] == 0xa5);
+    }
+
+    OK(uc_close(uc));
+    free(before_hole);
+    free(second);
+    free(first);
+}
+
+static void test_mem_regions_topology(void)
+{
+    const uint64_t address = 0x8000;
+    uint8_t *memory = calloc(1, 0x3000);
+    uc_mem_region *regions;
+    uint32_t count;
+    uc_engine *uc;
+
+    TEST_CHECK(memory != NULL);
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    OK(uc_mem_map_ptr(uc, address, 0x3000, UC_PROT_ALL, memory));
+    OK(uc_mem_protect(uc, address + 0x1000, 0x1000, UC_PROT_READ));
+
+    OK(uc_mem_regions(uc, &regions, &count));
+    TEST_CHECK(count == 3);
+    TEST_CHECK(regions[0].begin == address);
+    TEST_CHECK(regions[0].end == address + 0xfff);
+    TEST_CHECK(regions[0].perms == UC_PROT_ALL);
+    TEST_CHECK(regions[1].begin == address + 0x1000);
+    TEST_CHECK(regions[1].end == address + 0x1fff);
+    TEST_CHECK(regions[1].perms == UC_PROT_READ);
+    TEST_CHECK(regions[2].begin == address + 0x2000);
+    TEST_CHECK(regions[2].end == address + 0x2fff);
+    TEST_CHECK(regions[2].perms == UC_PROT_ALL);
+    OK(uc_free(regions));
+
+    OK(uc_mem_unmap(uc, address + 0x1000, 0x1000));
+    OK(uc_mem_regions(uc, &regions, &count));
+    TEST_CHECK(count == 2);
+    TEST_CHECK(regions[0].begin == address);
+    TEST_CHECK(regions[0].end == address + 0xfff);
+    TEST_CHECK(regions[1].begin == address + 0x2000);
+    TEST_CHECK(regions[1].end == address + 0x2fff);
+    OK(uc_free(regions));
+
+    OK(uc_close(uc));
+    free(memory);
+}
+
 static void test_map_at_the_end(void)
 {
     uc_engine *uc;
@@ -227,6 +320,105 @@ static void test_mem_protect_remove_exec(void)
     TEST_CHECK(called_count == 2);
 
     OK(uc_close(uc));
+}
+
+typedef enum TestActiveCodePageAction {
+    TEST_ACTIVE_CODE_PROTECT,
+    TEST_ACTIVE_CODE_UNMAP,
+} TestActiveCodePageAction;
+
+typedef struct TestActiveCodePageData {
+    TestActiveCodePageAction action;
+    uint32_t count;
+} TestActiveCodePageData;
+
+static void test_active_code_page_callback(uc_engine *uc, uint64_t address,
+                                           uint32_t size, void *user_data)
+{
+    TestActiveCodePageData *data =
+        (TestActiveCodePageData *)user_data;
+
+    data->count++;
+    if (data->action == TEST_ACTIVE_CODE_PROTECT) {
+        OK(uc_mem_protect(uc, 0x1000, 0x1000,
+                          UC_PROT_READ | UC_PROT_WRITE));
+    } else {
+        OK(uc_mem_unmap(uc, 0x1000, 0x1000));
+    }
+}
+
+static void test_active_code_page_change_one(TestActiveCodePageAction action)
+{
+    const char code[] = "\x40\x40";
+    TestActiveCodePageData data = { .action = action };
+    uint32_t eax = 0;
+    uint32_t eip;
+    uc_engine *uc;
+    uc_hook hook;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, 0x1000, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, 0x1000, code, sizeof(code) - 1));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_active_code_page_callback, &data,
+                   0x1000, 0x1000));
+
+    OK(uc_emu_start(uc, 0x1000, 0x1000 + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    TEST_CHECK(data.count == 1);
+    TEST_CHECK(eax == 0);
+    TEST_CHECK(eip == 0x1000);
+
+    if (action == TEST_ACTIVE_CODE_PROTECT) {
+        uc_assert_err(UC_ERR_FETCH_PROT,
+                      uc_emu_start(uc, 0x1000,
+                                   0x1000 + sizeof(code) - 1, 0, 0));
+    } else {
+        uc_assert_err(UC_ERR_FETCH_UNMAPPED,
+                      uc_emu_start(uc, 0x1000,
+                                   0x1000 + sizeof(code) - 1, 0, 0));
+    }
+
+    OK(uc_close(uc));
+}
+
+static void test_active_code_page_change(void)
+{
+    test_active_code_page_change_one(TEST_ACTIVE_CODE_PROTECT);
+    test_active_code_page_change_one(TEST_ACTIVE_CODE_UNMAP);
+}
+
+static void test_inactive_code_page_change_one(TestActiveCodePageAction action)
+{
+    const char code[] = "\x40";
+    uint32_t eax = 0;
+    uint32_t eip = 0x1000;
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map(uc, 0x1000, 0x2000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, 0x2000, code, sizeof(code) - 1));
+    OK(uc_reg_write(uc, UC_X86_REG_EIP, &eip));
+    if (action == TEST_ACTIVE_CODE_PROTECT) {
+        OK(uc_mem_protect(uc, 0x1000, 0x1000,
+                          UC_PROT_READ | UC_PROT_WRITE));
+    } else {
+        OK(uc_mem_unmap(uc, 0x1000, 0x1000));
+    }
+
+    OK(uc_emu_start(uc, 0x2000, 0x2000 + sizeof(code) - 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 1);
+
+    OK(uc_close(uc));
+}
+
+static void test_inactive_code_page_change(void)
+{
+    test_inactive_code_page_change_one(TEST_ACTIVE_CODE_PROTECT);
+    test_inactive_code_page_change_one(TEST_ACTIVE_CODE_UNMAP);
 }
 
 static uint64_t test_mem_protect_mmio_read_cb(struct uc_struct *uc,
@@ -315,6 +507,63 @@ static void test_snapshot(void)
 
     OK(uc_context_free(c0));
     OK(uc_context_free(c1));
+    OK(uc_close(uc));
+}
+
+typedef struct TestSnapshotCodeRestoreData {
+    uc_context *context;
+    uint32_t count;
+    bool restored;
+} TestSnapshotCodeRestoreData;
+
+static void test_snapshot_code_restore_callback(uc_engine *uc,
+                                                uint64_t address,
+                                                uint32_t size,
+                                                void *user_data)
+{
+    TestSnapshotCodeRestoreData *data =
+        (TestSnapshotCodeRestoreData *)user_data;
+
+    data->count++;
+    if (!data->restored) {
+        data->restored = true;
+        OK(uc_context_restore(uc, data->context));
+    }
+}
+
+static void test_snapshot_code_restore_from_callback(void)
+{
+    const uint8_t snapshot_code[] = { 0x90, 0x43 };
+    const uint8_t live_code[] = { 0x90, 0x40 };
+    uint8_t restored_code[sizeof(snapshot_code)];
+    TestSnapshotCodeRestoreData data = { 0 };
+    uint32_t eax = 0;
+    uint32_t ebx = 0;
+    uc_engine *uc;
+    uc_hook hook;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_ctl_context_mode(uc, UC_CTL_CONTEXT_MEMORY));
+    OK(uc_mem_map(uc, 0x1000, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, 0x1000, snapshot_code, sizeof(snapshot_code)));
+    OK(uc_context_alloc(uc, &data.context));
+    OK(uc_context_save(uc, data.context));
+    OK(uc_mem_write(uc, 0x1000, live_code, sizeof(live_code)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_snapshot_code_restore_callback, &data,
+                   0x1000, 0x1000));
+
+    OK(uc_emu_start(uc, 0x1000, 0x1000 + sizeof(live_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_mem_read(uc, 0x1000, restored_code, sizeof(restored_code)));
+    TEST_CHECK(data.count == 2);
+    TEST_CHECK(eax == 0);
+    TEST_CHECK(ebx == 1);
+    TEST_CHECK(memcmp(restored_code, snapshot_code,
+                      sizeof(snapshot_code)) == 0);
+
+    OK(uc_context_free(data.context));
     OK(uc_close(uc));
 }
 
@@ -509,7 +758,7 @@ static void test_mem_read_and_write_large_memory_block(void)
     return;
 #endif 
 
-    OK(uc_open(UC_ARCH_ARM64, UC_MODE_ARM, &uc));
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
     OK(uc_mem_map(uc, mem_addr, mem_size, UC_PROT_ALL));
 
     pmem = malloc(mem_size);
@@ -687,12 +936,19 @@ TEST_LIST = {{"test_map_correct", test_map_correct},
              {"test_splitting_mem_unmap", test_splitting_mem_unmap},
              {"test_splitting_mmio_unmap", test_splitting_mmio_unmap},
              {"test_mem_protect_map_ptr", test_mem_protect_map_ptr},
+             {"test_mem_cross_region_access", test_mem_cross_region_access},
+             {"test_mem_regions_topology", test_mem_regions_topology},
              {"test_map_at_the_end", test_map_at_the_end},
              {"test_map_wrap", test_map_wrap},
              {"test_map_big_memory", test_map_big_memory},
              {"test_mem_protect_remove_exec", test_mem_protect_remove_exec},
+             {"test_active_code_page_change", test_active_code_page_change},
+             {"test_inactive_code_page_change",
+              test_inactive_code_page_change},
              {"test_mem_protect_mmio", test_mem_protect_mmio},
              {"test_snapshot", test_snapshot},
+             {"test_snapshot_code_restore_from_callback",
+              test_snapshot_code_restore_from_callback},
              {"test_snapshot_with_vtlb", test_snapshot_with_vtlb},
              {"test_context_snapshot", test_context_snapshot},
              {"test_snapshot_unmap", test_snapshot_unmap},

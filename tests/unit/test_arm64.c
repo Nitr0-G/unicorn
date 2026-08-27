@@ -283,11 +283,14 @@ static void test_arm64_read_sctlr(void)
     OK(uc_close(uc));
 }
 
+static uint32_t test_arm64_hook_insn_mrs_count;
+
 static uint32_t test_arm64_hook_insn_mrs_cb(uc_engine *uc, uc_arm64_reg reg,
                                        const uc_arm64_cp_reg *cp_reg)
 {
     uint64_t r_x2 = 0x114514;
 
+    test_arm64_hook_insn_mrs_count++;
     OK(uc_reg_write(uc, reg, &r_x2));
 
     // Skip
@@ -305,6 +308,10 @@ static void test_arm64_hook_insn_mrs(void)
     uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN | UC_MODE_ARM,
                     code, sizeof(code) - 1, UC_CPU_ARM64_A72);
 
+    test_arm64_hook_insn_mrs_count = 0;
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    TEST_CHECK(test_arm64_hook_insn_mrs_count == 0);
+
     OK(uc_hook_add(uc, &hk, UC_HOOK_INSN, (void *)test_arm64_hook_insn_mrs_cb, NULL,
                    1, 0, UC_ARM64_INS_MRS));
 
@@ -313,8 +320,13 @@ static void test_arm64_hook_insn_mrs(void)
     OK(uc_reg_read(uc, UC_ARM64_REG_X2, &r_x2));
 
     TEST_CHECK(r_x2 == 0x114514);
+    TEST_CHECK(test_arm64_hook_insn_mrs_count == 1);
 
     OK(uc_hook_del(uc, hk));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    TEST_CHECK(test_arm64_hook_insn_mrs_count == 1);
 
     OK(uc_close(uc));
 }
@@ -330,18 +342,25 @@ static void test_arm64_hook_insn_wfi(void)
 {
     uc_engine *uc;
     uc_hook hook;
+    uc_hook unrelated_hook;
     char code[] = "\x7f\x20\x03\xd5"; // wfi
     WFI_HOOK_INSN_RESULT result = {false};
+    WFI_HOOK_INSN_RESULT unrelated = {false};
 
     uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN | UC_MODE_ARM,
                     code, sizeof(code) - 1, UC_CPU_ARM64_A72);
     OK(uc_hook_add(uc, &hook, UC_HOOK_INSN, test_arm64_hook_insn_wfi_callback, &result, 1, 0,
                    UC_ARM64_INS_WFI));
+    OK(uc_hook_add(uc, &unrelated_hook, UC_HOOK_INSN,
+                   test_arm64_hook_insn_wfi_callback, &unrelated, 1, 0,
+                   UC_ARM64_INS_MRS));
 
     OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
     TEST_CHECK(result.called == true);
+    TEST_CHECK(unrelated.called == false);
 
     OK(uc_hook_del(uc, hook));
+    OK(uc_hook_del(uc, unrelated_hook));
     OK(uc_close(uc));
 }
 
@@ -869,6 +888,87 @@ static uint32_t test_arm64_msr_sysreg(uint32_t rt,
     return 0xd5000000 | (cpregid[0] << 19) | (cpregid[1] << 16) |
            (cpregid[2] << 12) | (cpregid[3] << 8) |
            (cpregid[4] << 5) | rt;
+}
+
+static void test_arm64_eret_el1_to_el0(void)
+{
+    const char eret[] = "\xe0\x03\x9f\xd6";
+    const char target_code[] =
+        "\x40\x05\x80\xd2" /* mov x0, #42 */
+        "\xe1\x03\x00\x91"; /* mov x1, sp */
+    const uint32_t ELR_EL1[5] = { 3, 0, 4, 0, 1 };
+    const uint32_t SPSR_EL1[5] = { 3, 0, 4, 0, 0 };
+    const uint64_t target = code_start + 0x1000;
+    const uint64_t sp_el1 = 0x41000;
+    uint32_t pstate = 5;
+    uint64_t pc = code_start;
+    uint64_t sp = sp_el1;
+    uint64_t sp_el0 = 0x42000;
+    uint64_t x0 = 0;
+    uint64_t x1 = 0;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, eret,
+                    sizeof(eret) - 1, UC_CPU_ARM64_A72);
+    OK(uc_mem_write(uc, target, target_code, sizeof(target_code) - 1));
+    OK(uc_reg_write(uc, UC_ARM64_REG_PSTATE, &pstate));
+    OK(uc_reg_write(uc, UC_ARM64_REG_SP_EL0, &sp_el0));
+    OK(uc_reg_write(uc, UC_ARM64_REG_SP, &sp));
+    test_arm64_pauth_cp_reg_write(uc, ELR_EL1, target);
+    test_arm64_pauth_cp_reg_write(uc, SPSR_EL1, 0);
+    OK(uc_reg_write(uc, UC_ARM64_REG_PC, &pc));
+
+    OK(uc_emu_start(uc, code_start, UINT64_MAX, 0, 3));
+    OK(uc_reg_read(uc, UC_ARM64_REG_PSTATE, &pstate));
+    OK(uc_reg_read(uc, UC_ARM64_REG_PC, &pc));
+    OK(uc_reg_read(uc, UC_ARM64_REG_SP, &sp));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X0, &x0));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X1, &x1));
+
+    TEST_CHECK((pstate & 0xf) == 0);
+    TEST_CHECK((pstate & (1U << 20)) == 0);
+    TEST_CHECK(pc == target + sizeof(target_code) - 1);
+    TEST_CHECK(sp == sp_el0);
+    TEST_CHECK(x0 == 42);
+    TEST_CHECK(x1 == sp_el0);
+    OK(uc_close(uc));
+}
+
+static void test_arm64_eret_illegal_spsr(void)
+{
+    const char eret[] = "\xe0\x03\x9f\xd6";
+    const char target_code[] = "\x40\x05\x80\xd2"; /* mov x0, #42 */
+    const uint32_t ELR_EL1[5] = { 3, 0, 4, 0, 1 };
+    const uint32_t SPSR_EL1[5] = { 3, 0, 4, 0, 0 };
+    const uint64_t target = code_start + 0x1000;
+    const uint64_t sp_el1 = 0x41000;
+    uint32_t pstate = 5;
+    uint64_t pc = code_start;
+    uint64_t sp = sp_el1;
+    uint64_t x0 = 0;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, eret,
+                    sizeof(eret) - 1, UC_CPU_ARM64_A72);
+    OK(uc_mem_write(uc, target, target_code, sizeof(target_code) - 1));
+    OK(uc_reg_write(uc, UC_ARM64_REG_PSTATE, &pstate));
+    OK(uc_reg_write(uc, UC_ARM64_REG_SP, &sp));
+    test_arm64_pauth_cp_reg_write(uc, ELR_EL1, target);
+    test_arm64_pauth_cp_reg_write(uc, SPSR_EL1, 2);
+    OK(uc_reg_write(uc, UC_ARM64_REG_PC, &pc));
+
+    OK(uc_emu_start(uc, code_start, UINT64_MAX, 0, 2));
+    OK(uc_reg_read(uc, UC_ARM64_REG_PSTATE, &pstate));
+    OK(uc_reg_read(uc, UC_ARM64_REG_PC, &pc));
+    OK(uc_reg_read(uc, UC_ARM64_REG_SP, &sp));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X0, &x0));
+
+    TEST_CHECK((pstate & 0xf) == 5);
+    TEST_CHECK((pstate & (1U << 20)) != 0);
+    TEST_CHECK(pc == target + sizeof(target_code) - 1);
+    TEST_CHECK(sp == sp_el1);
+    TEST_CHECK(x0 == 42);
+    OK(uc_close(uc));
 }
 
 static void test_arm64_pauth_check_cpu_feat(uc_engine *uc)
@@ -3494,6 +3594,118 @@ static void test_arm64_emit32(uint8_t *code, int offset, uint32_t insn)
     code[offset + 1] = (uint8_t)(insn >> 8);
     code[offset + 2] = (uint8_t)(insn >> 16);
     code[offset + 3] = (uint8_t)(insn >> 24);
+}
+
+static void test_arm64_advsimd_aes_sha256(void)
+{
+    const uint32_t ID_AA64ISAR0_EL1[5] = { 3, 0, 0, 6, 0 };
+    const uint8_t aes_state[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    const uint8_t aes_key[16] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    };
+    const uint8_t aes_expected[16] = {
+        0x5f, 0x72, 0x64, 0x15, 0x57, 0xf5, 0xbc, 0x92,
+        0xf7, 0xbe, 0x3b, 0x29, 0x1d, 0xb9, 0xf9, 0x1a,
+    };
+    const uint32_t sha_abcd[4] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    };
+    const uint32_t sha_efgh[4] = {
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+    const uint32_t sha_wk[4] = {
+        0xc28a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    };
+    const uint32_t sha_expected[4] = {
+        0x4c23eacb, 0xc4ac5526, 0x9ce564d0, 0x7c08884d,
+    };
+    uint8_t code[12];
+    uint64_t q0[2];
+    uint64_t q1[2];
+    uint64_t q2[2];
+    uint64_t q3[2];
+    uint64_t q4[2];
+    uint64_t isar0;
+    uc_engine *uc;
+
+    test_arm64_emit32(code, 0, 0x4e284820); /* aese v0.16b,v1.16b */
+    test_arm64_emit32(code, 4, 0x4e286800); /* aesmc v0.16b,v0.16b */
+    test_arm64_emit32(code, 8, 0x5e044062); /* sha256h q2,q3,v4.4s */
+    memcpy(q0, aes_state, sizeof(q0));
+    memcpy(q1, aes_key, sizeof(q1));
+    memcpy(q2, sha_abcd, sizeof(q2));
+    memcpy(q3, sha_efgh, sizeof(q3));
+    memcpy(q4, sha_wk, sizeof(q4));
+
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM64_A72);
+    isar0 = test_arm64_pauth_cp_reg_read(uc, ID_AA64ISAR0_EL1);
+    TEST_CHECK(((isar0 >> 4) & 0xf) == 2);
+    TEST_CHECK(((isar0 >> 12) & 0xf) == 1);
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q0, q0));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q1, q1));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q2, q2));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q3, q3));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q4, q4));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM64_REG_Q0, q0));
+    OK(uc_reg_read(uc, UC_ARM64_REG_Q2, q2));
+    TEST_CHECK(memcmp(q0, aes_expected, sizeof(q0)) == 0);
+    TEST_CHECK(memcmp(q2, sha_expected, sizeof(q2)) == 0);
+    OK(uc_close(uc));
+}
+
+static void test_arm64_advsimd_sha512_gating(void)
+{
+    const uint32_t ID_AA64ISAR0_EL1[5] = { 3, 0, 0, 6, 0 };
+    const uint64_t initial[2] = {
+        0x0123456789abcdefull, 0xfedcba9876543210ull,
+    };
+    const uint64_t n[2] = {
+        0x0f1e2d3c4b5a6978ull, 0x8877665544332211ull,
+    };
+    const uint64_t m[2] = {
+        0x1122334455667788ull, 0x99aabbccddeeff00ull,
+    };
+    const uint64_t expected[2] = {
+        0xf22187af14bd61d2ull, 0xade8df75813c30beull,
+    };
+    uint8_t code[4];
+    uint64_t q0[2];
+    uint64_t isar0;
+    uc_engine *uc;
+
+    test_arm64_emit32(code, 0, 0xce628020); /* sha512h q0,q1,v2.2d */
+    memcpy(q0, initial, sizeof(q0));
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM64_MAX);
+    isar0 = test_arm64_pauth_cp_reg_read(uc, ID_AA64ISAR0_EL1);
+    TEST_CHECK(((isar0 >> 12) & 0xf) == 2);
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q0, q0));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q1, n));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q2, m));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM64_REG_Q0, q0));
+    TEST_CHECK(memcmp(q0, expected, sizeof(q0)) == 0);
+    OK(uc_close(uc));
+
+    memcpy(q0, initial, sizeof(q0));
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM64_A72);
+    isar0 = test_arm64_pauth_cp_reg_read(uc, ID_AA64ISAR0_EL1);
+    TEST_CHECK(((isar0 >> 12) & 0xf) == 1);
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q0, q0));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q1, n));
+    OK(uc_reg_write(uc, UC_ARM64_REG_Q2, m));
+    TEST_CHECK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0) ==
+               UC_ERR_EXCEPTION);
+    OK(uc_reg_read(uc, UC_ARM64_REG_Q0, q0));
+    TEST_CHECK(memcmp(q0, initial, sizeof(q0)) == 0);
+    OK(uc_close(uc));
 }
 
 static void test_arm64_mte_simd_fp_single_access(void)
@@ -12420,6 +12632,9 @@ TEST_LIST = {{"test_arm64_until", test_arm64_until},
               test_arm64_lse_rcpc_a72_rejects},
              {"test_arm64_dgh_hint", test_arm64_dgh_hint},
              {"test_arm64_read_sctlr", test_arm64_read_sctlr},
+             {"test_arm64_eret_el1_to_el0", test_arm64_eret_el1_to_el0},
+             {"test_arm64_eret_illegal_spsr",
+              test_arm64_eret_illegal_spsr},
              {"test_arm64_hook_insn_mrs", test_arm64_hook_insn_mrs},
              {"test_arm64_hook_insn_wfi", test_arm64_hook_insn_wfi},
              {"test_arm64_correct_address_in_small_jump_hook",
@@ -12455,6 +12670,10 @@ TEST_LIST = {{"test_arm64_until", test_arm64_until},
              {"test_arm64_sme_ldst1_mte", test_arm64_sme_ldst1_mte},
              {"test_arm64_sme_imopa", test_arm64_sme_imopa},
              {"test_arm64_sme_fpout", test_arm64_sme_fpout},
+             {"test_arm64_advsimd_aes_sha256",
+              test_arm64_advsimd_aes_sha256},
+             {"test_arm64_advsimd_sha512_gating",
+              test_arm64_advsimd_sha512_gating},
              {"test_arm64_i8mm_advsimd", test_arm64_i8mm_advsimd},
              {"test_arm64_bf16_advsimd", test_arm64_bf16_advsimd},
              {"test_arm64_pauth_vanilla", test_arm64_pauth_vanilla},

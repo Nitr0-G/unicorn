@@ -35,6 +35,9 @@ static void clear_deleted_hooks(uc_engine *uc);
 static uc_err uc_snapshot(uc_engine *uc);
 static uc_err uc_restore_latest_snapshot(uc_engine *uc);
 
+#define UC_HOOK_MEM_FAST_PATH                                               \
+    (UC_HOOK_MEM_READ | UC_HOOK_MEM_READ_AFTER | UC_HOOK_MEM_WRITE)
+
 #define UC_MTE_TAG_STORAGE_GRANULE 32
 
 #if defined(__APPLE__) && defined(HAVE_PTHREAD_JIT_PROTECT) &&                 \
@@ -99,6 +102,33 @@ static void hook_invalidate_region(void *key, void *data, void *opaq)
     HookedRegion *region = (HookedRegion *)key;
 
     uc->uc_invalidate_tb(uc, region->start, region->length);
+}
+
+static void request_tb_flush(uc_engine *uc)
+{
+    if (uc->tb_exec_depth != 0) {
+        uc->tb_flush_pending = true;
+        uc->tb_flush_deferred(uc);
+    } else {
+        uc->tb_flush(uc);
+    }
+}
+
+static void hook_invalidate_range(uc_engine *uc, uint64_t begin,
+                                  uint64_t end)
+{
+    uint64_t span;
+
+    if (end < begin) {
+        request_tb_flush(uc);
+        return;
+    }
+    span = end - begin;
+    if (span >= SIZE_MAX) {
+        request_tb_flush(uc);
+        return;
+    }
+    uc->uc_invalidate_tb(uc, begin, (size_t)span + 1);
 }
 
 static void hook_delete(void *data)
@@ -257,6 +287,7 @@ bool uc_arch_supported(uc_arch arch)
     if (unlikely(!(uc)->init_done)) {                                          \
         int __init_ret = uc_init_engine(uc);                                   \
         if (unlikely(__init_ret != UC_ERR_OK)) {                               \
+            restore_jit_state(uc);                                             \
             return __init_ret;                                                 \
         }                                                                      \
     }
@@ -612,6 +643,13 @@ uc_err uc_reg_read_batch(uc_engine *uc, int const *regs, void **vals, int count)
     return UC_ERR_OK;
 }
 
+static void uc_request_pc_change(uc_engine *uc)
+{
+    uc->quit_request = true;
+    uc->skip_sync_pc_on_exit = true;
+    break_translation_loop(uc);
+}
+
 UNICORN_EXPORT
 uc_err uc_reg_write_batch(uc_engine *uc, int const *regs, void *const *vals,
                           int count)
@@ -634,9 +672,7 @@ uc_err uc_reg_write_batch(uc_engine *uc, int const *regs, void *const *vals,
         }
     }
     if (setpc) {
-        // force to quit execution and flush TB
-        uc->quit_request = true;
-        break_translation_loop(uc);
+        uc_request_pc_change(uc);
     }
 
     restore_jit_state(uc);
@@ -688,9 +724,7 @@ uc_err uc_reg_write_batch2(uc_engine *uc, int const *regs,
         }
     }
     if (setpc) {
-        // force to quit execution and flush TB
-        uc->quit_request = true;
-        break_translation_loop(uc);
+        uc_request_pc_change(uc);
     }
 
     restore_jit_state(uc);
@@ -720,10 +754,7 @@ uc_err uc_reg_write(uc_engine *uc, int regid, const void *value)
         return err;
     }
     if (setpc) {
-        // force to quit execution and flush TB
-        uc->quit_request = true;
-        uc->skip_sync_pc_on_exit = true;
-        break_translation_loop(uc);
+        uc_request_pc_change(uc);
     }
 
     restore_jit_state(uc);
@@ -751,9 +782,7 @@ uc_err uc_reg_write2(uc_engine *uc, int regid, const void *value, size_t *size)
         return err;
     }
     if (setpc) {
-        // force to quit execution and flush TB
-        uc->quit_request = true;
-        break_translation_loop(uc);
+        uc_request_pc_change(uc);
     }
 
     restore_jit_state(uc);
@@ -773,9 +802,14 @@ static uint64_t memory_region_len(uc_engine *uc, MemoryRegion *mr,
 
 // check if a memory area is mapped
 // this is complicated because an area can overlap adjacent blocks
-static bool check_mem_area(uc_engine *uc, uint64_t address, size_t size)
+static bool check_mem_area(uc_engine *uc, uint64_t address, size_t size,
+                           MemoryRegion **first_mr)
 {
     size_t count = 0, len;
+
+    if (first_mr != NULL) {
+        *first_mr = NULL;
+    }
 
     // A wrap-around range can never be a single mapped extent. Reject it
     // here so the loop below can't walk from the top of the address space
@@ -788,6 +822,9 @@ static bool check_mem_area(uc_engine *uc, uint64_t address, size_t size)
     while (count < size) {
         MemoryRegion *mr = uc->memory_mapping(uc, address);
         if (mr) {
+            if (count == 0 && first_mr != NULL) {
+                *first_mr = mr;
+            }
             len = memory_region_len(uc, mr, address, size - count);
             count += len;
             address += len;
@@ -936,17 +973,19 @@ uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *_bytes, uint64_t size)
 {
     uint64_t count = 0, len;
     uint8_t *bytes = _bytes;
+    MemoryRegion *first_mr;
 
     UC_INIT(uc);
 
-    if (!check_mem_area(uc, address, size)) {
+    if (!check_mem_area(uc, address, size, &first_mr)) {
         restore_jit_state(uc);
         return UC_ERR_READ_UNMAPPED;
     }
 
     // memory area can overlap adjacent memory blocks
     while (count < size) {
-        MemoryRegion *mr = uc->memory_mapping(uc, address);
+        MemoryRegion *mr =
+            count == 0 ? first_mr : uc->memory_mapping(uc, address);
         if (mr) {
             len = memory_region_len(uc, mr, address, size - count);
             if (uc->read_mem(&uc->address_space_memory, address, bytes, len) ==
@@ -970,23 +1009,56 @@ uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *_bytes, uint64_t size)
     }
 }
 
+static bool mem_write_may_touch_current_tb(uc_engine *uc, uint64_t address,
+                                           uint64_t size)
+{
+    uint64_t current_page;
+    uint64_t next_page;
+    uint64_t start_page;
+    uint64_t end_page;
+    uint64_t pc;
+
+    if (size == 0 || uc->tb_exec_depth == 0) {
+        return false;
+    }
+    if (uc->tlb_mode == UC_TLB_VIRTUAL) {
+        return true;
+    }
+
+    pc = uc->get_pc(uc);
+    current_page = pc & ~uc->target_page_align;
+    next_page = current_page + uc->target_page_size;
+    start_page = address & ~uc->target_page_align;
+    end_page = (address + size - 1) & ~uc->target_page_align;
+
+    if (current_page >= start_page && current_page <= end_page) {
+        return true;
+    }
+    return next_page > current_page && next_page >= start_page &&
+           next_page <= end_page;
+}
+
 UNICORN_EXPORT
 uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
                     uint64_t size)
 {
     uint64_t count = 0, len;
     const uint8_t *bytes = _bytes;
+    MemoryRegion *first_mr;
+    bool wrote_executable = false;
+    uint64_t write_address = address;
 
     UC_INIT(uc);
 
-    if (!check_mem_area(uc, address, size)) {
+    if (!check_mem_area(uc, address, size, &first_mr)) {
         restore_jit_state(uc);
         return UC_ERR_WRITE_UNMAPPED;
     }
 
     // memory area can overlap adjacent memory blocks
     while (count < size) {
-        MemoryRegion *mr = uc->memory_mapping(uc, address);
+        MemoryRegion *mr =
+            count == 0 ? first_mr : uc->memory_mapping(uc, address);
         if (mr) {
             uint32_t operms = mr->perms;
             uint64_t align = uc->target_page_align;
@@ -1008,6 +1080,7 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
                 false) {
                 break;
             }
+            wrote_executable |= (operms & UC_PROT_EXEC) != 0;
 
             if (!(operms & UC_PROT_WRITE)) { // write protected
                 // now write protect it again
@@ -1020,6 +1093,13 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
         } else { // this address is not mapped in yet
             break;
         }
+    }
+
+    if (wrote_executable &&
+        mem_write_may_touch_current_tb(uc, write_address, size)) {
+        request_tb_flush(uc);
+        uc->quit_request = true;
+        break_translation_loop(uc);
     }
 
     if (count == size) {
@@ -1062,15 +1142,11 @@ static void enable_emu_timer(uc_engine *uc, uint64_t timeout)
                        QEMU_THREAD_JOINABLE);
 }
 
-static void hook_count_cb(struct uc_struct *uc, uint64_t address, uint32_t size,
-                          void *user_data)
+static void hook_count_cb(struct uc_struct *uc, uint64_t address,
+                          uint32_t size, void *user_data)
 {
-    // count this instruction. ah ah ah.
     uc->emu_counter++;
-    // printf(":: emu counter = %u, at %lx\n", uc->emu_counter, address);
-
     if (uc->emu_counter > uc->emu_count) {
-        // printf(":: emu counter = %u, stop emulation\n", uc->emu_counter);
         uc_emu_stop(uc);
     }
 }
@@ -1099,6 +1175,32 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
                     uint64_t timeout, size_t count)
 {
     uc_err err;
+    bool nested_start;
+    size_t saved_emu_count = 0;
+    size_t saved_emu_counter = 0;
+    IcountDecr saved_icount_decr = { 0 };
+    uint32_t saved_cflags_next_tb = 0;
+    uc_tb saved_last_tb = { 0 };
+    bool saved_last_tb_valid = false;
+    bool saved_stop_request = false;
+    bool saved_quit_request = false;
+
+    // Reject before changing lifecycle state owned by the active frame.
+    if (uc->nested_level >= UC_MAX_NESTED_LEVEL) {
+        return UC_ERR_RESOURCE;
+    }
+    nested_start = uc->nested_level != 0;
+    if (nested_start) {
+        saved_emu_count = uc->emu_count;
+        saved_emu_counter = uc->emu_counter;
+        saved_icount_decr = *uc->cpu->icount_decr_ptr;
+        saved_cflags_next_tb = uc->cpu->cflags_next_tb;
+        saved_last_tb = uc->last_tb;
+        saved_last_tb_valid = uc->last_tb_valid;
+        saved_stop_request = uc_stop_requested(uc);
+        saved_quit_request = uc->quit_request;
+        uc->last_tb_valid = false;
+    }
 
     // reset the counter
     uc->emu_counter = 0;
@@ -1115,10 +1217,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
 
     // Advance the nested levels. We must decrease the level count by one when
     // we return from uc_emu_start.
-    if (uc->nested_level >= UC_MAX_NESTED_LEVEL) {
-        // We can't support so many nested levels.
-        return UC_ERR_RESOURCE;
-    }
     uc->nested_level++;
 
     uint32_t begin_pc32 = READ_DWORD(begin);
@@ -1209,27 +1307,27 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
 #endif
     }
     uc->skip_sync_pc_on_exit = false;
-    uc->stop_request = false;
+    revert_uc_emu_stop(uc);
 
     uc->emu_count = count;
-    // remove count hook if counting isn't necessary
-    if (count <= 0 && uc->count_hook != 0) {
+    uc->cpu->icount_decr_ptr->u32 = 0;
+    uc->cpu->icount_extra = 0;
+    uc->cpu->icount_budget = 0;
+    if (uc_uses_tcg_count(uc)) {
+        size_t initial_count = MIN((size_t)UINT16_MAX, count);
+
+        uc->cpu->icount_decr_ptr->u16.low = initial_count;
+        uc->emu_counter = count - initial_count;
+    }
+    if (count == 0 && uc->count_hook != 0) {
         uc_hook_del(uc, uc->count_hook);
         uc->count_hook = 0;
-
-        // In this case, we have to drop all translated blocks.
         uc->tb_flush(uc);
-    }
-    // set up count hook to count instructions.
-    if (count > 0 && uc->count_hook == 0) {
-        uc_err err;
-        // callback to count instructions must be run before everything else,
-        // so instead of appending, we must insert the hook at the begin
-        // of the hook list
+    } else if (count != 0 && !uc_uses_tcg_count(uc) &&
+               uc->count_hook == 0) {
         uc->hook_insert = 1;
         err = uc_hook_add(uc, &uc->count_hook, UC_HOOK_CODE, hook_count_cb,
                           NULL, 1, 0);
-        // restore to append mode for uc_hook_add()
         uc->hook_insert = 0;
         if (err != UC_ERR_OK) {
             uc->nested_level--;
@@ -1250,6 +1348,31 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
     uc->vm_start(uc);
 
     uc->nested_level--;
+    if (nested_start) {
+        revert_uc_emu_stop(uc);
+        uc->quit_request = saved_quit_request;
+        uc->emu_count = saved_emu_count;
+        uc->emu_counter = saved_emu_counter;
+        *uc->cpu->icount_decr_ptr = saved_icount_decr;
+        uc->cpu->cflags_next_tb = saved_cflags_next_tb;
+        uc->last_tb = saved_last_tb;
+        uc->last_tb_valid = saved_last_tb_valid;
+        if (saved_stop_request) {
+            uc_set_stop_request(uc, true);
+        }
+        if (saved_stop_request || saved_quit_request) {
+            break_translation_loop(uc);
+        }
+    } else {
+        uc->emu_count = 0;
+        uc->cpu->icount_decr_ptr->u32 = 0;
+        uc->cpu->icount_extra = 0;
+        uc->cpu->icount_budget = 0;
+    }
+    if (uc->nested_level == 0 && uc->tb_flush_pending) {
+        uc->tb_flush_pending = false;
+        uc->tb_flush(uc);
+    }
 
     // emulation is done if and only if we exit the outer uc_emu_start
     // or we may lost uc_emu_stop
@@ -1279,7 +1402,7 @@ UNICORN_EXPORT
 uc_err uc_emu_stop(uc_engine *uc)
 {
     UC_INIT(uc);
-    uc->stop_request = true;
+    uc_set_stop_request(uc, true);
     uc_err err = break_translation_loop(uc);
     restore_jit_state(uc);
     return err;
@@ -1857,7 +1980,7 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
     // check that user's entire requested block is mapped
     // TODO check if protected is possible
     // deny after cow
-    if (!check_mem_area(uc, address, size)) {
+    if (!check_mem_area(uc, address, size, NULL)) {
         restore_jit_state(uc);
         return UC_ERR_NOMEM;
     }
@@ -1900,9 +2023,9 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
 
     // if EXEC permission is removed, then quit TB and continue at the same
     // place
-    if (remove_exec) {
+    if (remove_exec && uc->nested_level != 0) {
         pc = uc->get_pc(uc);
-        if (pc < address + size && pc >= address) {
+        if (pc >= address && pc - address < size) {
             uc->quit_request = true;
             uc_emu_stop(uc);
         }
@@ -1940,6 +2063,7 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
 {
     MemoryRegion *mr;
     uint64_t addr;
+    uint64_t pc;
     uint64_t count, len;
 
     UC_INIT(uc);
@@ -1963,7 +2087,7 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
     }
 
     // check that user's entire requested block is mapped
-    if (!check_mem_area(uc, address, size)) {
+    if (!check_mem_area(uc, address, size, NULL)) {
         restore_jit_state(uc);
         return UC_ERR_NOMEM;
     }
@@ -1973,6 +2097,8 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
         restore_jit_state(uc);
         return res;
     }
+
+    pc = uc->get_pc(uc);
 
     // Now we know entire region is mapped, so do the unmap
     // We may need to split regions if this area spans adjacent regions
@@ -2001,6 +2127,11 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
         }
         count += len;
         addr += len;
+    }
+
+    if (uc->nested_level != 0 && pc >= address && pc - address < size) {
+        uc->quit_request = true;
+        uc_emu_stop(uc);
     }
 
     restore_jit_state(uc);
@@ -2064,6 +2195,14 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
         }
 
         uc->hooks_count[UC_HOOK_INSN_IDX]++;
+        hook_dispatch_cache_invalidate(uc, UC_HOOK_INSN_IDX);
+        if (uc->arch == UC_ARCH_ARM64) {
+            request_tb_flush(uc);
+            if (uc->nested_level) {
+                uc->quit_request = true;
+                break_translation_loop(uc);
+            }
+        }
         restore_jit_state(uc);
         return UC_ERR_OK;
     }
@@ -2099,15 +2238,12 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
         }
 
         uc->hooks_count[UC_HOOK_TCG_OPCODE_IDX]++;
+        hook_dispatch_cache_invalidate(uc, UC_HOOK_TCG_OPCODE_IDX);
         return UC_ERR_OK;
     }
 
     if (type & UC_HOOK_CODE || type & UC_HOOK_BLOCK) {
-        if (end <= begin) {
-            uc->tb_flush(uc);
-        } else {
-            uc->uc_invalidate_tb(uc, begin, end-begin);
-        }
+        hook_invalidate_range(uc, begin, end);
         if (uc->nested_level) {
             uc->quit_request = true;
             break_translation_loop(uc);
@@ -2132,9 +2268,17 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
                     }
                 }
                 uc->hooks_count[i]++;
+                hook_dispatch_cache_invalidate(uc, i);
+                if (i == UC_HOOK_EDGE_GENERATED_IDX) {
+                    uc->last_tb_valid = false;
+                }
             }
         }
         i++;
+    }
+
+    if (hook->refs != 0 && (type & UC_HOOK_MEM_FAST_PATH)) {
+        uc->tcg_flush_tlb(uc);
     }
 
     // we didn't use the hook
@@ -2151,6 +2295,9 @@ UNICORN_EXPORT
 uc_err uc_hook_del(uc_engine *uc, uc_hook hh)
 {
     int i;
+    bool flush_tlb = false;
+    bool flush_tb = false;
+    bool exit_direct_hook = false;
     struct hook *hook = (struct hook *)hh;
 
     UC_INIT(uc);
@@ -2162,15 +2309,45 @@ uc_err uc_hook_del(uc_engine *uc, uc_hook hh)
     // and store the type mask in the hook pointer.
     for (i = 0; i < UC_HOOK_MAX; i++) {
         if (list_exists(&uc->hook[i], (void *)hook)) {
+            if (hook->type & UC_HOOK_MEM_FAST_PATH) {
+                flush_tlb = true;
+            }
+            if (i == UC_HOOK_INSN_IDX && uc->arch == UC_ARCH_ARM64) {
+                flush_tb = true;
+            }
             if (hook->type & UC_HOOK_CODE || hook->type & UC_HOOK_BLOCK) {
                 g_hash_table_foreach(hook->hooked_regions,
                                      hook_invalidate_region, uc);
+                if ((i == UC_HOOK_CODE_IDX || i == UC_HOOK_BLOCK_IDX) &&
+                    uc->hooks_count[i] == 1 &&
+                    (uc_hook)hook != uc->count_hook) {
+                    exit_direct_hook = true;
+                }
             }
             g_hash_table_remove_all(hook->hooked_regions);
             hook->to_delete = true;
             uc->hooks_count[i]--;
+            hook_dispatch_cache_invalidate(uc, i);
+            if (i == UC_HOOK_EDGE_GENERATED_IDX) {
+                uc->last_tb_valid = false;
+            }
             hook_append(&uc->hooks_to_del, hook);
         }
+    }
+
+    if (flush_tlb) {
+        uc->tcg_flush_tlb(uc);
+    }
+    if (flush_tb) {
+        request_tb_flush(uc);
+        if (uc->nested_level) {
+            uc->quit_request = true;
+            break_translation_loop(uc);
+        }
+    }
+    if (exit_direct_hook && uc->nested_level) {
+        uc->quit_request = true;
+        break_translation_loop(uc);
     }
 
     restore_jit_state(uc);
@@ -2185,11 +2362,7 @@ uc_err uc_hook_set_user_data(uc_engine *uc, uc_hook hh, void *user_data)
         if (uc->nested_level) {
             return UC_ERR_ARG;
         }
-        if (hook->end < hook->begin) {
-            uc->tb_flush(uc);
-        } else {
-            uc->uc_invalidate_tb(uc, hook->begin, hook->end - hook->begin);
-        }
+        hook_invalidate_range(uc, hook->begin, hook->end);
     }
     hook->user_data = user_data;
     return UC_ERR_OK;
@@ -2206,7 +2379,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
 {
     struct uc_struct *uc = handle;
 
-    if (unlikely(uc->stop_request)) {
+    if (unlikely(uc_stop_requested(uc))) {
         return;
     }
 
@@ -2224,7 +2397,7 @@ void helper_uc_traceopcode(struct hook *hook, uint64_t arg1, uint64_t arg2,
     JIT_CALLBACK_GUARD(((uc_hook_tcg_op_2)hook->callback)(
         uc, address, arg1, arg2, size, hook->user_data));
 
-    if (unlikely(uc->stop_request)) {
+    if (unlikely(uc_stop_requested(uc))) {
         return;
     }
 }
@@ -2256,9 +2429,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
     // }
 
     // the last callback may already asked to stop emulation
-    if (uc->stop_request && !not_allow_stop) {
+    if (uc_stop_requested(uc) && !not_allow_stop) {
         return;
-    } else if (not_allow_stop && uc->stop_request) {
+    } else if (not_allow_stop && uc_stop_requested(uc)) {
         revert_uc_emu_stop(uc);
     }
 
@@ -2291,9 +2464,9 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
         //   normally. No check_exit_request is generated and the hooks are
         //   triggered normally. In other words, the whole IT block is treated
         //   as a single instruction.
-        if (not_allow_stop && uc->stop_request) {
+        if (not_allow_stop && uc_stop_requested(uc)) {
             revert_uc_emu_stop(uc);
-        } else if (!not_allow_stop && uc->stop_request) {
+        } else if (!not_allow_stop && uc_stop_requested(uc)) {
             break;
         }
     }
@@ -2337,6 +2510,7 @@ uc_err uc_query(uc_engine *uc, uc_query_type type, size_t *result)
 
     switch (type) {
     default:
+        restore_jit_state(uc);
         return UC_ERR_ARG;
 
     case UC_QUERY_PAGE_SIZE:
@@ -2350,7 +2524,10 @@ uc_err uc_query(uc_engine *uc, uc_query_type type, size_t *result)
     case UC_QUERY_MODE:
 #ifdef UNICORN_HAS_ARM
         if (uc->arch == UC_ARCH_ARM) {
-            return uc->query(uc, type, result);
+            uc_err ret = uc->query(uc, type, result);
+
+            restore_jit_state(uc);
+            return ret;
         }
 #endif
         *result = uc->mode;
@@ -2702,6 +2879,7 @@ uc_err uc_context_restore(uc_engine *uc, uc_context *context)
         uc->snapshot_level = context->snapshot_level;
         if (!uc->flatview_copy(uc, uc->address_space_memory.current_map,
                                context->fv, true)) {
+            restore_jit_state(uc);
             return UC_ERR_NOMEM;
         }
         ret = uc_restore_latest_snapshot(uc);
@@ -2713,19 +2891,31 @@ uc_err uc_context_restore(uc_engine *uc, uc_context *context)
         uc->ram_list.freed = context->ramblock_freed;
         uc->ram_list.last_block = context->last_block;
         uc->tcg_flush_tlb(uc);
+        request_tb_flush(uc);
+        if (uc->nested_level != 0) {
+            uc->quit_request = true;
+            break_translation_loop(uc);
+        }
     }
 
     if (uc->context_content & UC_CTL_CONTEXT_CPU) {
         if (!uc->context_restore) {
             memcpy(uc->cpu->env_ptr, context->data, context->context_size);
+            if (uc->nested_level != 0) {
+                uc_request_pc_change(uc);
+            }
             restore_jit_state(uc);
             return UC_ERR_OK;
         } else {
             ret = uc->context_restore(uc, context);
+            if (ret == UC_ERR_OK && uc->nested_level != 0) {
+                uc_request_pc_change(uc);
+            }
             restore_jit_state(uc);
             return ret;
         }
     }
+    restore_jit_state(uc);
     return UC_ERR_OK;
 }
 
@@ -2820,7 +3010,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
                 break;
             }
 
-            if ((page_size & (page_size - 1))) {
+            if (page_size == 0 || (page_size & (page_size - 1))) {
                 err = UC_ERR_ARG;
                 break;
             }
@@ -2842,7 +3032,11 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
     case UC_CTL_UC_USE_EXITS: {
         if (rw == UC_CTL_IO_WRITE) {
             int use_exits = va_arg(args, int);
+
             uc->use_exits = use_exits;
+            if (!use_exits && uc->ctl_exits != NULL) {
+                g_tree_remove_all(uc->ctl_exits);
+            }
         } else {
             err = UC_ERR_ARG;
         }
@@ -2909,7 +3103,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
             int *model = va_arg(args, int *);
             *model = uc->cpu_model;
 
-            save_jit_state(uc);
+            restore_jit_state(uc);
         } else {
             int model = va_arg(args, int);
 
@@ -3050,7 +3244,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
         UC_INIT(uc);
 
         if (rw == UC_CTL_IO_WRITE) {
-            uc->tb_flush(uc);
+            request_tb_flush(uc);
         } else {
             err = UC_ERR_ARG;
         }
@@ -3078,6 +3272,9 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
         if (rw == UC_CTL_IO_WRITE) {
             int mode = va_arg(args, int);
             err = uc->set_tlb(uc, mode);
+            if (err == UC_ERR_OK) {
+                uc->tcg_flush_tlb(uc);
+            }
         } else {
             err = UC_ERR_ARG;
         }

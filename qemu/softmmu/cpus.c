@@ -97,16 +97,16 @@ static int tcg_cpu_exec(struct uc_struct *uc)
             r = cpu_exec(uc, cpu);
 
             // quit current TB but continue emulating?
-            if (uc->quit_request && !uc->stop_request) {
+            if (uc->quit_request && !uc_stop_requested(uc)) {
                 // reset stop_request
-                uc->stop_request = false;
+                uc_set_stop_request(uc, false);
 
                 // resume cpu
                 cpu->halted = 0;
-                cpu->exit_request = 0;
+                qatomic_set(&cpu->exit_request, 0);
                 cpu->exception_index = -1;
                 cpu_resume(cpu);
-            } else if (uc->stop_request) {
+            } else if (uc_stop_requested(uc)) {
                 //printf(">>> got STOP request!!!\n");
                 finish = true;
                 break;
@@ -135,9 +135,9 @@ static int tcg_cpu_exec(struct uc_struct *uc)
         }
     }
     uc->exit_request = 0;
-    uc->cpu->exit_request = 0;
+    qatomic_set(&uc->cpu->exit_request, 0);
     uc->cpu->icount_decr_ptr->u16.high = 0;
-    uc->cpu->tcg_exit_req = 0;
+    qatomic_set(&uc->cpu->tcg_exit_req, 0);
 
     return finish;
 }
@@ -212,7 +212,7 @@ void resume_all_vcpus(struct uc_struct* uc)
 {
     CPUState *cpu = uc->cpu;
     cpu->halted = 0;
-    cpu->exit_request = 0;
+    qatomic_set(&cpu->exit_request, 0);
     cpu->exception_index = -1;
     cpu_resume(cpu);
     /* static void qemu_tcg_cpu_loop(struct uc_struct *uc) */

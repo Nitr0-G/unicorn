@@ -1,180 +1,78 @@
-/*
-   Test for MIPS branch likely instructions only executing their delay slot instruction when the branch is taken.
-   Currently it seems to always execute the delay slot instruction like a normal non-"likely" style branch.
- */
-
-// windows specific
-#ifdef _MSC_VER
-#include <io.h>
-#include <windows.h>
-#include <process.h>
-#define PRIx64 "llX"
 #include <unicorn/unicorn.h>
-#ifdef _WIN64
-#pragma comment(lib, "unicorn_staload64.lib")
-#else // _WIN64
-#pragma comment(lib, "unicorn_staload.lib")
-#endif // _WIN64
 
-// posix specific
-#else // _MSC_VER
-#include <unicorn/unicorn.h>
-#include "pthread.h"
-#endif // _MSC_VER
+#define ADDRESS 0x100000
+#define DELAY_SLOT_ADDRESS (ADDRESS + 16)
 
-// common includes
-#include <string.h>
+typedef struct HookState {
+    unsigned int test_number;
+    unsigned int delay_slot_count[2];
+} HookState;
 
-
-const uint64_t addr = 0x100000;
-// This code SHOULD execute the instruction at 0x100010.
-const unsigned char test_code_1[] = {
-    0x00,0x00,0x04,0x24,	// 100000: li      $a0, 0
-    0x01,0x00,0x02,0x24,	// 100004: li      $v0, 1
-    0x02,0x00,0x03,0x24,	// 100008: li      $v1, 2
-    0x01,0x00,0x62,0x54,	// 10000C: bnel    $v1, $v0, 0x100014
-    0x21,0x20,0x62,0x00,	// 100010: addu    $a0, $v1, $v0
-};
-// This code SHOULD NOT execute the instruction at 0x100010.
-const unsigned char test_code_2[] = {
-    0x00,0x00,0x04,0x24,	// 100000: li      $a0, 0
-    0x01,0x00,0x02,0x24,	// 100004: li      $v0, 1
-    0x01,0x00,0x03,0x24,	// 100008: li      $v1, 1
-    0x01,0x00,0x62,0x54,	// 10000C: bnel    $v1, $v0, 0x100014
-    0x21,0x20,0x62,0x00,	// 100010: addu    $a0, $v1, $v0
-};
-int test_num = 0;
-// flag for whether the delay slot was executed by the emulator
-bool test1_delayslot_executed = false;
-bool test2_delayslot_executed = false;
-// flag for whether the delay slot had a code hook called for it
-bool test1_delayslot_hooked = false;
-bool test2_delayslot_hooked = false;
-
-
-// This hook is used to show that code is executing in the emulator.
-static void mips_codehook(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
+static void count_delay_slot(uc_engine *uc, uint64_t address, uint32_t size,
+                             void *user_data)
 {
-    printf("Test %d Executing: %"PRIx64"\n", test_num, address);
-    if( test_num == 1 && address == 0x100010 )
-    {
-        printf("Delay slot hook called!\n");
-        test1_delayslot_hooked = true;
-    }
-    if( test_num == 2 && address == 0x100010 )
-    {
-        printf("Delay slot hook called!\n");
-        test2_delayslot_hooked = true;
+    HookState *state = user_data;
+
+    (void)uc;
+    (void)size;
+    if (address == DELAY_SLOT_ADDRESS && state->test_number < 2) {
+        state->delay_slot_count[state->test_number]++;
     }
 }
 
-
-int main(int argc, char **argv, char **envp)
+static bool run_case(uc_engine *uc, HookState *state, const uint8_t *code,
+                     size_t code_size, uint32_t expected_a0)
 {
+    uint32_t a0 = UINT32_MAX;
+
+    if (uc_mem_write(uc, ADDRESS, code, code_size) != UC_ERR_OK ||
+        uc_emu_start(uc, ADDRESS, ADDRESS + code_size, 0, 0) != UC_ERR_OK ||
+        uc_reg_read(uc, UC_MIPS_REG_A0, &a0) != UC_ERR_OK) {
+        return false;
+    }
+    return a0 == expected_a0;
+}
+
+int main(void)
+{
+    const uint8_t taken[] = {
+        0x00, 0x00, 0x04, 0x24, /* li $a0, 0 */
+        0x01, 0x00, 0x02, 0x24, /* li $v0, 1 */
+        0x02, 0x00, 0x03, 0x24, /* li $v1, 2 */
+        0x01, 0x00, 0x62, 0x54, /* bnel $v1, $v0, +1 */
+        0x21, 0x20, 0x62, 0x00, /* addu $a0, $v1, $v0 */
+    };
+    const uint8_t not_taken[] = {
+        0x00, 0x00, 0x04, 0x24, /* li $a0, 0 */
+        0x01, 0x00, 0x02, 0x24, /* li $v0, 1 */
+        0x01, 0x00, 0x03, 0x24, /* li $v1, 1 */
+        0x01, 0x00, 0x62, 0x54, /* bnel $v1, $v0, +1 */
+        0x21, 0x20, 0x62, 0x00, /* addu $a0, $v1, $v0 */
+    };
+    HookState state = {0};
     uc_engine *uc;
-    uc_err err;
-    uc_hook hhc;
-    uint32_t val;
+    uc_hook hook;
 
-    // Initialize emulator in MIPS 32bit little endian mode
-    printf("uc_open()\n");
-    err = uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32, &uc);
-    if (err)
-    {
-        printf("Failed on uc_open() with error returned: %u\n", err);
-        return err;
+    if (uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32, &uc) != UC_ERR_OK) {
+        return 1;
+    }
+    if (uc_mem_map(uc, ADDRESS, 0x1000, UC_PROT_ALL) != UC_ERR_OK ||
+        uc_hook_add(uc, &hook, UC_HOOK_CODE, count_delay_slot, &state, 1, 0) !=
+            UC_ERR_OK ||
+        !run_case(uc, &state, taken, sizeof(taken), 3)) {
+        uc_close(uc);
+        return 1;
     }
 
-    // map in a page of mem
-    printf("uc_mem_map()\n");
-    err = uc_mem_map(uc, addr, 0x1000, UC_PROT_ALL);
-    if (err)
-    {
-        printf("Failed on uc_mem_map() with error returned: %u\n", err);
-        return err;
+    state.test_number = 1;
+    if (!run_case(uc, &state, not_taken, sizeof(not_taken), 0)) {
+        uc_close(uc);
+        return 1;
     }
 
-    // hook all instructions by having @begin > @end
-    printf("uc_hook_add()\n");
-    uc_hook_add(uc, &hhc, UC_HOOK_CODE, mips_codehook, NULL, 1, 0);
-    if( err )
-    {
-        printf("Failed on uc_hook_add(code) with error returned: %u\n", err);
-        return err;
+    if (uc_close(uc) != UC_ERR_OK) {
+        return 1;
     }
-
-
-    // write test1 code to be emulated to memory
-    test_num = 1;
-    printf("\nuc_mem_write(1)\n");
-    err = uc_mem_write(uc, addr, test_code_1, sizeof(test_code_1));
-    if( err )
-    {
-        printf("Failed on uc_mem_write() with error returned: %u\n", err);
-        return err;
-    }
-    // start executing test code 1
-    printf("uc_emu_start(1)\n");
-    uc_emu_start(uc, addr, addr+sizeof(test_code_1), 0, 0);
-    // read the value from a0 when finished executing
-    uc_reg_read(uc, UC_MIPS_REG_A0, &val);	printf("a0 is %X\n", val);
-    if( val != 0 )
-        test1_delayslot_executed = true;
-
-
-    // write test2 code to be emulated to memory
-    test_num = 2;
-    printf("\nuc_mem_write(2)\n");
-    err = uc_mem_write(uc, addr, test_code_2, sizeof(test_code_2));
-    if( err )
-    {
-        printf("Failed on uc_mem_write() with error returned: %u\n", err);
-        return err;
-    }
-    // start executing test code 2
-    printf("uc_emu_start(2)\n");
-    uc_emu_start(uc, addr, addr+sizeof(test_code_2), 0, 0);
-    // read the value from a0 when finished executing
-    uc_reg_read(uc, UC_MIPS_REG_A0, &val);	printf("a0 is %X\n", val);
-    if( val != 0 )
-        test2_delayslot_executed = true;
-
-
-    // free resources
-    printf("\nuc_close()\n");
-    uc_close(uc);
-
-
-    // print test results
-    printf("\n\nTest 1 SHOULD execute the delay slot instruction:\n");
-    printf("  Emulator %s execute the delay slot:  %s\n",
-            test1_delayslot_executed ? "did" : "did not",
-            test1_delayslot_executed ? "CORRECT" : "WRONG");
-    printf("  Emulator %s hook the delay slot:  %s\n",
-            test1_delayslot_hooked ? "did" : "did not",
-            test1_delayslot_hooked ? "CORRECT" : "WRONG");
-
-    printf("\n\nTest 2 SHOULD NOT execute the delay slot instruction:\n");
-    printf("  Emulator %s execute the delay slot:  %s\n",
-            test2_delayslot_executed ? "did" : "did not",
-            !test2_delayslot_executed ? "CORRECT" : "WRONG");
-    printf("  Emulator %s hook the delay slot:  %s\n",
-            test2_delayslot_hooked ? "did" : "did not",
-            !test2_delayslot_hooked ? "CORRECT" : "WRONG");
-
-
-    // test 1 SHOULD execute the instruction in the delay slot
-    if( test1_delayslot_hooked == true && test1_delayslot_executed == true )
-        printf("\n\nTEST 1 PASSED!\n");
-    else
-        printf("\n\nTEST 1 FAILED!\n");
-
-    // test 2 SHOULD NOT execute the instruction in the delay slot
-    if( test2_delayslot_hooked == false && test2_delayslot_executed == false )
-        printf("TEST 2 PASSED!\n\n");
-    else
-        printf("TEST 2 FAILED!\n\n");
-
-    return 0;
+    return state.delay_slot_count[0] == 1 && state.delay_slot_count[1] == 0 ? 0
+                                                                            : 1;
 }
-

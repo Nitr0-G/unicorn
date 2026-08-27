@@ -254,10 +254,22 @@ jobs:
 
       - name: '📤 Upload artifact'
         if: always()
+        id: upload_artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           path: ./${{ matrix.config.artifact }}
           name: ${{ matrix.config.artifact }}
+          compression-level: 0
+
+      - name: '📤 Retry artifact upload'
+        if: steps.upload_artifact.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          path: ./${{ matrix.config.artifact }}
+          name: ${{ matrix.config.artifact }}
+          compression-level: 0
+          overwrite: true
 
   Macos:
     runs-on: ${{ matrix.config.os }}
@@ -406,10 +418,22 @@ jobs:
 
       - name: '📤 Upload artifact'
         if: always()
+        id: upload_artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           path: ./${{ matrix.config.artifact }}
           name: ${{ matrix.config.artifact }}
+          compression-level: 0
+
+      - name: '📤 Retry artifact upload'
+        if: steps.upload_artifact.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          path: ./${{ matrix.config.artifact }}
+          name: ${{ matrix.config.artifact }}
+          compression-level: 0
+          overwrite: true
 
   Linux:
     runs-on: ${{ matrix.config.os }}
@@ -556,10 +580,22 @@ jobs:
 
       - name: '📤 Upload artifact'
         if: always()
+        id: upload_artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           path: ./${{ matrix.config.artifact }}
           name: ${{ matrix.config.artifact }}
+          compression-level: 0
+
+      - name: '📤 Retry artifact upload'
+        if: steps.upload_artifact.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          path: ./${{ matrix.config.artifact }}
+          name: ${{ matrix.config.artifact }}
+          compression-level: 0
+          overwrite: true
 
   AlpineLinux:
     runs-on: ${{ matrix.config.os }}
@@ -626,12 +662,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 'Bootstrap Alpine apk-tools'
+        shell: bash
+        env:
+          APK_TOOLS_PACKAGE_URL: https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/apk-tools-static-2.14.10-r0.apk
+          APK_TOOLS_SHA256: f9c4c5675cdbf597a151aab6a9ba05983bfe5d927632c36c4575e7551ff55608
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/apk-tools-static.apk"
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/apk-tools-static.XXXXXX")"
+          curl --fail --location --show-error --silent \
+            --retry 5 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 30 --max-time 180 \
+            --output "$package" "$APK_TOOLS_PACKAGE_URL"
+          tar -xzf "$package" -C "$extract_dir" sbin/apk.static
+          printf '%s  %s\n' "$APK_TOOLS_SHA256" \
+            "$extract_dir/sbin/apk.static" | sha256sum --check -
+          install -m 0755 "$extract_dir/sbin/apk.static" "$RUNNER_TEMP/apk"
+          nohup python3 -m http.server 38473 --bind 127.0.0.1 \
+            --directory "$extract_dir/sbin" \
+            >"$RUNNER_TEMP/apk-http.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/apk-http.pid"
+
       - name: '🚧 Setup Alpine Linux'
         uses: jirutka/setup-alpine@v1
         with:
+          apk-tools-url: 'http://127.0.0.1:38473/apk.static#!sha256!f9c4c5675cdbf597a151aab6a9ba05983bfe5d927632c36c4575e7551ff55608'
           branch: v3.22
           arch: ${{ matrix.config.arch }}
+          mirror-url: https://dl-cdn.alpinelinux.org/alpine
           packages: cmake build-base automake cmocka-dev pkgconfig ${{ matrix.compiler }} ninja linux-headers
+
+      - name: 'Stop Alpine bootstrap server'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$RUNNER_TEMP/apk-http.pid" ]]; then
+            kill "$(cat "$RUNNER_TEMP/apk-http.pid")" || true
+          fi
 
       - name: '🚧 Linux Alpine build'
         shell: alpine.sh --root {0}
@@ -659,7 +727,19 @@ jobs:
 
       - name: '📤 Upload artifact'
         if: always()
+        id: upload_artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           path: ./${{ matrix.config.artifact }}
           name: ${{ matrix.config.artifact }}
+          compression-level: 0
+
+      - name: '📤 Retry artifact upload'
+        if: steps.upload_artifact.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          path: ./${{ matrix.config.artifact }}
+          name: ${{ matrix.config.artifact }}
+          compression-level: 0
+          overwrite: true

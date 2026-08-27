@@ -1846,6 +1846,94 @@ static void test_x86_clear_count_cache(void)
     OK(uc_close(uc));
 }
 
+static void test_x86_large_instruction_count(void)
+{
+    const uint8_t code[] = {
+        0x40,             /* inc eax */
+        0xeb, 0xfd,       /* jmp loop */
+    };
+    const size_t counts[] = { 1, 2, 3, 65535, 65536, 70000 };
+    uc_engine *uc;
+    size_t i;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    for (i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        uint32_t eax = 0;
+        uint32_t eip;
+
+        OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+        OK(uc_emu_start(uc, code_start, 0, 0, counts[i]));
+        OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+        OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+        TEST_CHECK_(eax == (counts[i] + 1) / 2,
+                    "count=%zu eax=%u", counts[i], eax);
+        TEST_CHECK_(eip == code_start + (counts[i] & 1),
+                    "count=%zu eip=0x%x", counts[i], eip);
+    }
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86CountPcChangeData {
+    uint32_t count;
+    uint32_t destination;
+} X86CountPcChangeData;
+
+static void test_x86_count_pc_change_callback(uc_engine *uc,
+                                              uint64_t address,
+                                              uint32_t size,
+                                              void *user_data)
+{
+    X86CountPcChangeData *data =
+        (X86CountPcChangeData *)user_data;
+
+    data->count++;
+    OK(uc_reg_write(uc, UC_X86_REG_EIP, &data->destination));
+}
+
+static void test_x86_count_nonmatching_callback(uc_engine *uc,
+                                                uint64_t address,
+                                                uint32_t size,
+                                                void *user_data)
+{
+    TEST_CHECK(false);
+}
+
+static void test_x86_instruction_count_pc_change_refund(void)
+{
+    const uint64_t destination = code_start + 0x1000;
+    const uint8_t code[] = { 0x40, 0x40, 0x40, 0x40 }; /* inc eax */
+    X86CountPcChangeData data = {
+        .destination = (uint32_t)destination,
+    };
+    uint32_t eax = 0;
+    uint32_t eip;
+    uc_engine *uc;
+    uc_hook hook;
+    uc_hook nonmatching_hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_write(uc, destination, code, sizeof(code)));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_hook_add(uc, &nonmatching_hook, UC_HOOK_CODE,
+                   test_x86_count_nonmatching_callback, NULL,
+                   code_start + 0x100, code_start + 0x100));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_x86_count_pc_change_callback, &data,
+                   code_start + 1, code_start + 1));
+
+    OK(uc_emu_start(uc, code_start, 0, 0, 3));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    TEST_CHECK_(eax == 3, "eax=%u", eax);
+    TEST_CHECK_(eip == destination + 2, "eip=0x%x", eip);
+    TEST_CHECK(data.count == 1);
+
+    OK(uc_close(uc));
+}
+
 // This is a regression bug.
 static void test_x86_clear_empty_tb(void)
 {
@@ -2353,6 +2441,52 @@ static void test_x86_nested_emu_start(void)
     OK(uc_close(uc));
 }
 
+typedef struct X86NestedCountData {
+    uint64_t inner_address;
+    uint32_t count;
+} X86NestedCountData;
+
+static void test_x86_nested_count_callback(uc_engine *uc, uint64_t address,
+                                           uint32_t size, void *user_data)
+{
+    X86NestedCountData *data = (X86NestedCountData *)user_data;
+
+    data->count++;
+    OK(uc_emu_start(uc, data->inner_address, data->inner_address + 1,
+                    0, 1));
+}
+
+static void test_x86_nested_count_state(void)
+{
+    const uint64_t inner_address = code_start + 0x1000;
+    const uint8_t outer_code[] = { 0x40, 0x40, 0x40 }; /* inc eax */
+    const uint8_t inner_code[] = { 0x4b }; /* dec ebx */
+    X86NestedCountData data = { .inner_address = inner_address };
+    uint32_t eax = 0;
+    uint32_t ebx = 10;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)outer_code, sizeof(outer_code));
+    OK(uc_mem_write(uc, inner_address, inner_code, sizeof(inner_code)));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_x86_nested_count_callback, &data,
+                   code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(outer_code),
+                    0, 2));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_EBX, &ebx));
+    TEST_CHECK(eax == 2);
+    TEST_CHECK(ebx == 9);
+    TEST_CHECK(data.count == 1);
+
+    OK(uc_close(uc));
+}
+
 static void test_x86_nested_emu_stop_cb(uc_engine *uc, uint64_t addr,
                                         size_t size, void *data)
 {
@@ -2408,6 +2542,65 @@ static void test_x86_64_nested_emu_start_error(void)
 
     // This call shouldn't fail!
     OK(uc_emu_start(uc, code_start, code_start + 2, 0, 0));
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86NestedDepthData {
+    uint32_t callbacks;
+    uint32_t successful_starts;
+    uint32_t returns;
+    uint32_t resource_errors;
+} X86NestedDepthData;
+
+static void test_x86_nested_emu_start_max_depth_cb(uc_engine *uc,
+                                                    uint64_t address,
+                                                    uint32_t size,
+                                                    void *user_data)
+{
+    X86NestedDepthData *data = (X86NestedDepthData *)user_data;
+    uc_err err;
+
+    data->callbacks++;
+    err = uc_emu_start(uc, code_start, code_start + 1, 0, 0);
+    if (err == UC_ERR_RESOURCE) {
+        data->resource_errors++;
+        OK(uc_ctl_remove_cache(uc, code_start, code_start + 1));
+    } else {
+        uc_assert_err(UC_ERR_OK, err);
+        if (err == UC_ERR_OK) {
+            data->successful_starts++;
+        }
+    }
+    data->returns++;
+}
+
+static void test_x86_nested_emu_start_max_depth(void)
+{
+    const uint8_t nop[] = { 0x90 };
+    const uint8_t inc_eax[] = { 0x40 };
+    X86NestedDepthData data = { 0 };
+    uint32_t eax = 0;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)nop, sizeof(nop));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_x86_nested_emu_start_max_depth_cb, &data,
+                   code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + 1, 0, 0));
+    TEST_CHECK(data.resource_errors == 1);
+    TEST_CHECK(data.callbacks == data.returns);
+    TEST_CHECK(data.successful_starts + 1 == data.callbacks);
+
+    OK(uc_hook_del(uc, hook));
+    OK(uc_mem_write(uc, code_start, inc_eax, sizeof(inc_eax)));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_emu_start(uc, code_start, code_start + 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 1);
 
     OK(uc_close(uc));
 }
@@ -3181,12 +3374,18 @@ static void test_x86_read_virtual(void)
         uc_vmem_read(uc, 0x1000, UC_PROT_WRITE, &tmp, sizeof(tmp)));
     TEST_CHECK(parrent == 60);
     TEST_CHECK(child == 42);
+
+    OK(uc_context_free(context));
+    OK(uc_close(uc));
 }
 
 static bool test_x86_vtlb_callback(uc_engine *uc, uint64_t addr,
                                    uc_mem_type type, uc_tlb_entry *result,
                                    void *user_data)
 {
+    if (user_data != NULL) {
+        (*(uint32_t *)user_data)++;
+    }
     result->paddr = addr;
     result->perms = UC_PROT_ALL;
     return true;
@@ -3211,6 +3410,223 @@ static void test_x86_vtlb(void)
     OK(uc_reg_read(uc, UC_X86_REG_EIP, &r_eip));
 
     TEST_CHECK(r_eip == code_start + 4);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_vtlb_conflict_growth(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint64_t page_size = 0x1000;
+    const uint64_t page_count = 512;
+    const uint64_t rounds = 3;
+    const uint8_t code[] = {
+        0x48, 0x89, 0xde,                   /* mov rsi, rbx */
+        0x4c, 0x89, 0xc2,                   /* mov rdx, r8 */
+        0x48, 0x03, 0x06,                   /* add rax, [rsi] */
+        0x48, 0x81, 0xc6, 0x00, 0x10, 0x00, 0x00,
+                                                /* add rsi, 0x1000 */
+        0x48, 0xff, 0xca,                   /* dec rdx */
+        0x75, 0xf1,                         /* jnz inner */
+        0x48, 0xff, 0xc9,                   /* dec rcx */
+        0x75, 0xe6,                         /* jnz outer */
+    };
+    uint64_t rax = 0;
+    uint64_t rbx = data_address;
+    uint64_t rcx = rounds;
+    uint64_t r8 = page_count;
+    uint64_t one = 1;
+    uint32_t fill_count = 0;
+    uc_engine *uc;
+    uc_hook hook;
+    uint64_t i;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_map(uc, data_address, page_count * page_size, UC_PROT_ALL));
+    for (i = 0; i < page_count; i++) {
+        OK(uc_mem_write(uc, data_address + i * page_size, &one,
+                        sizeof(one)));
+    }
+
+    OK(uc_ctl_tlb_mode(uc, UC_TLB_VIRTUAL));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_TLB_FILL, test_x86_vtlb_callback,
+                   &fill_count, 1, 0));
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+    OK(uc_reg_write(uc, UC_X86_REG_RCX, &rcx));
+    OK(uc_reg_write(uc, UC_X86_REG_R8, &r8));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+    TEST_CHECK(rax == page_count * rounds);
+    TEST_CHECK(fill_count < page_count * rounds);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_vtlb_stride_conflict_growth(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint64_t stride = 0x100000;
+    const uint64_t page_count = 16;
+    const uint64_t rounds = 64;
+    const uint8_t code[] = {
+        0x48, 0x8b, 0x06,                   /* mov rax, [rsi] */
+        0x48, 0x81, 0xc6, 0x00, 0x00, 0x10, 0x00,
+                                                 /* add rsi, 0x100000 */
+        0x48, 0x39, 0xfe,                   /* cmp rsi, rdi */
+        0x75, 0x03,                         /* jne no_wrap */
+        0x48, 0x89, 0xde,                   /* mov rsi, rbx */
+        0x48, 0xff, 0xc9,                   /* dec rcx */
+        0x75, 0xe9,                         /* jnz loop */
+    };
+    uint64_t rax = 0;
+    uint64_t rbx = data_address;
+    uint64_t rcx = page_count * rounds;
+    uint64_t rdi = data_address + stride * page_count;
+    uint64_t rsi = data_address;
+    uint64_t remaining;
+    uint64_t value = 1;
+    uint32_t fill_count = 0;
+    uint64_t i;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_map(uc, data_address, stride * page_count, UC_PROT_ALL));
+    for (i = 0; i < page_count; i++) {
+        OK(uc_mem_write(uc, data_address + i * stride, &value,
+                        sizeof(value)));
+    }
+
+    OK(uc_ctl_tlb_mode(uc, UC_TLB_VIRTUAL));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_TLB_FILL, test_x86_vtlb_callback,
+                   &fill_count, 1, 0));
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+    OK(uc_reg_write(uc, UC_X86_REG_RCX, &rcx));
+    OK(uc_reg_write(uc, UC_X86_REG_RDI, &rdi));
+    OK(uc_reg_write(uc, UC_X86_REG_RSI, &rsi));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_RCX, &remaining));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+
+    TEST_CHECK(remaining == 0);
+    TEST_CHECK(rax == value);
+    TEST_CHECK_(fill_count < page_count * rounds + 1,
+                "fill_count=%u", fill_count);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_vtlb_victim_memory_hook(uc_engine *uc,
+                                             uc_mem_type type,
+                                             uint64_t address, int size,
+                                             int64_t value, void *user_data)
+{
+    (*(uint32_t *)user_data)++;
+}
+
+static void test_x86_vtlb_hooked_victim_hit(void)
+{
+    const uint64_t address_a = 0x200000;
+    const uint64_t address_b = address_a + 0x100000;
+    const uint64_t value_a = 7;
+    const uint64_t value_b = 11;
+    const uint8_t code[] = {
+        0x48, 0x8b, 0x03, /* mov rax, [rbx] */
+        0x48, 0x8b, 0x11, /* mov rdx, [rcx] */
+        0x48, 0x03, 0x03, /* add rax, [rbx] */
+    };
+    uint64_t rax = 0;
+    uint64_t rbx = address_a;
+    uint64_t rcx = address_b;
+    uint64_t rdx = 0;
+    uint32_t fill_count = 0;
+    uint32_t hook_count = 0;
+    uc_engine *uc;
+    uc_hook fill_hook;
+    uc_hook read_hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_map(uc, address_a, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, address_b, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, address_a, &value_a, sizeof(value_a)));
+    OK(uc_mem_write(uc, address_b, &value_b, sizeof(value_b)));
+
+    OK(uc_ctl_tlb_mode(uc, UC_TLB_VIRTUAL));
+    OK(uc_hook_add(uc, &fill_hook, UC_HOOK_TLB_FILL,
+                   test_x86_vtlb_callback, &fill_count, 1, 0));
+    OK(uc_hook_add(uc, &read_hook, UC_HOOK_MEM_READ,
+                   test_x86_vtlb_victim_memory_hook, &hook_count,
+                   address_a, address_a + 0xfff));
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+    OK(uc_reg_write(uc, UC_X86_REG_RCX, &rcx));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+    OK(uc_reg_read(uc, UC_X86_REG_RDX, &rdx));
+
+    TEST_CHECK(rax == value_a * 2);
+    TEST_CHECK(rdx == value_b);
+    TEST_CHECK(hook_count == 2);
+    TEST_CHECK(fill_count == 3);
+
+    OK(uc_close(uc));
+}
+
+typedef struct {
+    uint64_t virtual_address;
+    uint64_t physical_address;
+} X86HighPaddrTlbData;
+
+static bool test_x86_vtlb_high_paddr_callback(uc_engine *uc, uint64_t address,
+                                              uc_mem_type type,
+                                              uc_tlb_entry *result,
+                                              void *user_data)
+{
+    X86HighPaddrTlbData *data = (X86HighPaddrTlbData *)user_data;
+
+    if (address == data->virtual_address) {
+        result->paddr = data->physical_address;
+    } else {
+        result->paddr = address;
+    }
+    result->perms = UC_PROT_ALL;
+    return true;
+}
+
+static void test_x86_vtlb_32bit_high_paddr(void)
+{
+    const uint64_t virtual_address = 0x2000;
+    const uint64_t physical_address = UINT64_C(0x100000000);
+    const char code[] = "\xa1\x00\x20\x00\x00"; /* mov eax, [0x2000] */
+    const uint32_t expected = 0x89abcdef;
+    X86HighPaddrTlbData data = {
+        .virtual_address = virtual_address,
+        .physical_address = physical_address,
+    };
+    uint64_t translated;
+    uint32_t eax;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, physical_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, physical_address, &expected, sizeof(expected)));
+    OK(uc_ctl_tlb_mode(uc, UC_TLB_VIRTUAL));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_TLB_FILL,
+                   test_x86_vtlb_high_paddr_callback, &data, 1, 0));
+
+    OK(uc_vmem_translate(uc, virtual_address, UC_PROT_READ, &translated));
+    TEST_CHECK(translated == physical_address);
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == expected);
 
     OK(uc_close(uc));
 }
@@ -3706,6 +4122,113 @@ static void test_x86_hook_insn_rdmsr(void)
     OK(uc_close(uc));
 }
 
+static int test_x86_count_filtered_insn_hook(uc_engine *uc, void *user_data)
+{
+    uint32_t *count = (uint32_t *)user_data;
+
+    (*count)++;
+    return 1;
+}
+
+static void test_x86_filtered_insn_hooks(void)
+{
+    static const struct {
+        uint8_t code[3];
+        size_t size;
+        int insn;
+    } cases[] = {
+        {{0x0f, 0xa2, 0x00}, 2, UC_X86_INS_CPUID},
+        {{0x0f, 0x31, 0x00}, 2, UC_X86_INS_RDTSC},
+        {{0x0f, 0x01, 0xf9}, 3, UC_X86_INS_RDTSCP},
+        {{0x0f, 0x30, 0x00}, 2, UC_X86_INS_WRMSR},
+        {{0x0f, 0x32, 0x00}, 2, UC_X86_INS_RDMSR},
+    };
+    static const int insns[] = {
+        UC_X86_INS_CPUID,
+        UC_X86_INS_RDTSC,
+        UC_X86_INS_RDTSCP,
+        UC_X86_INS_WRMSR,
+        UC_X86_INS_RDMSR,
+    };
+    uint32_t counts[sizeof(insns) / sizeof(insns[0])] = { 0 };
+    uc_hook hooks[sizeof(insns) / sizeof(insns[0])];
+    uc_engine *uc;
+    size_t i;
+    size_t j;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_X86_HASWELL));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        OK(uc_mem_write(uc, code_start + i * 0x10,
+                        cases[i].code, cases[i].size));
+    }
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        OK(uc_hook_add(uc, &hooks[i], UC_HOOK_INSN,
+                       test_x86_count_filtered_insn_hook, &counts[i],
+                       1, 0, insns[i]));
+    }
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint64_t address = code_start + i * 0x10;
+
+        OK(uc_emu_start(uc, address, address + cases[i].size, 0, 0));
+        for (j = 0; j < sizeof(counts) / sizeof(counts[0]); j++) {
+            TEST_CHECK_(counts[j] == (j <= i ? 1u : 0u),
+                        "case=%zu hook=%zu count=%u", i, j, counts[j]);
+        }
+    }
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_count_filtered_system_hook(uc_engine *uc,
+                                                void *user_data)
+{
+    uint32_t *count = (uint32_t *)user_data;
+
+    (*count)++;
+}
+
+static void test_x86_filtered_system_hooks_one(const uint8_t code[2],
+                                               int expected_insn,
+                                               int unrelated_insn)
+{
+    uint32_t expected_count = 0;
+    uint32_t unrelated_count = 0;
+    uc_engine *uc;
+    uc_hook expected_hook;
+    uc_hook unrelated_hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86,
+                    expected_insn == UC_X86_INS_SYSCALL ?
+                        UC_MODE_64 : UC_MODE_32,
+                    (const char *)code, 2);
+    OK(uc_hook_add(uc, &expected_hook, UC_HOOK_INSN,
+                   test_x86_count_filtered_system_hook, &expected_count,
+                   1, 0, expected_insn));
+    OK(uc_hook_add(uc, &unrelated_hook, UC_HOOK_INSN,
+                   test_x86_count_filtered_system_hook, &unrelated_count,
+                   1, 0, unrelated_insn));
+
+    OK(uc_emu_start(uc, code_start, code_start + 2, 0, 0));
+    TEST_CHECK(expected_count == 1);
+    TEST_CHECK(unrelated_count == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_filtered_system_hooks(void)
+{
+    const uint8_t syscall_code[] = {0x0f, 0x05};
+    const uint8_t sysenter_code[] = {0x0f, 0x34};
+
+    test_x86_filtered_system_hooks_one(syscall_code, UC_X86_INS_SYSCALL,
+                                       UC_X86_INS_SYSENTER);
+    test_x86_filtered_system_hooks_one(sysenter_code, UC_X86_INS_SYSENTER,
+                                       UC_X86_INS_SYSCALL);
+}
+
 static void test_x86_dr7(void)
 {
     uc_engine *uc;
@@ -3745,6 +4268,1318 @@ static void test_x86_hook_block(void)
 
     TEST_CHECK(cnt == 2);
     OK(uc_close(uc));
+}
+
+static void test_x86_count_memory_hook(uc_engine *uc, uc_mem_type type,
+                                       uint64_t address, int size,
+                                       int64_t value, void *user_data)
+{
+    uint32_t *count = (uint32_t *)user_data;
+
+    (*count)++;
+}
+
+typedef struct {
+    uc_hook hook;
+    uint32_t count;
+} X86SelfDeletingHookData;
+
+static void test_x86_self_deleting_memory_hook(uc_engine *uc,
+                                               uc_mem_type type,
+                                               uint64_t address, int size,
+                                               int64_t value, void *user_data)
+{
+    X86SelfDeletingHookData *data =
+        (X86SelfDeletingHookData *)user_data;
+
+    data->count++;
+    OK(uc_hook_del(uc, data->hook));
+}
+
+static void test_x86_memory_hook_add_delete_after_translation(void)
+{
+    const uint64_t data_address = 0x200000;
+    const char code[] = "\x8b\x03"; /* mov eax, [ebx] */
+    const uint32_t value = 0x44332211;
+    uint32_t hook_count = 0;
+    uint32_t ebx = (uint32_t)data_address;
+    uint32_t eax;
+    uint32_t virtual_value;
+    X86SelfDeletingHookData self_deleting = { 0 };
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &value, sizeof(value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == value);
+
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_count_memory_hook, &hook_count, data_address,
+                   data_address + sizeof(value) - 1));
+    OK(uc_vmem_read(uc, data_address, UC_PROT_READ, &virtual_value,
+                    sizeof(virtual_value)));
+    TEST_CHECK(virtual_value == value);
+    TEST_CHECK(hook_count == 0);
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    TEST_CHECK(hook_count == 1);
+
+    OK(uc_hook_del(uc, hook));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    TEST_CHECK(hook_count == 1);
+
+    OK(uc_hook_add(uc, &self_deleting.hook, UC_HOOK_MEM_READ,
+                   test_x86_self_deleting_memory_hook, &self_deleting,
+                   data_address, data_address + sizeof(value) - 1));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    TEST_CHECK(self_deleting.count == 1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86MemoryHookMutationData {
+    int hook_type;
+    uint64_t address;
+    uc_hook added_hook;
+    uc_hook deleted_hook;
+    uint32_t log[8];
+    uint32_t log_count;
+    bool mutated;
+} X86MemoryHookMutationData;
+
+static void test_x86_log_added_memory_hook(uc_engine *uc, uc_mem_type type,
+                                           uint64_t address, int size,
+                                           int64_t value, void *user_data)
+{
+    X86MemoryHookMutationData *data =
+        (X86MemoryHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 3;
+}
+
+static void test_x86_unreachable_memory_hook(uc_engine *uc,
+                                             uc_mem_type type,
+                                             uint64_t address, int size,
+                                             int64_t value, void *user_data)
+{
+    X86MemoryHookMutationData *data =
+        (X86MemoryHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 9;
+}
+
+static void test_x86_mutate_memory_hooks(uc_engine *uc, uc_mem_type type,
+                                         uint64_t address, int size,
+                                         int64_t value, void *user_data)
+{
+    X86MemoryHookMutationData *data =
+        (X86MemoryHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 1;
+    if (!data->mutated) {
+        data->mutated = true;
+        OK(uc_hook_del(uc, data->deleted_hook));
+        OK(uc_hook_add(uc, &data->added_hook, data->hook_type,
+                       test_x86_log_added_memory_hook, data,
+                       data->address, data->address + 3));
+    }
+}
+
+static void test_x86_memory_hook_mutation_same_dispatch_one(int hook_type)
+{
+    const uint64_t data_address = 0x200000;
+    const uint8_t read_code[] = {
+        0xa1, 0x00, 0x00, 0x20, 0x00,
+        0xa1, 0x00, 0x00, 0x20, 0x00,
+    };
+    const uint8_t write_code[] = {
+        0xa3, 0x00, 0x00, 0x20, 0x00,
+        0xa3, 0x00, 0x00, 0x20, 0x00,
+    };
+    const uint8_t *code = hook_type == UC_HOOK_MEM_WRITE ?
+                              write_code : read_code;
+    uint32_t value = 0x44332211;
+    X86MemoryHookMutationData data = {
+        .hook_type = hook_type,
+        .address = data_address,
+    };
+    uc_engine *uc;
+    uc_hook first_hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(read_code));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &value, sizeof(value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &value));
+    OK(uc_hook_add(uc, &first_hook, hook_type,
+                   test_x86_mutate_memory_hooks, &data,
+                   data_address, data_address + 3));
+    OK(uc_hook_add(uc, &data.deleted_hook, hook_type,
+                   test_x86_unreachable_memory_hook, &data,
+                   data_address, data_address + 3));
+
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(read_code), 0, 0));
+    TEST_CHECK(data.log_count == 4);
+    TEST_CHECK(data.log[0] == 1 && data.log[1] == 3 &&
+               data.log[2] == 1 && data.log[3] == 3);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_memory_hook_mutation_same_dispatch(void)
+{
+    test_x86_memory_hook_mutation_same_dispatch_one(UC_HOOK_MEM_READ);
+    test_x86_memory_hook_mutation_same_dispatch_one(UC_HOOK_MEM_READ_AFTER);
+    test_x86_memory_hook_mutation_same_dispatch_one(UC_HOOK_MEM_WRITE);
+}
+
+typedef struct X86MemoryHookUserData {
+    uc_hook hook;
+    struct X86MemoryHookUserData *replacement;
+    uint32_t count;
+} X86MemoryHookUserData;
+
+static void test_x86_memory_hook_user_data_callback(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
+{
+    X86MemoryHookUserData *data =
+        (X86MemoryHookUserData *)user_data;
+
+    data->count++;
+    if (data->replacement != NULL) {
+        OK(uc_hook_set_user_data(uc, data->hook, data->replacement));
+        data->replacement = NULL;
+    }
+}
+
+static void test_x86_memory_hook_user_data(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint8_t code[] = {
+        0xa1, 0x00, 0x00, 0x20, 0x00,
+        0xa1, 0x00, 0x00, 0x20, 0x00,
+    };
+    const uint32_t value = 0x11223344;
+    X86MemoryHookUserData replacement = { 0 };
+    X86MemoryHookUserData initial = {
+        .replacement = &replacement,
+    };
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &value, sizeof(value)));
+    OK(uc_hook_add(uc, &initial.hook, UC_HOOK_MEM_READ,
+                   test_x86_memory_hook_user_data_callback, &initial,
+                   data_address, data_address + sizeof(value) - 1));
+    replacement.hook = initial.hook;
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    TEST_CHECK(initial.count == 1);
+    TEST_CHECK(replacement.count == 1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86MemoryHookFallbackData {
+    uint32_t count;
+} X86MemoryHookFallbackData;
+
+static void test_x86_memory_hook_fallback_callback(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
+{
+    X86MemoryHookFallbackData *data =
+        (X86MemoryHookFallbackData *)user_data;
+    uint32_t eip;
+
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    TEST_CHECK(type == UC_MEM_READ);
+    TEST_CHECK(size == 4);
+    TEST_CHECK(eip == code_start + data->count * 5);
+    data->count++;
+}
+
+static void test_x86_memory_hook_fallback_accesses(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint8_t code[] = {
+        0xa1, 0x01, 0x00, 0x20, 0x00,
+        0xa1, 0xfe, 0x0f, 0x20, 0x00,
+    };
+    const uint32_t unaligned_value = 0x11223344;
+    const uint32_t cross_page_value = 0xaabbccdd;
+    X86MemoryHookFallbackData data = { 0 };
+    uint32_t eax;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)code, sizeof(code));
+    OK(uc_mem_map(uc, data_address, 0x2000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address + 1, &unaligned_value,
+                    sizeof(unaligned_value)));
+    OK(uc_mem_write(uc, data_address + 0xffe, &cross_page_value,
+                    sizeof(cross_page_value)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_memory_hook_fallback_callback, &data, 1, 0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(data.count == 2);
+    TEST_CHECK(eax == cross_page_value);
+
+    OK(uc_close(uc));
+}
+
+typedef struct {
+    uint32_t expected_pc;
+    uint32_t count;
+} X86RestoreCacheHookData;
+
+static void test_x86_restore_cache_memory_hook(uc_engine *uc,
+                                               uc_mem_type type,
+                                               uint64_t address, int size,
+                                               int64_t value, void *user_data)
+{
+    X86RestoreCacheHookData *data =
+        (X86RestoreCacheHookData *)user_data;
+    uint32_t pc;
+
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &pc));
+    TEST_CHECK(pc == data->expected_pc);
+    data->count++;
+}
+
+static void test_x86_memory_hook_restore_cache_tb_flush(void)
+{
+    const uint64_t second_code_address = code_start + 0x1000;
+    const uint64_t data_address = 0x200000;
+    const uint8_t code[] = { 0x8b, 0x03 }; /* mov eax, [ebx] */
+    const uint32_t value = 0x44332211;
+    X86RestoreCacheHookData data = {
+        .expected_pc = (uint32_t)code_start,
+    };
+    uint32_t ebx = (uint32_t)data_address;
+    uint32_t eax;
+    size_t i;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_write(uc, second_code_address, code, sizeof(code)));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &value, sizeof(value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_restore_cache_memory_hook, &data,
+                   data_address, data_address + sizeof(value) - 1));
+
+    for (i = 0; i < 8; i++) {
+        OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    }
+
+    OK(uc_ctl_flush_tb(uc));
+    data.expected_pc = (uint32_t)second_code_address;
+    for (i = 0; i < 8; i++) {
+        OK(uc_emu_start(uc, second_code_address,
+                        second_code_address + sizeof(code), 0, 0));
+    }
+
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == value);
+    TEST_CHECK(data.count == 16);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86CodeHookDeleteData {
+    uc_hook hook;
+    uint32_t count;
+} X86CodeHookDeleteData;
+
+static void test_x86_count_code_hook(uc_engine *uc, uint64_t address,
+                                     uint32_t size, void *user_data)
+{
+    X86CodeHookDeleteData *data =
+        (X86CodeHookDeleteData *)user_data;
+
+    data->count++;
+}
+
+static void test_x86_delete_code_hook(uc_engine *uc, uint64_t address,
+                                      uint32_t size, void *user_data)
+{
+    X86CodeHookDeleteData *data =
+        (X86CodeHookDeleteData *)user_data;
+
+    data->count++;
+    if (data->count == 1) {
+        OK(uc_hook_del(uc, data->hook));
+    }
+}
+
+static void test_x86_bounded_mid_tb_code_hook_delete(void)
+{
+    const uint64_t sink_address = code_start + 0x1000;
+    const uint8_t code[] = {
+        0x40,                         /* inc eax */
+        0x40,                         /* inc eax */
+        0xe9, 0xf9, 0x0f, 0x00, 0x00, /* jmp sink */
+    };
+    const uint8_t sink_code[] = { 0x90 }; /* nop */
+    X86CodeHookDeleteData data = { 0 };
+    uint32_t eax = 0;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_write(uc, sink_address, sink_code, sizeof(sink_code)));
+    OK(uc_hook_add(uc, &data.hook, UC_HOOK_CODE,
+                   test_x86_count_code_hook, &data,
+                   code_start + 1, code_start + 1));
+
+    OK(uc_emu_start(uc, code_start,
+                    sink_address + sizeof(sink_code), 0, 0));
+    TEST_CHECK(data.count == 1);
+    OK(uc_hook_del(uc, data.hook));
+
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_emu_start(uc, code_start,
+                    sink_address + sizeof(sink_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 2);
+    TEST_CHECK(data.count == 1);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_self_deleting_single_code_hook(void)
+{
+    const uint8_t code[] = { 0x40, 0x40, 0x40, 0x40 };
+    X86CodeHookDeleteData data = { 0 };
+    uint32_t eax;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_hook_add(uc, &data.hook, UC_HOOK_CODE,
+                   test_x86_delete_code_hook, &data, 1, 0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 4);
+    TEST_CHECK(data.count == 1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86CodeHookUserData {
+    uc_hook hook;
+    struct X86CodeHookUserData *replacement;
+    uc_err callback_update_error;
+    uint32_t count;
+} X86CodeHookUserData;
+
+static void test_x86_code_hook_user_data_callback(uc_engine *uc,
+                                                  uint64_t address,
+                                                  uint32_t size,
+                                                  void *user_data)
+{
+    X86CodeHookUserData *data = (X86CodeHookUserData *)user_data;
+
+    data->count++;
+    if (data->replacement != NULL) {
+        data->callback_update_error =
+            uc_hook_set_user_data(uc, data->hook, data->replacement);
+    }
+}
+
+static void test_x86_bounded_code_hook_user_data(void)
+{
+    const uint8_t code[] = { 0x40, 0x40 };
+    X86CodeHookUserData replacement = { 0 };
+    X86CodeHookUserData initial = {
+        .replacement = &replacement,
+        .callback_update_error = UC_ERR_OK,
+    };
+    uint32_t eax = 0;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)code, sizeof(code));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_hook_add(uc, &initial.hook, UC_HOOK_CODE,
+                   test_x86_code_hook_user_data_callback, &initial,
+                   code_start + 1, code_start + 1));
+    replacement.hook = initial.hook;
+
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    TEST_CHECK(initial.count == 1);
+    TEST_CHECK(initial.callback_update_error == UC_ERR_ARG);
+    TEST_CHECK(replacement.count == 0);
+
+    OK(uc_hook_set_user_data(uc, initial.hook, &replacement));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    TEST_CHECK(initial.count == 1);
+    TEST_CHECK(replacement.count == 1);
+
+    OK(uc_hook_del(uc, initial.hook));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    TEST_CHECK(replacement.count == 1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86SelfDeletingBlockData {
+    uc_hook hook;
+    uint32_t count;
+} X86SelfDeletingBlockData;
+
+static void test_x86_self_deleting_block_callback(uc_engine *uc,
+                                                  uint64_t address,
+                                                  uint32_t size,
+                                                  void *user_data)
+{
+    X86SelfDeletingBlockData *data =
+        (X86SelfDeletingBlockData *)user_data;
+
+    data->count++;
+    OK(uc_hook_del(uc, data->hook));
+}
+
+static void test_x86_self_deleting_single_block_hook(void)
+{
+    const uint64_t target = code_start + 0x1000;
+    const uint8_t first_code[] = {
+        0x40,
+        0xe9, 0xfa, 0x0f, 0x00, 0x00,
+    };
+    const uint8_t target_code[] = { 0x40 };
+    X86SelfDeletingBlockData data = { 0 };
+    uint32_t eax;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)first_code, sizeof(first_code));
+    OK(uc_mem_write(uc, target, target_code, sizeof(target_code)));
+    OK(uc_hook_add(uc, &data.hook, UC_HOOK_BLOCK,
+                   test_x86_self_deleting_block_callback, &data, 1, 0));
+
+    OK(uc_emu_start(uc, code_start,
+                    target + sizeof(target_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 2);
+    TEST_CHECK(data.count == 1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86CodeHookMutationData {
+    uc_hook added_hook;
+    uc_hook deleted_hook;
+    uint32_t log[8];
+    uint32_t log_count;
+    bool mutated;
+} X86CodeHookMutationData;
+
+static void test_x86_log_added_code_hook(uc_engine *uc, uint64_t address,
+                                         uint32_t size, void *user_data)
+{
+    X86CodeHookMutationData *data =
+        (X86CodeHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 3;
+}
+
+static void test_x86_add_code_hook_from_callback(uc_engine *uc,
+                                                 uint64_t address,
+                                                 uint32_t size,
+                                                 void *user_data)
+{
+    X86CodeHookMutationData *data =
+        (X86CodeHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 2;
+    if (!data->mutated) {
+        data->mutated = true;
+        OK(uc_hook_add(uc, &data->added_hook, UC_HOOK_CODE,
+                       test_x86_log_added_code_hook, data,
+                       address, address));
+    }
+}
+
+static void test_x86_delete_later_code_hook(uc_engine *uc,
+                                            uint64_t address,
+                                            uint32_t size,
+                                            void *user_data)
+{
+    X86CodeHookMutationData *data =
+        (X86CodeHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 1;
+    if (!data->mutated) {
+        data->mutated = true;
+        OK(uc_hook_del(uc, data->deleted_hook));
+    }
+}
+
+static void test_x86_unreachable_code_hook(uc_engine *uc, uint64_t address,
+                                           uint32_t size, void *user_data)
+{
+    X86CodeHookMutationData *data =
+        (X86CodeHookMutationData *)user_data;
+
+    data->log[data->log_count++] = 9;
+}
+
+static void test_x86_code_hook_append_same_dispatch(void)
+{
+    const uint8_t code[] = { 0x40 }; /* inc eax */
+    X86CodeHookMutationData data = { 0 };
+    uc_engine *uc;
+    uc_hook nonmatching_hook;
+    uc_hook matching_hook;
+    uint32_t eax;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_hook_add(uc, &nonmatching_hook, UC_HOOK_CODE,
+                   test_x86_unreachable_code_hook, &data,
+                   code_start + 0x100, code_start + 0x100));
+    OK(uc_hook_add(uc, &matching_hook, UC_HOOK_CODE,
+                   test_x86_add_code_hook_from_callback, &data,
+                   code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 1);
+    TEST_CHECK(data.log_count == 4);
+    TEST_CHECK(data.log[0] == 2 && data.log[1] == 3 &&
+               data.log[2] == 2 && data.log[3] == 3);
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_code_hook_delete_later_same_dispatch(void)
+{
+    const uint8_t code[] = { 0x40 }; /* inc eax */
+    X86CodeHookMutationData data = { 0 };
+    uc_engine *uc;
+    uc_hook first_hook;
+    uint32_t eax;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_hook_add(uc, &first_hook, UC_HOOK_CODE,
+                   test_x86_delete_later_code_hook, &data,
+                   code_start, code_start));
+    OK(uc_hook_add(uc, &data.deleted_hook, UC_HOOK_CODE,
+                   test_x86_unreachable_code_hook, &data,
+                   code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 1);
+    TEST_CHECK(data.log_count == 1 && data.log[0] == 1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86EdgeFlushData {
+    uint32_t count;
+    uc_tb first_current;
+    uc_tb first_previous;
+} X86EdgeFlushData;
+
+static void test_x86_edge_flush_callback(uc_engine *uc,
+                                         const uc_tb *current,
+                                         const uc_tb *previous,
+                                         void *user_data)
+{
+    X86EdgeFlushData *data = (X86EdgeFlushData *)user_data;
+
+    if (data->count == 0) {
+        data->first_current = *current;
+        data->first_previous = *previous;
+        OK(uc_ctl_flush_tb(uc));
+    }
+    data->count++;
+}
+
+static void test_x86_edge_hook_tb_flush_lifetime(void)
+{
+    const uint64_t second_address = code_start + 0x1000;
+    const uint64_t sink_address = code_start + 0x2000;
+    const uint8_t first_code[] = {
+        0xe9, 0xfb, 0x0f, 0x00, 0x00, /* jmp second */
+    };
+    const uint8_t second_code[] = {
+        0x40,                         /* inc eax */
+        0xe9, 0xfa, 0x0f, 0x00, 0x00, /* jmp sink */
+    };
+    const uint8_t sink_code[] = { 0x90 };
+    X86EdgeFlushData data = { 0 };
+    uc_engine *uc;
+    uc_hook hook;
+    uint32_t eax;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)first_code, sizeof(first_code));
+    OK(uc_mem_write(uc, second_address, second_code, sizeof(second_code)));
+    OK(uc_mem_write(uc, sink_address, sink_code, sizeof(sink_code)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_EDGE_GENERATED,
+                   test_x86_edge_flush_callback, &data, 1, 0));
+
+    OK(uc_emu_start(uc, code_start, second_address, 0, 0));
+    OK(uc_ctl_remove_cache(uc, second_address, second_address + 1));
+    OK(uc_emu_start(uc, second_address,
+                    sink_address + sizeof(sink_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == 1);
+    TEST_CHECK_(data.count == 3, "count=%u", data.count);
+    TEST_CHECK_(data.first_previous.pc == code_start,
+                "previous=0x%" PRIx64, data.first_previous.pc);
+    TEST_CHECK_(data.first_current.pc == second_address,
+                "current=0x%" PRIx64, data.first_current.pc);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86NestedEdgeData {
+    uint64_t inner_start;
+    uint64_t inner_end;
+    uint64_t previous[8];
+    uint64_t current[8];
+    uint32_t count;
+    bool nested_started;
+} X86NestedEdgeData;
+
+static void test_x86_nested_edge_callback(uc_engine *uc,
+                                          const uc_tb *current,
+                                          const uc_tb *previous,
+                                          void *user_data)
+{
+    X86NestedEdgeData *data = (X86NestedEdgeData *)user_data;
+
+    TEST_CHECK(data->count < 8);
+    data->previous[data->count] = previous->pc;
+    data->current[data->count] = current->pc;
+    data->count++;
+    if (!data->nested_started) {
+        uint32_t resume_pc = (uint32_t)current->pc;
+
+        data->nested_started = true;
+        OK(uc_emu_start(uc, data->inner_start, data->inner_end, 0, 0));
+        OK(uc_reg_write(uc, UC_X86_REG_EIP, &resume_pc));
+    }
+}
+
+static void test_x86_nested_edge_history(void)
+{
+    const uint64_t outer_target = code_start + 0x1000;
+    const uint64_t inner_start = code_start + 0x2000;
+    const uint64_t inner_end = code_start + 0x3000;
+    const uint8_t jump[] = {
+        0xe9, 0xfb, 0x0f, 0x00, 0x00,
+    };
+    const uint8_t nop[] = { 0x90 };
+    X86NestedEdgeData data = {
+        .inner_start = inner_start,
+        .inner_end = inner_end,
+    };
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)jump, sizeof(jump));
+    OK(uc_mem_write(uc, outer_target, nop, sizeof(nop)));
+    OK(uc_mem_write(uc, inner_start, jump, sizeof(jump)));
+    OK(uc_mem_write(uc, inner_end, nop, sizeof(nop)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_EDGE_GENERATED,
+                   test_x86_nested_edge_callback, &data, 1, 0));
+
+    OK(uc_emu_start(uc, code_start, outer_target, 0, 0));
+    TEST_CHECK(data.count >= 2);
+    TEST_CHECK(data.previous[0] == code_start);
+    TEST_CHECK(data.current[0] == outer_target);
+    TEST_CHECK(data.previous[1] == inner_start);
+    TEST_CHECK(data.current[1] == inner_end);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86EdgeHistoryResetData {
+    uint64_t previous[4];
+    uint64_t current[4];
+    uint32_t count;
+} X86EdgeHistoryResetData;
+
+static void test_x86_edge_history_reset_callback(uc_engine *uc,
+                                                 const uc_tb *current,
+                                                 const uc_tb *previous,
+                                                 void *user_data)
+{
+    X86EdgeHistoryResetData *data =
+        (X86EdgeHistoryResetData *)user_data;
+
+    TEST_CHECK(data->count < 4);
+    data->previous[data->count] = previous->pc;
+    data->current[data->count] = current->pc;
+    data->count++;
+}
+
+static void test_x86_edge_hook_add_resets_history(void)
+{
+    const uint64_t middle = code_start + 0x1000;
+    const uint64_t sink = code_start + 0x2000;
+    const uint8_t jump[] = {
+        0xe9, 0xfb, 0x0f, 0x00, 0x00,
+    };
+    const uint8_t sink_code[] = { 0x90 };
+    X86EdgeHistoryResetData data = { 0 };
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)jump, sizeof(jump));
+    OK(uc_mem_write(uc, middle, jump, sizeof(jump)));
+    OK(uc_mem_write(uc, sink, sink_code, sizeof(sink_code)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_EDGE_GENERATED,
+                   test_x86_edge_history_reset_callback, &data, 1, 0));
+    OK(uc_emu_start(uc, code_start, middle, 0, 0));
+    TEST_CHECK(data.count == 1);
+    OK(uc_hook_del(uc, hook));
+    memset(&data, 0, sizeof(data));
+
+    OK(uc_hook_add(uc, &hook, UC_HOOK_EDGE_GENERATED,
+                   test_x86_edge_history_reset_callback, &data, 1, 0));
+    OK(uc_emu_start(uc, middle,
+                    sink + sizeof(sink_code), 0, 0));
+    TEST_CHECK_(data.count == 2, "count=%u", data.count);
+    TEST_CHECK_(data.previous[0] == middle, "previous=0x%" PRIx64,
+                data.previous[0]);
+    TEST_CHECK_(data.current[0] == sink, "current=0x%" PRIx64,
+                data.current[0]);
+    TEST_CHECK(data.previous[1] == sink);
+    TEST_CHECK(data.current[1] == sink + sizeof(sink_code));
+
+    OK(uc_close(uc));
+}
+
+typedef struct {
+    uint32_t read_after_count;
+    uint32_t write_count;
+} X86ReadAfterWriteHookData;
+
+static void test_x86_count_read_after_write_hook(uc_engine *uc,
+                                                 uc_mem_type type,
+                                                 uint64_t address, int size,
+                                                 int64_t value,
+                                                 void *user_data)
+{
+    X86ReadAfterWriteHookData *data =
+        (X86ReadAfterWriteHookData *)user_data;
+
+    if (type == UC_MEM_READ_AFTER) {
+        data->read_after_count++;
+    } else {
+        TEST_CHECK(type == UC_MEM_WRITE);
+        data->write_count++;
+    }
+}
+
+static void test_x86_memory_write_read_after_hook_add_delete(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint8_t code[] = {
+        0xa1, 0x00, 0x00, 0x20, 0x00, /* mov eax, [0x200000] */
+        0xa3, 0x04, 0x00, 0x20, 0x00, /* mov [0x200004], eax */
+    };
+    const uint32_t value = 0x44332211;
+    X86ReadAfterWriteHookData data = { 0 };
+    uint32_t stored = 0;
+    uc_engine *uc;
+    uc_hook read_after_hook;
+    uc_hook write_hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &value, sizeof(value)));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_hook_add(uc, &read_after_hook, UC_HOOK_MEM_READ_AFTER,
+                   test_x86_count_read_after_write_hook, &data,
+                   data_address, data_address + sizeof(value) - 1));
+    OK(uc_hook_add(uc, &write_hook, UC_HOOK_MEM_WRITE,
+                   test_x86_count_read_after_write_hook, &data,
+                   data_address + sizeof(value),
+                   data_address + 2 * sizeof(value) - 1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    TEST_CHECK(data.read_after_count == 1);
+    TEST_CHECK(data.write_count == 1);
+
+    OK(uc_hook_del(uc, read_after_hook));
+    OK(uc_hook_del(uc, write_hook));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    TEST_CHECK(data.read_after_count == 1);
+    TEST_CHECK(data.write_count == 1);
+    OK(uc_mem_read(uc, data_address + sizeof(value), &stored,
+                   sizeof(stored)));
+    TEST_CHECK(stored == value);
+
+    OK(uc_close(uc));
+}
+
+typedef struct {
+    uint64_t address;
+    uint32_t value;
+    uint32_t count;
+} X86RemapHookData;
+
+static void test_x86_remap_memory_hook(uc_engine *uc, uc_mem_type type,
+                                       uint64_t address, int size,
+                                       int64_t value, void *user_data)
+{
+    X86RemapHookData *data = (X86RemapHookData *)user_data;
+
+    data->count++;
+    OK(uc_mem_unmap(uc, data->address, 0x1000));
+    OK(uc_mem_map(uc, data->address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data->address, &data->value, sizeof(data->value)));
+}
+
+static void test_x86_memory_hook_remap_revalidation(void)
+{
+    const uint64_t data_address = 0x200000;
+    const char code[] = "\x8b\x03"; /* mov eax, [ebx] */
+    const uint32_t initial_value = 0x11223344;
+    X86RemapHookData data = {
+        .address = data_address,
+        .value = 0xaabbccdd,
+    };
+    uint32_t ebx = (uint32_t)data_address;
+    uint32_t eax;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code, sizeof(code) - 1);
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &initial_value, sizeof(initial_value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_remap_memory_hook, &data, data_address,
+                   data_address + sizeof(initial_value) - 1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(data.count == 1);
+    TEST_CHECK(eax == data.value);
+
+    OK(uc_close(uc));
+}
+
+typedef struct {
+    uint64_t nested_address;
+    uint32_t count;
+    bool active;
+} X86NestedMemoryHookData;
+
+static void test_x86_nested_memory_hook(uc_engine *uc, uc_mem_type type,
+                                        uint64_t address, int size,
+                                        int64_t value, void *user_data)
+{
+    X86NestedMemoryHookData *data = (X86NestedMemoryHookData *)user_data;
+
+    data->count++;
+    if (!data->active) {
+        data->active = true;
+        OK(uc_emu_start(uc, data->nested_address,
+                        data->nested_address + 2, 0, 1));
+        data->active = false;
+    }
+}
+
+static void test_x86_memory_hook_nested_tlb_revalidation(void)
+{
+    const uint64_t outer_data_address = 0x200000;
+    const uint64_t nested_data_address = 0x300000;
+    const uint64_t nested_code_address = code_start + 0x1000;
+    const char outer_code[] = "\x8b\x03"; /* mov eax, [ebx] */
+    const char nested_code[] = "\x8b\x0a"; /* mov ecx, [edx] */
+    const uint32_t outer_value = 0x12345678;
+    const uint32_t nested_value = 0x87654321;
+    X86NestedMemoryHookData data = {
+        .nested_address = nested_code_address,
+    };
+    uint32_t ebx = (uint32_t)outer_data_address;
+    uint32_t edx = (uint32_t)nested_data_address;
+    uint32_t eax;
+    uint32_t ecx;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, outer_code,
+                    sizeof(outer_code) - 1);
+    OK(uc_mem_write(uc, nested_code_address, nested_code,
+                    sizeof(nested_code) - 1));
+    OK(uc_mem_map(uc, outer_data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(uc, nested_data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, outer_data_address, &outer_value,
+                    sizeof(outer_value)));
+    OK(uc_mem_write(uc, nested_data_address, &nested_value,
+                    sizeof(nested_value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_reg_write(uc, UC_X86_REG_EDX, &edx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_nested_memory_hook, &data, outer_data_address,
+                   outer_data_address + sizeof(outer_value) - 1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(outer_code) - 1, 0,
+                    1));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    TEST_CHECK(data.count == 1);
+    TEST_CHECK(eax == outer_value);
+    TEST_CHECK(ecx == nested_value);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86NestedFlushHookData {
+    uint64_t nested_address;
+    uint32_t count;
+    bool nested_started;
+} X86NestedFlushHookData;
+
+static void test_x86_memory_hook_nested_flush_callback(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
+{
+    X86NestedFlushHookData *data =
+        (X86NestedFlushHookData *)user_data;
+
+    data->count++;
+    if (!data->nested_started) {
+        data->nested_started = true;
+        OK(uc_ctl_flush_tb(uc));
+        OK(uc_emu_start(uc, data->nested_address,
+                        data->nested_address + 5, 0, 0));
+    }
+}
+
+static void test_x86_memory_hook_nested_tb_flush(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint64_t nested_address = code_start + 0x1000;
+    const uint8_t outer_code[] = {
+        0x8b, 0x03, /* mov eax, [ebx] */
+        0x40,       /* inc eax */
+    };
+    const uint8_t nested_code[] = {
+        0xb9, 0x78, 0x56, 0x34, 0x12, /* mov ecx, 0x12345678 */
+    };
+    const uint32_t memory_value = 0x11223344;
+    X86NestedFlushHookData data = {
+        .nested_address = nested_address,
+    };
+    uint32_t ebx = (uint32_t)data_address;
+    uint32_t eax;
+    uint32_t ecx;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)outer_code, sizeof(outer_code));
+    OK(uc_mem_write(uc, nested_address, nested_code, sizeof(nested_code)));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &memory_value,
+                    sizeof(memory_value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_memory_hook_nested_flush_callback, &data,
+                   data_address,
+                   data_address + sizeof(memory_value) - 1));
+
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(outer_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    TEST_CHECK_(data.count == 1, "count=%u", data.count);
+    TEST_CHECK_(eax == memory_value + 1, "eax=0x%x", eax);
+    TEST_CHECK(ecx == 0x12345678);
+
+    OK(uc_close(uc));
+}
+
+typedef struct X86TbFlushSelfLinkData {
+    uint8_t *code;
+    uint32_t count;
+} X86TbFlushSelfLinkData;
+
+static void test_x86_memory_hook_tb_flush_self_link_callback(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
+{
+    X86TbFlushSelfLinkData *data =
+        (X86TbFlushSelfLinkData *)user_data;
+
+    data->count++;
+    if (data->count == 1) {
+        data->code[2] = 0x42; /* inc edx */
+        OK(uc_ctl_flush_tb(uc));
+    }
+}
+
+static void test_x86_memory_hook_tb_flush_self_link(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint8_t original_code[] = {
+        0x8b, 0x33, /* mov esi, [ebx] */
+        0x40,       /* inc eax */
+        0x49,       /* dec ecx */
+        0x75, 0xfa, /* jne loop */
+    };
+    const uint32_t memory_value = 0x11223344;
+    uint8_t *code_page = calloc(1, 0x1000);
+    X86TbFlushSelfLinkData data = {
+        .code = code_page,
+    };
+    uint32_t ebx = (uint32_t)data_address;
+    uint32_t ecx = 4;
+    uint32_t eax = 0;
+    uint32_t edx = 0;
+    uc_engine *uc;
+    uc_hook hook;
+
+    TEST_CHECK(code_page != NULL);
+    memcpy(code_page, original_code, sizeof(original_code));
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map_ptr(uc, code_start, 0x1000, UC_PROT_ALL, code_page));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &memory_value,
+                    sizeof(memory_value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_reg_write(uc, UC_X86_REG_ECX, &ecx));
+
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(original_code), 0, 0));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_memory_hook_tb_flush_self_link_callback, &data,
+                   data_address,
+                   data_address + sizeof(memory_value) - 1));
+
+    ecx = 2;
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_write(uc, UC_X86_REG_ECX, &ecx));
+    OK(uc_reg_write(uc, UC_X86_REG_EDX, &edx));
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(original_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_EDX, &edx));
+    TEST_CHECK_(data.count == 2, "count=%u", data.count);
+    TEST_CHECK_(eax == 1, "eax=0x%x", eax);
+    TEST_CHECK_(edx == 1, "edx=0x%x", edx);
+
+    OK(uc_close(uc));
+    free(code_page);
+}
+
+static void test_x86_code_hook_nested_flush_callback(
+    uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
+{
+    X86NestedFlushHookData *data =
+        (X86NestedFlushHookData *)user_data;
+
+    data->count++;
+    if (!data->nested_started) {
+        data->nested_started = true;
+        OK(uc_ctl_flush_tb(uc));
+        if (data->nested_address != 0) {
+            OK(uc_emu_start(uc, data->nested_address,
+                            data->nested_address + 5, 0, 0));
+        }
+    }
+}
+
+static void test_x86_code_hook_nested_tb_flush_run(unsigned int hook_count,
+                                                   bool nested)
+{
+    const uint64_t nested_address = code_start + 0x1000;
+    const uint8_t outer_code[] = { 0x40 }; /* inc eax */
+    const uint8_t nested_code[] = {
+        0xb9, 0x78, 0x56, 0x34, 0x12, /* mov ecx, 0x12345678 */
+    };
+    X86NestedFlushHookData data = {
+        .nested_address = nested ? nested_address : 0,
+    };
+    uint32_t eax;
+    uint32_t ecx;
+    unsigned int i;
+    uc_engine *uc;
+    uc_hook hooks[2];
+
+    TEST_CHECK(hook_count <= sizeof(hooks) / sizeof(hooks[0]));
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)outer_code, sizeof(outer_code));
+    OK(uc_mem_write(uc, nested_address, nested_code, sizeof(nested_code)));
+    for (i = 0; i < hook_count; i++) {
+        OK(uc_hook_add(uc, &hooks[i], UC_HOOK_CODE,
+                       test_x86_code_hook_nested_flush_callback, &data,
+                       code_start, code_start));
+    }
+
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(outer_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    TEST_CHECK_(data.count == hook_count, "count=%u", data.count);
+    TEST_CHECK_(eax == 1, "eax=0x%x", eax);
+    TEST_CHECK(ecx == (nested ? 0x12345678 : 0));
+
+    OK(uc_close(uc));
+}
+
+static void test_x86_code_hook_nested_tb_flush(void)
+{
+    test_x86_code_hook_nested_tb_flush_run(1, true);
+}
+
+static void test_x86_multi_code_hook_nested_tb_flush(void)
+{
+    test_x86_code_hook_nested_tb_flush_run(2, false);
+}
+
+static void test_x86_nested_tb_flush_retranslation(void)
+{
+    const uint64_t nested_address = 0x400000;
+    const uint8_t outer_code[] = { 0x40 }; /* inc eax */
+    const uint8_t old_nested_code[] = {
+        0xb9, 0x11, 0x11, 0x11, 0x11, /* mov ecx, 0x11111111 */
+    };
+    const uint8_t new_nested_code[] = {
+        0xb9, 0x78, 0x56, 0x34, 0x12, /* mov ecx, 0x12345678 */
+    };
+    X86NestedFlushHookData data = {
+        .nested_address = nested_address,
+    };
+    uint8_t *nested_page = calloc(1, 0x1000);
+    uint32_t ecx;
+    uc_engine *uc;
+    uc_hook hook;
+
+    TEST_CHECK(nested_page != NULL);
+    memcpy(nested_page, old_nested_code, sizeof(old_nested_code));
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32,
+                    (const char *)outer_code, sizeof(outer_code));
+    OK(uc_mem_map_ptr(uc, nested_address, 0x1000, UC_PROT_ALL,
+                      nested_page));
+
+    OK(uc_emu_start(uc, nested_address,
+                    nested_address + sizeof(old_nested_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    TEST_CHECK(ecx == 0x11111111);
+
+    memcpy(nested_page, new_nested_code, sizeof(new_nested_code));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_x86_code_hook_nested_flush_callback, &data,
+                   code_start, code_start));
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(outer_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    TEST_CHECK_(data.count == 1, "count=%u", data.count);
+    TEST_CHECK_(ecx == 0x12345678, "ecx=0x%x", ecx);
+
+    OK(uc_close(uc));
+    free(nested_page);
+}
+
+typedef struct X86NestedFlushFaultData {
+    uint64_t nested_address;
+    uc_err nested_error;
+    uint32_t count;
+} X86NestedFlushFaultData;
+
+static void test_x86_nested_flush_fault_callback(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
+{
+    X86NestedFlushFaultData *data =
+        (X86NestedFlushFaultData *)user_data;
+
+    data->count++;
+    OK(uc_ctl_flush_tb(uc));
+    data->nested_error =
+        uc_emu_start(uc, data->nested_address,
+                     data->nested_address + 6, 0, 0);
+}
+
+static void test_x86_nested_tb_flush_fault_recovery(void)
+{
+    const uint64_t nested_address = code_start + 0x100;
+    const uint64_t data_address = 0x200000;
+    const uint8_t outer_code[] = {
+        0x8b, 0x03,
+        0x40,
+    };
+    const uint8_t nested_code[] = {
+        0x8b, 0x0d, 0x00, 0x00, 0x30, 0x00,
+    };
+    const uint32_t memory_value = 0x11223344;
+    uint8_t *code_page = calloc(1, 0x1000);
+    X86NestedFlushFaultData data = {
+        .nested_address = nested_address,
+    };
+    uint32_t ebx = (uint32_t)data_address;
+    uint32_t eax;
+    uc_engine *uc;
+    uc_hook hook;
+
+    TEST_CHECK(code_page != NULL);
+    memcpy(code_page, outer_code, sizeof(outer_code));
+    memcpy(code_page + nested_address - code_start,
+           nested_code, sizeof(nested_code));
+    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+    OK(uc_mem_map_ptr(uc, code_start, 0x1000, UC_PROT_ALL, code_page));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &memory_value,
+                    sizeof(memory_value)));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_x86_nested_flush_fault_callback, &data,
+                   data_address, data_address + sizeof(memory_value) - 1));
+
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(outer_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(data.count == 1);
+    TEST_CHECK(data.nested_error == UC_ERR_READ_UNMAPPED);
+    TEST_CHECK(eax == memory_value + 1);
+
+    OK(uc_hook_del(uc, hook));
+    code_page[2] = 0x48;
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(outer_code), 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    TEST_CHECK(eax == memory_value - 1);
+
+    OK(uc_close(uc));
+    free(code_page);
 }
 
 static bool test_x86_mem_hooks_pc_guarante_mem(uc_engine *uc, uc_mem_type type,
@@ -4046,8 +5881,11 @@ TEST_LIST = {
     {"test_x86_pdep32_zero_extend", test_x86_pdep32_zero_extend},
     {"test_x86_pext32_zero_extend", test_x86_pext32_zero_extend},
     {"test_x86_nested_emu_start", test_x86_nested_emu_start},
+    {"test_x86_nested_count_state", test_x86_nested_count_state},
     {"test_x86_nested_emu_stop", test_x86_nested_emu_stop},
     {"test_x86_64_nested_emu_start_error", test_x86_64_nested_emu_start_error},
+    {"test_x86_nested_emu_start_max_depth",
+     test_x86_nested_emu_start_max_depth},
     {"test_x86_eflags_reserved_bit", test_x86_eflags_reserved_bit},
     {"test_x86_blsi_cf", test_x86_blsi_cf},
     {"test_x86_blsr_flags", test_x86_blsr_flags},
@@ -4055,6 +5893,9 @@ TEST_LIST = {
     {"test_x86_bzhi_index_boundary", test_x86_bzhi_index_boundary},
     {"test_x86_nested_uc_emu_start_exits", test_x86_nested_uc_emu_start_exits},
     {"test_x86_clear_count_cache", test_x86_clear_count_cache},
+    {"test_x86_large_instruction_count", test_x86_large_instruction_count},
+    {"test_x86_instruction_count_pc_change_refund",
+     test_x86_instruction_count_pc_change_refund},
     {"test_x86_correct_address_in_small_jump_hook",
      test_x86_correct_address_in_small_jump_hook},
     {"test_x86_correct_address_in_long_jump_hook",
@@ -4072,6 +5913,11 @@ TEST_LIST = {
     {"test_x86_mmu", test_x86_mmu},
     {"test_x86_read_virtual", test_x86_read_virtual},
     {"test_x86_vtlb", test_x86_vtlb},
+    {"test_x86_vtlb_conflict_growth", test_x86_vtlb_conflict_growth},
+    {"test_x86_vtlb_stride_conflict_growth",
+     test_x86_vtlb_stride_conflict_growth},
+    {"test_x86_vtlb_hooked_victim_hit", test_x86_vtlb_hooked_victim_hit},
+    {"test_x86_vtlb_32bit_high_paddr", test_x86_vtlb_32bit_high_paddr},
     {"test_x86_segmentation", test_x86_segmentation},
     {"test_x86_0xff_lcall", test_x86_0xff_lcall},
     {"test_x86_64_not_overwriting_tmp0_for_pc_update",
@@ -4086,8 +5932,55 @@ TEST_LIST = {
     {"test_x86_hook_insn_rdtscp", test_x86_hook_insn_rdtscp},
     {"test_x86_hook_insn_wrmsr", test_x86_hook_insn_wrmsr},
     {"test_x86_hook_insn_rdmsr", test_x86_hook_insn_rdmsr},
+    {"test_x86_filtered_insn_hooks", test_x86_filtered_insn_hooks},
+    {"test_x86_filtered_system_hooks", test_x86_filtered_system_hooks},
     {"test_x86_dr7", test_x86_dr7},
     {"test_x86_hook_block", test_x86_hook_block},
+    {"test_x86_memory_hook_add_delete_after_translation",
+     test_x86_memory_hook_add_delete_after_translation},
+    {"test_x86_memory_hook_mutation_same_dispatch",
+     test_x86_memory_hook_mutation_same_dispatch},
+    {"test_x86_memory_hook_user_data",
+     test_x86_memory_hook_user_data},
+    {"test_x86_memory_hook_fallback_accesses",
+     test_x86_memory_hook_fallback_accesses},
+    {"test_x86_memory_hook_restore_cache_tb_flush",
+     test_x86_memory_hook_restore_cache_tb_flush},
+    {"test_x86_bounded_mid_tb_code_hook_delete",
+     test_x86_bounded_mid_tb_code_hook_delete},
+    {"test_x86_self_deleting_single_code_hook",
+     test_x86_self_deleting_single_code_hook},
+    {"test_x86_bounded_code_hook_user_data",
+     test_x86_bounded_code_hook_user_data},
+    {"test_x86_self_deleting_single_block_hook",
+     test_x86_self_deleting_single_block_hook},
+    {"test_x86_code_hook_append_same_dispatch",
+     test_x86_code_hook_append_same_dispatch},
+    {"test_x86_code_hook_delete_later_same_dispatch",
+     test_x86_code_hook_delete_later_same_dispatch},
+    {"test_x86_edge_hook_tb_flush_lifetime",
+     test_x86_edge_hook_tb_flush_lifetime},
+    {"test_x86_nested_edge_history", test_x86_nested_edge_history},
+    {"test_x86_edge_hook_add_resets_history",
+     test_x86_edge_hook_add_resets_history},
+    {"test_x86_memory_write_read_after_hook_add_delete",
+     test_x86_memory_write_read_after_hook_add_delete},
+    {"test_x86_memory_hook_remap_revalidation",
+     test_x86_memory_hook_remap_revalidation},
+    {"test_x86_memory_hook_nested_tlb_revalidation",
+     test_x86_memory_hook_nested_tlb_revalidation},
+    {"test_x86_memory_hook_nested_tb_flush",
+     test_x86_memory_hook_nested_tb_flush},
+    {"test_x86_memory_hook_tb_flush_self_link",
+     test_x86_memory_hook_tb_flush_self_link},
+    {"test_x86_code_hook_nested_tb_flush",
+     test_x86_code_hook_nested_tb_flush},
+    {"test_x86_multi_code_hook_nested_tb_flush",
+     test_x86_multi_code_hook_nested_tb_flush},
+    {"test_x86_nested_tb_flush_retranslation",
+     test_x86_nested_tb_flush_retranslation},
+    {"test_x86_nested_tb_flush_fault_recovery",
+     test_x86_nested_tb_flush_fault_recovery},
     {"test_x86_mem_hooks_pc_guarantee", test_x86_mem_hooks_pc_guarantee},
     {"test_x86_aaa_flags", test_x86_aaa_flags},
     {"test_x86_aas_flags", test_x86_aas_flags},

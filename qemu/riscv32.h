@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _riscv32
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_riscv32
+#define helper_uc_tracecode_single helper_uc_tracecode_single_riscv32
+#define cpu_restore_icount cpu_restore_icount_riscv32
 #define unicorn_fill_tlb unicorn_fill_tlb_riscv32
 #define reg_read reg_read_riscv32
 #define reg_write reg_write_riscv32
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_riscv32
 #define tb_cleanup tb_cleanup_riscv32
 #define tb_flush tb_flush_riscv32
+#define tb_flush_jit tb_flush_jit_riscv32
 #define tb_phys_invalidate tb_phys_invalidate_riscv32
 #define tb_gen_code tb_gen_code_riscv32
 #define tb_reset_jump tb_reset_jump_riscv32

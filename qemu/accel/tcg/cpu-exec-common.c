@@ -35,6 +35,13 @@ void cpu_reloading_memory_map(void)
 
 void cpu_loop_exit(CPUState *cpu)
 {
+    unsigned int level = cpu->uc->nested_level - 1;
+
+    if (cpu->uc->tb_exec_active[level]) {
+        cpu->uc->tb_exec_active[level] = false;
+        g_assert(cpu->uc->tb_exec_depth != 0);
+        cpu->uc->tb_exec_depth--;
+    }
     /* Unlock JIT write protect if applicable. */
     if (cpu->uc->nested_level == 1) {
         tb_exec_unlock(cpu->uc);

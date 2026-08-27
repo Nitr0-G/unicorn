@@ -360,7 +360,7 @@ def hook_intr(uc, intno, user_data):
 
 
 # Test X86 32 bit
-def test_i386(code):
+def run_i386(code):
     global fd_chains
 
     fd_chains.clean()
@@ -401,7 +401,7 @@ fd_chains = LogChain()
 id_gen = IdGenerator()
 
 if __name__ == '__main__':
-    test_i386(X86_SEND_ETCPASSWD)
-    test_i386(X86_BIND_TCP)
-    test_i386(X86_REVERSE_TCP)
-    test_i386(X86_REVERSE_TCP_2)
+    run_i386(X86_SEND_ETCPASSWD)
+    run_i386(X86_BIND_TCP)
+    run_i386(X86_REVERSE_TCP)
+    run_i386(X86_REVERSE_TCP_2)

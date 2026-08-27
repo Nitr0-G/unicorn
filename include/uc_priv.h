@@ -9,12 +9,15 @@
 #include <stdio.h>
 
 #include "qemu.h"
+#include "qemu/atomic.h"
 #include "qemu/xxhash.h"
 #include "unicorn/unicorn.h"
 #include "list.h"
 
 // The max recursive nested uc_emu_start levels
 #define UC_MAX_NESTED_LEVEL (64)
+// uc_invalidate_tb owns one additional fault-catching frame.
+#define UC_MAX_NESTED_JMP_LEVEL (UC_MAX_NESTED_LEVEL + 1)
 
 // These are masks of supported modes for each cpu/arch.
 // They should be updated when changes are made to the uc_mode enum typedef.
@@ -250,13 +253,15 @@ typedef enum uc_hook_idx {
 
 // if statement to check hook bounds
 #define HOOK_BOUND_CHECK(hh, addr)                                             \
-    ((((addr) >= (hh)->begin && (addr) <= (hh)->end) ||                        \
-      (hh)->begin > (hh)->end) &&                                              \
-     !((hh)->to_delete))
+    (!((hh)->to_delete) &&                                                     \
+     ((hh)->begin > (hh)->end ||                                               \
+      ((addr) >= (hh)->begin && (addr) <= (hh)->end)))
 
 #define HOOK_EXISTS(uc, idx) ((uc)->hook[idx##_IDX].head != NULL)
 #define HOOK_EXISTS_BOUNDED(uc, idx, addr)                                     \
     _hook_exists_bounded((uc)->hook[idx##_IDX].head, addr)
+#define HOOK_EXISTS_BOUNDED_RANGE(uc, idx, begin, end)                         \
+    _hook_exists_bounded_range((uc)->hook[idx##_IDX].head, begin, end)
 
 static inline bool _hook_exists_bounded(struct list_item *cur, uint64_t addr)
 {
@@ -268,11 +273,35 @@ static inline bool _hook_exists_bounded(struct list_item *cur, uint64_t addr)
     return false;
 }
 
+static inline bool _hook_exists_bounded_range(struct list_item *cur,
+                                              uint64_t begin, uint64_t end)
+{
+    while (cur != NULL) {
+        struct hook *hook = (struct hook *)cur->data;
+
+        if (!hook->to_delete &&
+            (hook->begin > hook->end ||
+             (hook->begin <= end && hook->end >= begin))) {
+            return true;
+        }
+        cur = cur->next;
+    }
+    return false;
+}
+
 // relloc increment, KEEP THIS A POWER OF 2!
 #define MEM_BLOCK_INCR 32
 
 typedef struct TargetPageBits TargetPageBits;
 typedef struct TCGContext TCGContext;
+
+#define UC_HOOK_DISPATCH_CACHE_SIZE 8
+
+typedef struct HookDispatchCacheEntry {
+    uint64_t address;
+    uintptr_t generation;
+    struct list_item *first_match;
+} HookDispatchCacheEntry;
 
 struct uc_struct {
     uc_arch arch;
@@ -316,6 +345,7 @@ struct uc_struct {
     uc_invalidate_tb_t uc_invalidate_tb;
     uc_gen_tb_t uc_gen_tb;
     uc_tb_flush_t tb_flush;
+    uc_tb_flush_t tb_flush_deferred;
     uc_add_inline_hook_t add_inline_hook;
     uc_del_inline_hook_t del_inline_hook;
     uc_pauth_sign_t pauth_sign;
@@ -365,11 +395,15 @@ struct uc_struct {
     bool memory_region_update_pending;
 
     uc_set_tlb_t set_tlb;
+    uc_tlb_type tlb_mode;
 
     // linked lists containing hooks per type
     struct list hook[UC_HOOK_MAX];
     struct list hooks_to_del;
     int hooks_count[UC_HOOK_MAX];
+    uintptr_t hook_generation[UC_HOOK_MAX];
+    HookDispatchCacheEntry
+        hook_dispatch_cache[UC_HOOK_MAX][UC_HOOK_DISPATCH_CACHE_SIZE];
 
     // hook to count number of instructions for uc_emu_start()
     uc_hook count_hook;
@@ -380,8 +414,8 @@ struct uc_struct {
     int size_recur_mem; // size for mem access when in a recursive call
 
     bool init_tcg;       // already initialized local TCGv variables?
-    bool stop_request;   // request to immediately stop emulation - for
-                         // uc_emu_stop()
+    int stop_request;    // request to immediately stop emulation - for
+                         // uc_emu_stop(); accessed atomically across threads
     bool quit_request;   // request to quit the current TB, but continue to
                          // emulate - for uc_mem_protect()
     bool emulation_done; // emulation is done by uc_emu_start()
@@ -422,10 +456,11 @@ struct uc_struct {
                           // workaround to treat the IT block as a whole block.
     bool init_done;       // Whether the initialization is done.
 
-    sigjmp_buf jmp_bufs[UC_MAX_NESTED_LEVEL]; // To support nested uc_emu_start
+    sigjmp_buf jmp_bufs[UC_MAX_NESTED_JMP_LEVEL];
     int nested_level;                         // Current nested_level
 
-    struct TranslationBlock *last_tb; // The real last tb we executed.
+    uc_tb last_tb;
+    bool last_tb_valid;
 
     FlatView *empty_view; // Static function variable moved from flatviews_init
 
@@ -446,7 +481,52 @@ struct uc_struct {
     bool thread_executable_entry;
     bool current_executable;
     bool skip_sync_pc_on_exit;
+    bool tb_flush_pending;
+    unsigned int tb_exec_depth;
+    bool tb_exec_active[UC_MAX_NESTED_JMP_LEVEL];
 };
+
+static inline bool uc_uses_tcg_count(const struct uc_struct *uc)
+{
+    return uc->emu_count != 0 && uc->arch != UC_ARCH_ARM &&
+           uc->arch != UC_ARCH_M68K && uc->arch != UC_ARCH_MIPS &&
+           uc->arch != UC_ARCH_SPARC;
+}
+
+static inline void hook_dispatch_cache_invalidate(struct uc_struct *uc,
+                                                  unsigned int index)
+{
+    uc->hook_generation[index]++;
+    if (uc->hook_generation[index] == 0) {
+        memset(uc->hook_dispatch_cache[index], 0,
+               sizeof(uc->hook_dispatch_cache[index]));
+        uc->hook_generation[index] = 1;
+    }
+}
+
+static inline struct list_item *hook_dispatch_first_match(
+    struct uc_struct *uc, unsigned int index, uint64_t address)
+{
+    unsigned int cache_index =
+        (address >> 3) & (UC_HOOK_DISPATCH_CACHE_SIZE - 1);
+    HookDispatchCacheEntry *entry =
+        &uc->hook_dispatch_cache[index][cache_index];
+    struct list_item *cur;
+
+    if (entry->generation == uc->hook_generation[index] &&
+        entry->address == address) {
+        return entry->first_match;
+    }
+    for (cur = uc->hook[index].head; cur != NULL; cur = cur->next) {
+        if (HOOK_BOUND_CHECK((struct hook *)cur->data, address)) {
+            break;
+        }
+    }
+    entry->address = address;
+    entry->generation = uc->hook_generation[index];
+    entry->first_match = cur;
+    return cur;
+}
 
 // Metadata stub for the variable-size cpu context used with uc_context_*()
 struct uc_context {
@@ -475,7 +555,8 @@ static inline int uc_addr_is_exit(uc_engine *uc, uint64_t addr)
     if (uc->use_exits) {
         return g_tree_lookup(uc->ctl_exits, (gpointer)(&addr)) == (gpointer)1;
     } else {
-        return uc->exits[uc->nested_level - 1] == addr;
+        return uc->nested_level != 0 &&
+               uc->exits[uc->nested_level - 1] == addr;
     }
 }
 
@@ -515,12 +596,40 @@ static inline void hooked_regions_add(struct hook *h, uint64_t start,
     }
 }
 
-static inline void hooked_regions_check_single(struct list_item *cur,
-                                               uint64_t start, uint64_t length)
+static inline void hooked_regions_check_code(struct list_item *cur,
+                                             uint64_t start, uint64_t length)
+{
+    uint64_t end;
+
+    if (length == 0) {
+        end = start;
+    } else {
+        end = start + length - 1;
+        if (end < start) {
+            end = UINT64_MAX;
+        }
+    }
+    while (cur != NULL) {
+        struct hook *hook = (struct hook *)cur->data;
+
+        if (!hook->to_delete &&
+            (hook->begin > hook->end ||
+             (hook->begin <= end && hook->end >= start))) {
+            hooked_regions_add(hook, start, length);
+        }
+        cur = cur->next;
+    }
+}
+
+static inline void hooked_regions_check_block(struct list_item *cur,
+                                              uint64_t start,
+                                              uint64_t length)
 {
     while (cur != NULL) {
-        if (HOOK_BOUND_CHECK((struct hook *)cur->data, start)) {
-            hooked_regions_add((struct hook *)cur->data, start, length);
+        struct hook *hook = (struct hook *)cur->data;
+
+        if (HOOK_BOUND_CHECK(hook, start)) {
+            hooked_regions_add(hook, start, length);
         }
         cur = cur->next;
     }
@@ -529,10 +638,9 @@ static inline void hooked_regions_check_single(struct list_item *cur,
 static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
                                         uint64_t length)
 {
-    // Only UC_HOOK_BLOCK and UC_HOOK_CODE might be wrongle cached!
-    hooked_regions_check_single(uc->hook[UC_HOOK_CODE_IDX].head, start, length);
-    hooked_regions_check_single(uc->hook[UC_HOOK_BLOCK_IDX].head, start,
-                                length);
+    hooked_regions_check_code(uc->hook[UC_HOOK_CODE_IDX].head, start, length);
+    hooked_regions_check_block(uc->hook[UC_HOOK_BLOCK_IDX].head, start,
+                               length);
 }
 
 /*
@@ -557,12 +665,22 @@ static inline uc_err break_translation_loop(uc_engine *uc)
     return UC_ERR_OK;
 }
 
+static inline bool uc_stop_requested(uc_engine *uc)
+{
+    return qatomic_read(&uc->stop_request) != 0;
+}
+
+static inline void uc_set_stop_request(uc_engine *uc, bool stop)
+{
+    qatomic_set(&uc->stop_request, stop);
+}
+
 static inline void revert_uc_emu_stop(uc_engine *uc)
 {
-    uc->stop_request = 0;
-    uc->cpu->exit_request = 0;
-    uc->cpu->tcg_exit_req = 0;
-    uc->cpu->icount_decr_ptr->u16.high = 0;
+    uc_set_stop_request(uc, false);
+    qatomic_set(&uc->cpu->exit_request, 0);
+    qatomic_set(&uc->cpu->tcg_exit_req, 0);
+    qatomic_set(&uc->cpu->icount_decr_ptr->u16.high, 0);
 }
 
 #ifdef UNICORN_TRACER

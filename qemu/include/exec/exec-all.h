@@ -23,6 +23,7 @@
 #include "hw/core/cpu.h"
 #include "exec/tb-context.h"
 #include "exec/cpu_ldst.h"
+#include "qemu/atomic.h"
 #include "sysemu/cpus.h"
 
 /* allow to see translation results - the slowdown should be negligible, so we leave it */
@@ -54,6 +55,7 @@ void restore_state_to_opc(CPUArchState *env, TranslationBlock *tb,
  * restored and the function returns false.
  */
 bool cpu_restore_state(CPUState *cpu, uintptr_t searched_pc, bool will_exit);
+bool cpu_restore_icount(CPUState *cpu, uintptr_t searched_pc);
 
 void QEMU_NORETURN cpu_loop_exit_noexc(CPUState *cpu);
 void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
@@ -80,7 +82,7 @@ void QEMU_NORETURN cpu_loop_exit_atomic(CPUState *cpu, uintptr_t pc);
  */
 static inline bool cpu_loop_exit_requested(CPUState *cpu)
 {
-    return (int32_t)cpu_neg(cpu)->icount_decr.u32 < 0;
+    return (int32_t)qatomic_read(&cpu_neg(cpu)->icount_decr.u32) < 0;
 }
 
 void cpu_reloading_memory_map(void);
@@ -401,14 +403,15 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
 }
 
 /* current cflags for hashing/comparison */
-static inline uint32_t curr_cflags(void)
+static inline uint32_t curr_cflags(struct uc_struct *uc)
 {
-    return 0;
+    return uc_uses_tcg_count(uc) ? CF_USE_ICOUNT : 0;
 }
 
 /* TranslationBlock invalidate API */
 void tb_invalidate_phys_addr(AddressSpace *as, hwaddr addr, MemTxAttrs attrs);
 void tb_flush(CPUState *cpu);
+void tb_flush_jit(CPUState *cpu);
 void tb_phys_invalidate(TCGContext *tcg_ctx, TranslationBlock *tb, tb_page_addr_t page_addr);
 TranslationBlock *tb_htable_lookup(CPUState *cpu, target_ulong pc,
                                    target_ulong cs_base, uint32_t flags,

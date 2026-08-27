@@ -64,6 +64,100 @@ static void test_uc_ctl_exits(void)
     OK(uc_close(uc));
 }
 
+static void test_uc_ctl_exits_boundaries(void)
+{
+    const char code[] = "\x90";
+    uint64_t exits[] = {
+        code_start + 0x30,
+        code_start + 0x10,
+        code_start + 0x30,
+        code_start + 0x20,
+    };
+    uint64_t output[4] = {
+        UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
+    };
+    size_t count;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code,
+                    sizeof(code) - 1);
+    uc_assert_err(UC_ERR_ARG, uc_ctl_get_exits_cnt(uc, &count));
+    uc_assert_err(UC_ERR_ARG, uc_ctl_set_exits(uc, exits, 4));
+
+    OK(uc_ctl_exits_enable(uc));
+    OK(uc_ctl_set_exits(uc, exits, 4));
+    OK(uc_ctl_get_exits_cnt(uc, &count));
+    TEST_CHECK(count == 3);
+    uc_assert_err(UC_ERR_ARG, uc_ctl_get_exits(uc, output, 2));
+    TEST_CHECK(output[0] == UINT64_MAX && output[1] == UINT64_MAX);
+    OK(uc_ctl_get_exits(uc, output, 4));
+    TEST_CHECK(output[0] == code_start + 0x10);
+    TEST_CHECK(output[1] == code_start + 0x20);
+    TEST_CHECK(output[2] == code_start + 0x30);
+    TEST_CHECK(output[3] == UINT64_MAX);
+
+    OK(uc_ctl_exits_disable(uc));
+    uc_assert_err(UC_ERR_ARG, uc_ctl_get_exits_cnt(uc, &count));
+    OK(uc_ctl_exits_enable(uc));
+    OK(uc_ctl_get_exits_cnt(uc, &count));
+    TEST_CHECK(count == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_timeout_reuse(void)
+{
+    const char loop[] = "\xeb\xfe";
+    const char nop[] = "\x90";
+    size_t timed_out;
+    uint32_t eip;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, loop,
+                    sizeof(loop) - 1);
+    OK(uc_mem_write(uc, code_start + 0x100, nop, sizeof(nop) - 1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(loop) - 1,
+                    UC_SECOND_SCALE / 10, 0));
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    TEST_CHECK(timed_out == 1);
+
+    OK(uc_emu_start(uc, code_start + 0x100,
+                    code_start + 0x100 + sizeof(nop) - 1, 0, 1));
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    TEST_CHECK(timed_out == 0);
+    TEST_CHECK(eip == code_start + 0x100 + sizeof(nop) - 1);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_query_and_cpu_model(void)
+{
+    const char code[] = "\x90";
+    size_t result;
+    int model;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code,
+                    sizeof(code) - 1);
+    uc_assert_err(UC_ERR_ARG, uc_query(uc, UC_QUERY_MODE + 100, &result));
+    OK(uc_query(uc, UC_QUERY_ARCH, &result));
+    TEST_CHECK(result == UC_ARCH_X86);
+    OK(uc_query(uc, UC_QUERY_MODE, &result));
+    TEST_CHECK(result == UC_MODE_32);
+    OK(uc_query(uc, UC_QUERY_PAGE_SIZE, &result));
+    TEST_CHECK(result == 4096);
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &result));
+    TEST_CHECK(result == 0);
+    OK(uc_ctl_get_cpu_model(uc, &model));
+    TEST_CHECK(model >= 0 && model < UC_CPU_X86_ENDING);
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1,
+                    0, 0));
+
+    OK(uc_close(uc));
+}
+
 #define TB_COUNT (8)
 #define TCG_MAX_INSNS (512) // from tcg.h
 #define CODE_LEN TB_COUNT *TCG_MAX_INSNS
@@ -116,12 +210,20 @@ static void test_uc_ctl_change_page_size(void)
 {
     uc_engine *uc;
     uc_engine *uc2;
+    size_t mode;
     uint32_t pg = 0;
 
     OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc));
     OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc2));
 
     OK(uc_ctl_set_page_size(uc, 4096));
+    uc_assert_err(UC_ERR_ARG, uc_ctl_set_page_size(uc, 0));
+    uc_assert_err(UC_ERR_ARG, uc_ctl_set_page_size(uc, 1536));
+    OK(uc_ctl_get_page_size(uc, &pg));
+    TEST_CHECK(pg == 4096);
+    OK(uc_query(uc, UC_QUERY_MODE, &mode));
+    TEST_CHECK((mode & UC_MODE_THUMB) == 0);
+    uc_assert_err(UC_ERR_ARG, uc_ctl_set_page_size(uc, 1024));
     OK(uc_ctl_get_page_size(uc, &pg));
     TEST_CHECK(pg == 4096);
 
@@ -300,6 +402,152 @@ static void test_uc_emu_stop_set_ip(void)
     OK(uc_close(uc));
 }
 
+typedef enum TestPcWriteMethod {
+    TEST_PC_WRITE_SINGLE,
+    TEST_PC_WRITE_BATCH,
+    TEST_PC_WRITE_BATCH2,
+    TEST_PC_WRITE_SIZED,
+    TEST_PC_WRITE_METHOD_COUNT,
+} TestPcWriteMethod;
+
+typedef struct TestPcWriteData {
+    TestPcWriteMethod method;
+    uint32_t count;
+} TestPcWriteData;
+
+static void test_uc_set_ip_callback(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data)
+{
+    TestPcWriteData *data = (TestPcWriteData *)user_data;
+    uint64_t rip = code_start + 0xb;
+    int regs[] = { UC_X86_REG_RIP };
+    void *values[] = { &rip };
+    const void *const_values[] = { &rip };
+    size_t sizes[] = { sizeof(rip) };
+
+    if (address != code_start + 0x7) {
+        return;
+    }
+    data->count++;
+    switch (data->method) {
+    case TEST_PC_WRITE_SINGLE:
+        OK(uc_reg_write(uc, UC_X86_REG_RIP, &rip));
+        break;
+    case TEST_PC_WRITE_BATCH:
+        OK(uc_reg_write_batch(uc, regs, values, 1));
+        break;
+    case TEST_PC_WRITE_BATCH2:
+        OK(uc_reg_write_batch2(uc, regs, const_values, sizes, 1));
+        break;
+    case TEST_PC_WRITE_SIZED:
+        OK(uc_reg_write2(uc, UC_X86_REG_RIP, &rip, sizes));
+        break;
+    default:
+        TEST_CHECK(false);
+        break;
+    }
+}
+
+static void test_uc_set_ip_write_apis(void)
+{
+    const char code[] =
+        "\x48\x31\xc0" /* xor rax, rax */
+        "\x90"         /* nop */
+        "\x48\xff\xc0" /* inc rax */
+        "\x90"         /* callback changes RIP */
+        "\x48\xff\xc0" /* must not execute */
+        "\x90";        /* destination */
+    TestPcWriteMethod method;
+
+    for (method = TEST_PC_WRITE_SINGLE;
+         method < TEST_PC_WRITE_METHOD_COUNT; method++) {
+        TestPcWriteData data = { .method = method };
+        uc_engine *uc;
+        uc_hook hook;
+        uint64_t rax;
+        uint64_t rip;
+
+        uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_64, code,
+                        sizeof(code) - 1);
+        OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                       test_uc_set_ip_callback, &data, 1, 0));
+        OK(uc_emu_start(uc, code_start, code_start + 0xb, 0, 0));
+        OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+        OK(uc_reg_read(uc, UC_X86_REG_RIP, &rip));
+        TEST_CHECK(rax == 1);
+        TEST_CHECK(rip == code_start + 0xb);
+        TEST_CHECK(data.count == 1);
+        OK(uc_close(uc));
+    }
+}
+
+typedef struct TestContextRestoreData {
+    uc_context *context;
+    uint32_t count;
+} TestContextRestoreData;
+
+static void test_uc_context_restore_callback(uc_engine *uc,
+                                             uint64_t address,
+                                             uint32_t size,
+                                             void *user_data)
+{
+    TestContextRestoreData *data =
+        (TestContextRestoreData *)user_data;
+
+    data->count++;
+    OK(uc_context_restore(uc, data->context));
+}
+
+static void test_uc_context_restore_from_callback(void)
+{
+    const char code[] = {
+        0x40, /* inc eax */
+        0x43, /* callback before inc ebx */
+        0x41, /* inc ecx */
+        0x42, /* destination */
+    };
+    TestContextRestoreData data = { 0 };
+    uint32_t destination = (uint32_t)code_start + 3;
+    uint32_t eax = 0x10;
+    uint32_t ebx = 0x20;
+    uint32_t ecx = 0x30;
+    uint32_t eip;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code, sizeof(code));
+    OK(uc_context_alloc(uc, &data.context));
+    OK(uc_reg_write(uc, UC_X86_REG_EIP, &destination));
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_reg_write(uc, UC_X86_REG_ECX, &ecx));
+    OK(uc_context_save(uc, data.context));
+
+    eax = 0;
+    ebx = 0;
+    ecx = 0;
+    OK(uc_reg_write(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_write(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_reg_write(uc, UC_X86_REG_ECX, &ecx));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_uc_context_restore_callback, &data,
+                   code_start + 1, code_start + 1));
+
+    OK(uc_emu_start(uc, code_start, destination, 0, 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &eax));
+    OK(uc_reg_read(uc, UC_X86_REG_EBX, &ebx));
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &ecx));
+    TEST_CHECK(data.count == 1);
+    TEST_CHECK(eip == destination);
+    TEST_CHECK(eax == 0x10);
+    TEST_CHECK(ebx == 0x20);
+    TEST_CHECK(ecx == 0x30);
+
+    OK(uc_context_free(data.context));
+    OK(uc_close(uc));
+}
+
 static bool test_tlb_clear_tlb(uc_engine *uc, uint64_t addr, uc_mem_type type,
                                uc_tlb_entry *result, void *user_data)
 {
@@ -397,6 +645,9 @@ TEST_LIST = {
     {"test_uc_ctl_arch", test_uc_ctl_arch},
     {"test_uc_ctl_time_out", test_uc_ctl_time_out},
     {"test_uc_ctl_exits", test_uc_ctl_exits},
+    {"test_uc_ctl_exits_boundaries", test_uc_ctl_exits_boundaries},
+    {"test_uc_timeout_reuse", test_uc_timeout_reuse},
+    {"test_uc_query_and_cpu_model", test_uc_query_and_cpu_model},
     {"test_uc_ctl_tb_cache", test_uc_ctl_tb_cache},
 #ifdef UNICORN_HAS_ARM
     {"test_uc_ctl_change_page_size", test_uc_ctl_change_page_size},
@@ -409,6 +660,9 @@ TEST_LIST = {
 #endif
     {"test_uc_hook_cached_uaf", test_uc_hook_cached_uaf},
     {"test_uc_emu_stop_set_ip", test_uc_emu_stop_set_ip},
+    {"test_uc_set_ip_write_apis", test_uc_set_ip_write_apis},
+    {"test_uc_context_restore_from_callback",
+     test_uc_context_restore_from_callback},
     {"test_tlb_clear", test_tlb_clear},
     {"test_noexec", test_noexec},
     {"test_add_block_hook", test_add_block_hook},

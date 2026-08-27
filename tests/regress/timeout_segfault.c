@@ -1,147 +1,121 @@
-/*
-timeout_segfault.c
-
-This program shows a case where the emulation timer keeps running after
-emulation has ended. It triggers an intermittent segfault when _timeout_fn()
-tries to call uc_emu_stop() after emulation has already been cleaned up. This
-code is the same as samples/sample_arm.c, except that it adds a timeout on each
-call to uc_emu_start(). See issue #78 for more details:
-https://github.com/unicorn-engine/unicorn/issues/78
-*/
-
 #include <unicorn/unicorn.h>
 
+#include <stdio.h>
 
-// code to be emulated
-#define ARM_CODE "\x37\x00\xa0\xe3\x03\x10\x42\xe0" // mov r0, #0x37; sub r1, r2, r3
-#define THUMB_CODE "\x83\xb0" // sub    sp, #0xc
-
-// memory address where emulation starts
 #define ADDRESS 0x10000
+#define TEST_ITERATIONS 32
+#define TEST_TIMEOUT (UC_SECOND_SCALE * 5)
 
-// number of seconds to wait before timeout
-#define TIMEOUT 5
-
-static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
+static bool check_error(const char *operation, uc_err error)
 {
-    printf(">>> Tracing basic block at 0x%"PRIx64 ", block size = 0x%x\n", address, size);
+    if (error == UC_ERR_OK) {
+        return true;
+    }
+    fprintf(stderr, "%s failed with %u: %s\n", operation, (unsigned)error,
+            uc_strerror(error));
+    return false;
 }
 
-static void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
+static bool run_arm(unsigned int iteration)
 {
-    printf(">>> Tracing instruction at 0x%"PRIx64 ", instruction size = 0x%x\n", address, size);
-}
-
-static void test_arm(void)
-{
+    const uint8_t code[] = {
+        0x37, 0x00, 0xa0, 0xe3, 0x03, 0x10, 0x42, 0xe0,
+    };
+    uint32_t r0 = 0;
+    uint32_t r1 = 0;
+    uint32_t r2 = 0x6789;
+    uint32_t r3 = 0x3333;
+    size_t timed_out = 0;
     uc_engine *uc;
-    uc_err err;
-    uc_hook trace1, trace2;
 
-    int r0 = 0x1234;     // R0 register
-    int r2 = 0x6789;     // R1 register
-    int r3 = 0x3333;     // R2 register
-    int r1;     // R1 register
-
-    printf("Emulate ARM code\n");
-
-    // Initialize emulator in ARM mode
-    err = uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc);
-    if (err) {
-        printf("Failed on uc_open() with error returned: %u (%s)\n",
-                err, uc_strerror(err));
-        return;
+    if (!check_error("ARM uc_open", uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc))) {
+        return false;
+    }
+    if (!check_error("ARM uc_mem_map",
+                     uc_mem_map(uc, ADDRESS, 0x1000, UC_PROT_ALL)) ||
+        !check_error("ARM uc_mem_write",
+                     uc_mem_write(uc, ADDRESS, code, sizeof(code))) ||
+        !check_error("ARM uc_reg_write(R2)",
+                     uc_reg_write(uc, UC_ARM_REG_R2, &r2)) ||
+        !check_error("ARM uc_reg_write(R3)",
+                     uc_reg_write(uc, UC_ARM_REG_R3, &r3)) ||
+        !check_error("ARM uc_emu_start",
+                     uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(code),
+                                  TEST_TIMEOUT, 0)) ||
+        !check_error("ARM uc_query(UC_QUERY_TIMEOUT)",
+                     uc_query(uc, UC_QUERY_TIMEOUT, &timed_out)) ||
+        !check_error("ARM uc_reg_read(R0)",
+                     uc_reg_read(uc, UC_ARM_REG_R0, &r0)) ||
+        !check_error("ARM uc_reg_read(R1)",
+                     uc_reg_read(uc, UC_ARM_REG_R1, &r1))) {
+        uc_close(uc);
+        return false;
     }
 
-    // map 2MB memory for this emulation
-    uc_mem_map(uc, ADDRESS, 2 * 1024 * 1024, UC_PROT_ALL);
-
-    // write machine code to be emulated to memory
-    uc_mem_write(uc, ADDRESS, ARM_CODE, sizeof(ARM_CODE) - 1);
-
-    // initialize machine registers
-    uc_reg_write(uc, UC_ARM_REG_R0, &r0);
-    uc_reg_write(uc, UC_ARM_REG_R2, &r2);
-    uc_reg_write(uc, UC_ARM_REG_R3, &r3);
-
-    // tracing all basic blocks with customized callback
-    uc_hook_add(uc, &trace1, UC_HOOK_BLOCK, hook_block, NULL, 1, 0);
-
-    // tracing one instruction at ADDRESS with customized callback
-    uc_hook_add(uc, &trace2, UC_HOOK_CODE, hook_code, NULL, ADDRESS, ADDRESS);
-
-    // emulate machine code in infinite time (last param = 0), or when
-    // finishing all the code.
-    err = uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(ARM_CODE) -1, UC_SECOND_SCALE * TIMEOUT, 0);
-    if (err) {
-        printf("Failed on uc_emu_start() with error returned: %u\n", err);
+    if (timed_out != 0) {
+        fprintf(stderr, "ARM iteration %u timed out\n", iteration + 1);
+        uc_close(uc);
+        return false;
     }
-
-    // now print out some registers
-    printf(">>> Emulation done. Below is the CPU context\n");
-
-    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
-    uc_reg_read(uc, UC_ARM_REG_R1, &r1);
-    printf(">>> R0 = 0x%x\n", r0);
-    printf(">>> R1 = 0x%x\n", r1);
-
-    uc_close(uc);
+    if (r0 != 0x37 || r1 != r2 - r3) {
+        fprintf(stderr,
+                "unexpected ARM result at iteration %u: R0=0x%x R1=0x%x\n",
+                iteration + 1, r0, r1);
+        uc_close(uc);
+        return false;
+    }
+    return check_error("ARM uc_close", uc_close(uc));
 }
 
-static void test_thumb(void)
+static bool run_thumb(unsigned int iteration)
 {
+    const uint8_t code[] = {0x83, 0xb0};
+    uint32_t sp = 0x1234;
+    size_t timed_out = 0;
     uc_engine *uc;
-    uc_err err;
-    uc_hook trace1, trace2;
 
-    int sp = 0x1234;     // R0 register
-
-    printf("Emulate THUMB code\n");
-
-    // Initialize emulator in ARM mode
-    err = uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &uc);
-    if (err) {
-        printf("Failed on uc_open() with error returned: %u (%s)\n",
-                err, uc_strerror(err));
-        return;
+    if (!check_error("Thumb uc_open",
+                     uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &uc))) {
+        return false;
+    }
+    if (!check_error("Thumb uc_mem_map",
+                     uc_mem_map(uc, ADDRESS, 0x1000, UC_PROT_ALL)) ||
+        !check_error("Thumb uc_mem_write",
+                     uc_mem_write(uc, ADDRESS, code, sizeof(code))) ||
+        !check_error("Thumb uc_reg_write(SP)",
+                     uc_reg_write(uc, UC_ARM_REG_SP, &sp)) ||
+        !check_error("Thumb uc_emu_start",
+                     uc_emu_start(uc, ADDRESS | 1, 0, TEST_TIMEOUT, 1)) ||
+        !check_error("Thumb uc_query(UC_QUERY_TIMEOUT)",
+                     uc_query(uc, UC_QUERY_TIMEOUT, &timed_out)) ||
+        !check_error("Thumb uc_reg_read(SP)",
+                     uc_reg_read(uc, UC_ARM_REG_SP, &sp))) {
+        uc_close(uc);
+        return false;
     }
 
-    // map 2MB memory for this emulation
-    uc_mem_map(uc, ADDRESS, 2 * 1024 * 1024, UC_PROT_ALL);
-
-    // write machine code to be emulated to memory
-    uc_mem_write(uc, ADDRESS, THUMB_CODE, sizeof(THUMB_CODE) - 1);
-
-    // initialize machine registers
-    uc_reg_write(uc, UC_ARM_REG_SP, &sp);
-
-    // tracing all basic blocks with customized callback
-    uc_hook_add(uc, &trace1, UC_HOOK_BLOCK, hook_block, NULL, 1, 0);
-
-    // tracing one instruction at ADDRESS with customized callback
-    uc_hook_add(uc, &trace2, UC_HOOK_CODE, hook_code, NULL, ADDRESS, ADDRESS);
-
-    // emulate machine code in infinite time (last param = 0), or when
-    // finishing all the code.
-    err = uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(THUMB_CODE) -1, UC_SECOND_SCALE * TIMEOUT, 0);
-    if (err) {
-        printf("Failed on uc_emu_start() with error returned: %u\n", err);
+    if (timed_out != 0) {
+        fprintf(stderr, "Thumb iteration %u timed out\n", iteration + 1);
+        uc_close(uc);
+        return false;
     }
-
-    // now print out some registers
-    printf(">>> Emulation done. Below is the CPU context\n");
-
-    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
-    printf(">>> SP = 0x%x\n", sp);
-
-    uc_close(uc);
+    if (sp != 0x1228) {
+        fprintf(stderr, "unexpected Thumb result at iteration %u: SP=0x%x\n",
+                iteration + 1, sp);
+        uc_close(uc);
+        return false;
+    }
+    return check_error("Thumb uc_close", uc_close(uc));
 }
 
-int main(int argc, char **argv, char **envp)
+int main(void)
 {
-    test_arm();
-    printf("==========================\n");
-    test_thumb();
+    unsigned int i;
 
+    for (i = 0; i < TEST_ITERATIONS; i++) {
+        if (!run_arm(i) || !run_thumb(i)) {
+            return 1;
+        }
+    }
     return 0;
 }

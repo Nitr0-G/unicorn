@@ -38,6 +38,7 @@ static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t t
     TCGv_ptr tdata;
     uc_engine* puc = uc;
     struct list_item *cur;
+    struct list_item *first_match = NULL;
     struct hook* hk;
     TCGTemp* args[] = {
         tcgv_ptr_temp(tcg_ctx, tuc),
@@ -47,7 +48,27 @@ static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t t
     };
 
     const int hook_type = type & UC_HOOK_IDX_MASK;
-    if (puc->hooks_count[hook_type] == 1 && !(type & UC_HOOK_FLAG_NO_STOP)) {
+    if (hook_type == UC_HOOK_CODE_IDX &&
+        puc->hooks_count[hook_type] > 1 && puc->count_hook == 0 &&
+        !(type & UC_HOOK_FLAG_NO_STOP) &&
+        tcg_ctx->delay_slot_flag == NULL) {
+        TCGv_ptr titem;
+
+        for (cur = puc->hook[hook_type].head; cur != NULL; cur = cur->next) {
+            hk = cur->data;
+            if (HOOK_BOUND_CHECK(hk, pc)) {
+                first_match = cur;
+                break;
+            }
+        }
+        if (first_match != NULL) {
+            titem = tcg_const_ptr(tcg_ctx, first_match);
+            gen_helper_uc_tracecode_single(tcg_ctx, titem, tsize, tuc, tpc);
+            tcg_temp_free_ptr(tcg_ctx, titem);
+            tcg_ctx->skip_next_exit_check = true;
+        }
+    } else if (puc->hooks_count[hook_type] == 1 &&
+               !(type & UC_HOOK_FLAG_NO_STOP)) {
         cur = puc->hook[hook_type].head;
         
         while (cur) {
@@ -61,6 +82,21 @@ static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t t
             cur = cur->next;
         }
 
+    } else if (!(type & UC_HOOK_FLAG_NO_STOP) && puc->count_hook == 0) {
+        TCGv_ptr titem;
+
+        for (cur = puc->hook[hook_type].head; cur != NULL; cur = cur->next) {
+            hk = cur->data;
+            if (HOOK_BOUND_CHECK(hk, pc)) {
+                first_match = cur;
+                break;
+            }
+        }
+        if (first_match != NULL) {
+            titem = tcg_const_ptr(tcg_ctx, first_match);
+            gen_helper_uc_tracecode_single(tcg_ctx, titem, tsize, tuc, tpc);
+            tcg_temp_free_ptr(tcg_ctx, titem);
+        }
     } else {
         ttype = tcg_const_i32(tcg_ctx, type);
         gen_helper_uc_tracecode(tcg_ctx, tsize, ttype, tuc, tpc);

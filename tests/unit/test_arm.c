@@ -25,6 +25,14 @@ static void test_arm_emit32(uint8_t *code, int offset, uint32_t insn)
     code[offset + 3] = (uint8_t)(insn >> 24);
 }
 
+static void test_arm_emit_thumb32(uint8_t *code, int offset, uint32_t insn)
+{
+    code[offset] = (uint8_t)(insn >> 16);
+    code[offset + 1] = (uint8_t)(insn >> 24);
+    code[offset + 2] = (uint8_t)insn;
+    code[offset + 3] = (uint8_t)(insn >> 8);
+}
+
 static void test_arm_enable_vfp(uc_engine *uc)
 {
     uint32_t cpacr = 0xfU << 20;
@@ -345,6 +353,252 @@ static void test_arm_nop(void)
     TEST_CHECK(r_r2 == 0x6789);
 
     OK(uc_close(uc));
+}
+
+static void test_arm_legacy_count_transition(void)
+{
+    const char code[] =
+        "\x01\x00\xa0\xe3" /* mov r0, #1 */
+        "\x02\x10\xa0\xe3"; /* mov r1, #2 */
+    uint32_t r0;
+    uint32_t r1;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_ARM, code,
+                    sizeof(code) - 1, UC_CPU_ARM_CORTEX_A15);
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1,
+                    0, 1));
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    TEST_CHECK(r0 == 1);
+    TEST_CHECK(r1 == 0);
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1,
+                    0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    TEST_CHECK(r1 == 2);
+
+    OK(uc_close(uc));
+}
+
+typedef struct ArmExclusiveCase {
+    const char *name;
+    uint32_t size;
+    uint32_t insns[6];
+} ArmExclusiveCase;
+
+static void test_arm_exclusive_single_run(uc_mode mode,
+                                          const ArmExclusiveCase *test_case)
+{
+    const uint64_t data_address = code_start + 0x1000;
+    const uint8_t initial[8] = {
+        0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01,
+    };
+    const uint8_t stored[4] = {0xd4, 0xc3, 0xb2, 0xa1};
+    uint8_t expected[8];
+    uint8_t memory[8] = {0};
+    uint8_t code[sizeof(test_case->insns)];
+    uint32_t r0 = (uint32_t)data_address;
+    uint32_t r1 = 0xffffffff;
+    uint32_t r2 = 0xffffffff;
+    uint32_t r3 = 0xa1b2c3d4;
+    uint32_t r4 = 0xffffffff;
+    uint32_t r5 = 0x13579bdf;
+    uint32_t r6 = 0xffffffff;
+    uint32_t r7 = 0xffffffff;
+    uint32_t r8 = 0x2468ace0;
+    uint32_t expected_load;
+    uint32_t expected_store;
+    uc_engine *uc;
+    size_t i;
+
+    for (i = 0; i < sizeof(test_case->insns) /
+                        sizeof(test_case->insns[0]); i++) {
+        if ((mode & UC_MODE_THUMB) != 0) {
+            test_arm_emit_thumb32(code, (int)i * 4, test_case->insns[i]);
+        } else {
+            test_arm_emit32(code, (int)i * 4, test_case->insns[i]);
+        }
+    }
+
+    uc_common_setup(&uc, UC_ARCH_ARM, mode, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    OK(uc_mem_write(uc, data_address, initial, sizeof(initial)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_write(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_ARM_REG_R3, &r3));
+    OK(uc_reg_write(uc, UC_ARM_REG_R4, &r4));
+    OK(uc_reg_write(uc, UC_ARM_REG_R5, &r5));
+    OK(uc_reg_write(uc, UC_ARM_REG_R6, &r6));
+    OK(uc_reg_write(uc, UC_ARM_REG_R7, &r7));
+    OK(uc_reg_write(uc, UC_ARM_REG_R8, &r8));
+
+    OK(uc_emu_start(uc, code_start | ((mode & UC_MODE_THUMB) != 0),
+                    code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_read(uc, UC_ARM_REG_R3, &r3));
+    OK(uc_reg_read(uc, UC_ARM_REG_R4, &r4));
+    OK(uc_reg_read(uc, UC_ARM_REG_R5, &r5));
+    OK(uc_reg_read(uc, UC_ARM_REG_R6, &r6));
+    OK(uc_reg_read(uc, UC_ARM_REG_R7, &r7));
+    OK(uc_reg_read(uc, UC_ARM_REG_R8, &r8));
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+
+    expected_load = test_case->size == 1 ? 0xef :
+                    test_case->size == 2 ? 0xcdef : 0x89abcdef;
+    expected_store = test_case->size == 1 ? 0xd4 :
+                     test_case->size == 2 ? 0xc3d4 : 0xa1b2c3d4;
+    memcpy(expected, initial, sizeof(expected));
+    memcpy(expected, stored, test_case->size);
+    TEST_CHECK_(r1 == expected_load, "%s first load=0x%08x",
+                test_case->name, r1);
+    TEST_CHECK_(r2 == 0, "%s first status=%u", test_case->name, r2);
+    TEST_CHECK_(r3 == 0xa1b2c3d4, "%s first source=0x%08x",
+                test_case->name, r3);
+    TEST_CHECK_(r4 == 1, "%s repeated status=%u", test_case->name, r4);
+    TEST_CHECK_(r5 == 0x13579bdf, "%s repeated source=0x%08x",
+                test_case->name, r5);
+    TEST_CHECK_(r6 == expected_store,
+                "%s second load=0x%08x", test_case->name, r6);
+    TEST_CHECK_(r7 == 1, "%s cleared status=%u", test_case->name, r7);
+    TEST_CHECK_(r8 == 0x2468ace0, "%s cleared source=0x%08x",
+                test_case->name, r8);
+    TEST_CHECK_(memcmp(memory, expected, sizeof(expected)) == 0,
+                "%s memory mismatch", test_case->name);
+
+    OK(uc_close(uc));
+}
+
+static void test_arm_exclusive_double_run(uc_mode mode,
+                                          const ArmExclusiveCase *test_case)
+{
+    const uint64_t data_address = code_start + 0x1000;
+    const uint8_t initial[8] = {
+        0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01,
+    };
+    const uint8_t expected[8] = {
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+    };
+    uint8_t memory[8] = {0};
+    uint8_t code[sizeof(test_case->insns)];
+    uint32_t regs[13] = {0};
+    uc_engine *uc;
+    int reg_ids[13];
+    size_t i;
+
+    regs[4] = 0x55667788;
+    regs[5] = 0x11223344;
+    regs[6] = 0xffffffff;
+    regs[7] = 0xffffffff;
+    regs[8] = 0x13579bdf;
+    regs[9] = 0x2468ace0;
+    regs[10] = 0xffffffff;
+    regs[11] = 0xffffffff;
+    regs[12] = 0xffffffff;
+    for (i = 0; i < sizeof(reg_ids) / sizeof(reg_ids[0]); i++) {
+        reg_ids[i] = UC_ARM_REG_R0 + (int)i;
+    }
+    for (i = 0; i < sizeof(test_case->insns) /
+                        sizeof(test_case->insns[0]); i++) {
+        if ((mode & UC_MODE_THUMB) != 0) {
+            test_arm_emit_thumb32(code, (int)i * 4, test_case->insns[i]);
+        } else {
+            test_arm_emit32(code, (int)i * 4, test_case->insns[i]);
+        }
+    }
+
+    uc_common_setup(&uc, UC_ARCH_ARM, mode, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    OK(uc_mem_write(uc, data_address, initial, sizeof(initial)));
+    regs[0] = (uint32_t)data_address;
+    for (i = 0; i < sizeof(reg_ids) / sizeof(reg_ids[0]); i++) {
+        OK(uc_reg_write(uc, reg_ids[i], &regs[i]));
+    }
+
+    OK(uc_emu_start(uc, code_start | ((mode & UC_MODE_THUMB) != 0),
+                    code_start + sizeof(code), 0, 0));
+    for (i = 0; i < sizeof(reg_ids) / sizeof(reg_ids[0]); i++) {
+        OK(uc_reg_read(uc, reg_ids[i], &regs[i]));
+    }
+    OK(uc_mem_read(uc, data_address, memory, sizeof(memory)));
+
+    TEST_CHECK_(regs[2] == 0x89abcdef, "%s first low=0x%08x",
+                test_case->name, regs[2]);
+    TEST_CHECK_(regs[3] == 0x01234567, "%s first high=0x%08x",
+                test_case->name, regs[3]);
+    TEST_CHECK_(regs[4] == 0x55667788, "%s store low=0x%08x",
+                test_case->name, regs[4]);
+    TEST_CHECK_(regs[5] == 0x11223344, "%s store high=0x%08x",
+                test_case->name, regs[5]);
+    TEST_CHECK_(regs[6] == 0, "%s first status=%u",
+                test_case->name, regs[6]);
+    TEST_CHECK_(regs[7] == 1, "%s repeated status=%u",
+                test_case->name, regs[7]);
+    TEST_CHECK_(regs[8] == 0x13579bdf, "%s repeated low=0x%08x",
+                test_case->name, regs[8]);
+    TEST_CHECK_(regs[9] == 0x2468ace0, "%s repeated high=0x%08x",
+                test_case->name, regs[9]);
+    TEST_CHECK_(regs[10] == 0x55667788, "%s second low=0x%08x",
+                test_case->name, regs[10]);
+    TEST_CHECK_(regs[11] == 0x11223344, "%s second high=0x%08x",
+                test_case->name, regs[11]);
+    TEST_CHECK_(regs[12] == 1, "%s cleared status=%u",
+                test_case->name, regs[12]);
+    TEST_CHECK_(memcmp(memory, expected, sizeof(expected)) == 0,
+                "%s memory mismatch", test_case->name);
+
+    OK(uc_close(uc));
+}
+
+static void test_arm_exclusive_cases(uc_mode mode,
+                                     const ArmExclusiveCase *test_cases,
+                                     size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (test_cases[i].size == 8) {
+            test_arm_exclusive_double_run(mode, &test_cases[i]);
+        } else {
+            test_arm_exclusive_single_run(mode, &test_cases[i]);
+        }
+    }
+}
+
+static void test_arm_exclusive_monitor(void)
+{
+    static const ArmExclusiveCase test_cases[] = {
+        {"A32 word", 4, {0xe1901f9f, 0xe1802f93, 0xe1804f95,
+                         0xe1906f9f, 0xf57ff01f, 0xe1807f98} },
+        {"A32 byte", 1, {0xe1d01f9f, 0xe1c02f93, 0xe1c04f95,
+                         0xe1d06f9f, 0xf57ff01f, 0xe1c07f98} },
+        {"A32 half", 2, {0xe1f01f9f, 0xe1e02f93, 0xe1e04f95,
+                         0xe1f06f9f, 0xf57ff01f, 0xe1e07f98} },
+        {"A32 double", 8, {0xe1b02f9f, 0xe1a06f94, 0xe1a07f98,
+                           0xe1b0af9f, 0xf57ff01f, 0xe1a0cf98} },
+    };
+
+    test_arm_exclusive_cases(UC_MODE_ARM, test_cases,
+                             sizeof(test_cases) / sizeof(test_cases[0]));
+}
+
+static void test_arm_thumb2_exclusive_monitor(void)
+{
+    static const ArmExclusiveCase test_cases[] = {
+        {"Thumb-2 word", 4, {0xe8501f00, 0xe8403200, 0xe8405400,
+                             0xe8506f00, 0xf3bf8f2f, 0xe8408700} },
+        {"Thumb-2 byte", 1, {0xe8d01f4f, 0xe8c03f42, 0xe8c05f44,
+                             0xe8d06f4f, 0xf3bf8f2f, 0xe8c08f47} },
+        {"Thumb-2 half", 2, {0xe8d01f5f, 0xe8c03f52, 0xe8c05f54,
+                             0xe8d06f5f, 0xf3bf8f2f, 0xe8c08f57} },
+        {"Thumb-2 double", 8, {0xe8d0237f, 0xe8c04576, 0xe8c08977,
+                               0xe8d0ab7f, 0xf3bf8f2f, 0xe8c0897c} },
+    };
+
+    test_arm_exclusive_cases(UC_MODE_THUMB, test_cases,
+                             sizeof(test_cases) / sizeof(test_cases[0]));
 }
 
 static void test_arm_thumb_sub(void)
@@ -1442,11 +1696,10 @@ static void test_arm_mve_store_masked(uint8_t *expected, size_t offset,
     uint8_t lane[8];
     unsigned b;
 
-    if (size == 8) {
-        test_arm_store_le64(lane, value);
-    } else {
-        test_arm_store_le(lane, size, (uint32_t)value);
+    if (!TEST_CHECK(size <= sizeof(lane))) {
+        return;
     }
+    test_arm_store_le64(lane, value);
     for (b = 0; b < size; b++) {
         if (mask & (1U << (offset + b))) {
             expected[offset + b] = lane[b];
@@ -11697,6 +11950,11 @@ static bool test_arm_mem_read_write_cb(uc_engine *uc, int type,
                                        int64_t value, void *user_data)
 {
     uint64_t *count = (uint64_t *)user_data;
+    uint64_t total = count[0] + count[1];
+    uint32_t pc;
+
+    OK(uc_reg_read(uc, UC_ARM_REG_PC, &pc));
+    TEST_CHECK(pc == code_start + (total % 4) * 4);
     switch (type) {
     case UC_MEM_READ:
         count[0]++;
@@ -11721,6 +11979,7 @@ static void test_arm_mem_hook_read_write(void)
     r_sp = 0x9000;
     uc_hook hk;
     uint64_t counter[2] = {0, 0};
+    size_t i;
 
     uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_ARM, code, sizeof(code) - 1,
                     UC_CPU_ARM_CORTEX_A15);
@@ -11733,9 +11992,78 @@ static void test_arm_mem_hook_read_write(void)
     OK(uc_hook_add(uc, &hk, UC_HOOK_MEM_WRITE, test_arm_mem_read_write_cb,
                    counter, 1, 0));
 
-    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    for (i = 0; i < 8; i++) {
+        OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
+    }
 
-    TEST_CHECK(counter[0] == 2 && counter[1] == 2);
+    TEST_CHECK(counter[0] == 16 && counter[1] == 16);
+    OK(uc_close(uc));
+}
+
+typedef struct ArmNestedFlushHookData {
+    uint64_t nested_address;
+    uint32_t count;
+    bool nested_started;
+} ArmNestedFlushHookData;
+
+static void test_arm_memory_hook_nested_flush_callback(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
+{
+    ArmNestedFlushHookData *data =
+        (ArmNestedFlushHookData *)user_data;
+
+    data->count++;
+    if (!data->nested_started) {
+        data->nested_started = true;
+        OK(uc_ctl_flush_tb(uc));
+        OK(uc_emu_start(uc, data->nested_address,
+                        data->nested_address + 4, 0, 0));
+    }
+}
+
+static void test_arm_memory_hook_nested_tb_flush(void)
+{
+    const uint64_t data_address = 0x200000;
+    const uint64_t nested_address = code_start + 0x1000;
+    const uint8_t outer_code[] = {
+        0x00, 0x10, 0x90, 0xe5, /* ldr r1, [r0] */
+        0x01, 0x10, 0x81, 0xe2, /* add r1, r1, #1 */
+    };
+    const uint8_t nested_code[] = {
+        0x07, 0x20, 0xa0, 0xe3, /* mov r2, #7 */
+    };
+    const uint32_t memory_value = 0x11223344;
+    ArmNestedFlushHookData data = {
+        .nested_address = nested_address,
+    };
+    uint32_t r0 = (uint32_t)data_address;
+    uint32_t r1;
+    uint32_t r2;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_ARM,
+                    (const char *)outer_code, sizeof(outer_code),
+                    UC_CPU_ARM_CORTEX_A15);
+    OK(uc_mem_write(uc, nested_address, nested_code, sizeof(nested_code)));
+    OK(uc_mem_map(uc, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, data_address, &memory_value,
+                    sizeof(memory_value)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_READ,
+                   test_arm_memory_hook_nested_flush_callback, &data,
+                   data_address,
+                   data_address + sizeof(memory_value) - 1));
+
+    OK(uc_emu_start(uc, code_start,
+                    code_start + sizeof(outer_code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_ARM_REG_R2, &r2));
+    TEST_CHECK_(data.count == 1, "count=%u", data.count);
+    TEST_CHECK_(r1 == memory_value + 1, "r1=0x%x", r1);
+    TEST_CHECK(r2 == 7);
+
     OK(uc_close(uc));
 }
 
@@ -12038,6 +12366,11 @@ static void test_arm_hook_insn_wfi(void)
 }
 
 TEST_LIST = {{"test_arm_nop", test_arm_nop},
+             {"test_arm_legacy_count_transition",
+              test_arm_legacy_count_transition},
+             {"test_arm_exclusive_monitor", test_arm_exclusive_monitor},
+             {"test_arm_thumb2_exclusive_monitor",
+              test_arm_thumb2_exclusive_monitor},
              {"test_arm_thumb_sub", test_arm_thumb_sub},
              {"test_armeb_sub", test_armeb_sub},
              {"test_armeb_be8_sub", test_armeb_be8_sub},
@@ -12137,6 +12470,8 @@ TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_arm_thumb2", test_arm_thumb2},
              {"test_armeb_be32_thumb2", test_armeb_be32_thumb2},
              {"test_arm_mem_hook_read_write", test_arm_mem_hook_read_write},
+             {"test_arm_memory_hook_nested_tb_flush",
+              test_arm_memory_hook_nested_tb_flush},
              {"test_arm_thumb_it_mem_hook", test_arm_thumb_it_mem_hook},
              {"test_arm_tcg_opcode_cmp", test_arm_tcg_opcode_cmp},
              {"test_arm_thumb_tcg_opcode_cmn", test_arm_thumb_tcg_opcode_cmn},

@@ -1,79 +1,155 @@
 #include <stdint.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dirent.h>
-#include <unistd.h>
+#include <sys/stat.h>
+#endif
 
-int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+#define MAX_INPUT_SIZE 4096
+#define MAX_PATH_SIZE 4096
+#define RUN_FILE_SKIPPED 1
 
-int main(int argc, char** argv)
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
+static int run_file(const char *path)
 {
-    FILE * fp;
-    uint8_t Data[0x1000];
-    size_t Size;
-    DIR *d;
-    struct dirent *dir;
-    int r = 0;
+    uint8_t data[MAX_INPUT_SIZE];
+    long file_size;
+    FILE *file;
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return 3;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return 4;
+    }
+    file_size = ftell(file);
+    if (file_size < 0) {
+        fclose(file);
+        return 5;
+    }
+    if (file_size > MAX_INPUT_SIZE) {
+        fclose(file);
+        return RUN_FILE_SKIPPED;
+    }
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return 6;
+    }
+    if (file_size != 0 &&
+        fread(data, 1, (size_t)file_size, file) != (size_t)file_size) {
+        fclose(file);
+        return 7;
+    }
+    fclose(file);
+    LLVMFuzzerTestOneInput(data, (size_t)file_size);
+    return 0;
+}
+
+#ifdef _WIN32
+static int run_directory(const char *directory, unsigned int *file_count)
+{
+    WIN32_FIND_DATAA entry;
+    char pattern[MAX_PATH_SIZE];
+    char path[MAX_PATH_SIZE];
+    HANDLE find;
+    int result = 0;
+    int length;
+
+    length = snprintf(pattern, sizeof(pattern), "%s\\*", directory);
+    if (length < 0 || (size_t)length >= sizeof(pattern)) {
+        return 2;
+    }
+    find = FindFirstFileA(pattern, &entry);
+    if (find == INVALID_HANDLE_VALUE) {
+        return 2;
+    }
+    do {
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            continue;
+        }
+        length =
+            snprintf(path, sizeof(path), "%s\\%s", directory, entry.cFileName);
+        if (length < 0 || (size_t)length >= sizeof(path)) {
+            result = 2;
+            break;
+        }
+        result = run_file(path);
+        if (result == RUN_FILE_SKIPPED) {
+            result = 0;
+            continue;
+        }
+        if (result != 0) {
+            break;
+        }
+        (*file_count)++;
+    } while (FindNextFileA(find, &entry));
+    if (result == 0 && GetLastError() != ERROR_NO_MORE_FILES) {
+        result = 2;
+    }
+    FindClose(find);
+    return result;
+}
+#else
+static int run_directory(const char *directory, unsigned int *file_count)
+{
+    char path[MAX_PATH_SIZE];
+    struct dirent *entry;
+    struct stat status;
+    DIR *dir;
+    int result = 0;
+    int length;
+
+    dir = opendir(directory);
+    if (dir == NULL) {
+        return 2;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        length =
+            snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        if (length < 0 || (size_t)length >= sizeof(path)) {
+            result = 2;
+            break;
+        }
+        if (stat(path, &status) != 0 || !S_ISREG(status.st_mode)) {
+            continue;
+        }
+        result = run_file(path);
+        if (result == RUN_FILE_SKIPPED) {
+            result = 0;
+            continue;
+        }
+        if (result != 0) {
+            break;
+        }
+        (*file_count)++;
+    }
+    closedir(dir);
+    return result;
+}
+#endif
+
+int main(int argc, char **argv)
+{
+    unsigned int file_count = 0;
+    int result;
 
     if (argc != 2) {
         return 1;
     }
-
-    d = opendir(argv[1]);
-    if (d == NULL) {
-        printf("Invalid directory\n");
-        return 2;
+    result = run_directory(argv[1], &file_count);
+    if (result != 0) {
+        return result;
     }
-    if (chdir(argv[1]) != 0) {
-        closedir(d);
-        printf("Invalid directory\n");
-        return 2;
-    }
-
-    printf("Starting directory %s\n", argv[1]);
-    while((dir = readdir(d)) != NULL) {
-        //opens the file, get its size, and reads it into a buffer
-        if (dir->d_type != DT_REG) {
-            continue;
-        }
-        //printf("Running file %s\n", dir->d_name);
-        fflush(stdout);
-        fp = fopen(dir->d_name, "rb");
-        if (fp == NULL) {
-            r = 3;
-            break;
-        }
-        if (fseek(fp, 0L, SEEK_END) != 0) {
-            fclose(fp);
-            r = 4;
-            break;
-        }
-        Size = ftell(fp);
-        if (Size == (size_t) -1) {
-            fclose(fp);
-            r = 5;
-            break;
-        } else if (Size > 0x1000) {
-            fclose(fp);
-            continue;
-        }
-        if (fseek(fp, 0L, SEEK_SET) != 0) {
-            fclose(fp);
-            r = 7;
-            break;
-        }
-        if (fread(Data, Size, 1, fp) != 1) {
-            fclose(fp);
-            r = 8;
-            break;
-        }
-
-        //lauch fuzzer
-        LLVMFuzzerTestOneInput(Data, Size);
-        fclose(fp);
-    }
-    closedir(d);
-    printf("Ok : whole directory finished %s\n", argv[1]);
-    return r;
+    return file_count == 0 ? 8 : 0;
 }
-

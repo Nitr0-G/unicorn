@@ -20,6 +20,7 @@
 
 #include "uc_priv.h"
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "hw/core/cpu.h"
 #include "sysemu/tcg.h"
 
@@ -57,9 +58,10 @@ void cpu_reset_interrupt(CPUState *cpu, int mask)
 
 void cpu_exit(CPUState *cpu)
 {
-    cpu->exit_request = 1;
-    cpu->tcg_exit_req = 1;
-    cpu->icount_decr_ptr->u16.high = -1;
+    qatomic_set(&cpu->exit_request, 1);
+    qatomic_set(&cpu->tcg_exit_req, 1);
+    smp_wmb();
+    qatomic_set(&cpu->icount_decr_ptr->u16.high, -1);
 }
 
 static void cpu_common_noop(CPUState *cpu)

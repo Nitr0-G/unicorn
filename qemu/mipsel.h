@@ -5,6 +5,8 @@
 #define UNICORN_ARCH_POSTFIX _mipsel
 #endif
 #define gen_helper_check_exit_request gen_helper_check_exit_request_mipsel
+#define helper_uc_tracecode_single helper_uc_tracecode_single_mipsel
+#define cpu_restore_icount cpu_restore_icount_mipsel
 #define unicorn_fill_tlb unicorn_fill_tlb_mipsel
 #define reg_read reg_read_mipsel
 #define reg_write reg_write_mipsel
@@ -1371,6 +1373,7 @@
 #define tb_htable_init tb_htable_init_mipsel
 #define tb_cleanup tb_cleanup_mipsel
 #define tb_flush tb_flush_mipsel
+#define tb_flush_jit tb_flush_jit_mipsel
 #define tb_phys_invalidate tb_phys_invalidate_mipsel
 #define tb_gen_code tb_gen_code_mipsel
 #define tb_reset_jump tb_reset_jump_mipsel

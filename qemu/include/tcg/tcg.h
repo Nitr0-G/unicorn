@@ -592,6 +592,16 @@ typedef struct TCGProfile {
     int64_t table_op_count[NB_OPS];
 } TCGProfile;
 
+#define TCG_RESTORE_STATE_CACHE_BITS 8
+#define TCG_RESTORE_STATE_CACHE_SIZE (1 << TCG_RESTORE_STATE_CACHE_BITS)
+
+typedef struct TCGRestoreStateCacheEntry {
+    uintptr_t host_pc;
+    TranslationBlock *tb;
+    int insns_left;
+    target_ulong data[TARGET_INSN_START_WORDS];
+} TCGRestoreStateCacheEntry;
+
 /*
  * We divide code_gen_buffer into equally-sized "regions" that TCG threads
  * dynamically allocate from as demand dictates. Given appropriate region
@@ -659,6 +669,8 @@ struct TCGContext {
     void *code_gen_highwater;
 
     size_t tb_phys_invalidate_count;
+    TCGRestoreStateCacheEntry
+        restore_state_cache[TCG_RESTORE_STATE_CACHE_SIZE];
 
     /* Track which vCPU triggers events */
     CPUState *cpu;                      /* *_trans */
@@ -690,6 +702,7 @@ struct TCGContext {
     TBContext tb_ctx;
     /* qemu/include/exec/gen-icount.h */
     TCGOp *icount_start_insn;
+    bool skip_next_exit_check;
     /* qemu/tcg/tcg.c */
     GHashTable *helper_table;
     GHashTable *custom_helper_infos; // To support inline hooks.
@@ -820,6 +833,28 @@ struct TCGContext {
     // loongarch 
     bool use_lsx_instructions;
 };
+
+static inline void tcg_restore_state_cache_clear(TCGContext *tcg_ctx)
+{
+    memset(tcg_ctx->restore_state_cache, 0,
+           sizeof(tcg_ctx->restore_state_cache));
+}
+
+static inline void tcg_restore_state_cache_remove(TCGContext *tcg_ctx,
+                                                  TranslationBlock *tb)
+{
+    size_t i;
+
+    for (i = 0; i < TCG_RESTORE_STATE_CACHE_SIZE; i++) {
+        TCGRestoreStateCacheEntry *entry =
+            &tcg_ctx->restore_state_cache[i];
+
+        if (entry->tb == tb) {
+            entry->host_pc = 0;
+            entry->tb = NULL;
+        }
+    }
+}
 
 static inline const void *tcg_splitwx_to_rx(void *rw)
 {

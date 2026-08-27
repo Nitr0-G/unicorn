@@ -475,6 +475,337 @@ static void test_m68010_move_from_sr_privileged(void)
     OK(uc_close(uc));
 }
 
+static void test_m68020_cas_word(void)
+{
+    const uint8_t code[] = {
+        0x0c, 0xd0, 0x00, 0x40, /* cas.w d0, d1, (a0) */
+        0x40, 0xc4,             /* move.w sr, d4 */
+    };
+    const uint8_t compare[] = { 0x12, 0x34 };
+    const uint8_t update[] = { 0x56, 0x78 };
+    const uint8_t mismatch[] = { 0x20, 0x02 };
+    uint8_t result[sizeof(compare)];
+    uc_engine *uc;
+    uint32_t a0 = code_start + 0x1000;
+    uint32_t d0 = 0xaaaa1234;
+    uint32_t d1 = 0xbbbb5678;
+    uint32_t d4;
+    uint32_t pc = code_start;
+    uint32_t sr = 0x2710;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_M68K_M68020);
+    OK(uc_mem_write(uc, a0, compare, sizeof(compare)));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result, sizeof(result)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result, update, sizeof(result)) == 0);
+    TEST_CHECK(d0 == 0xaaaa1234);
+    TEST_CHECK((d4 & 0x1f) == 0x14);
+
+    d0 = 0xaaaa1001;
+    sr = 0x2710;
+    OK(uc_mem_write(uc, a0, mismatch, sizeof(mismatch)));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_PC, &pc));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result, sizeof(result)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result, mismatch, sizeof(result)) == 0);
+    TEST_CHECK(d0 == 0xaaaa2002);
+    TEST_CHECK(d1 == 0xbbbb5678);
+    TEST_CHECK((d4 & 0x1f) == 0x10);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68020_cas_long(void)
+{
+    const uint8_t code[] = {
+        0x0e, 0xd0, 0x00, 0x40, /* cas.l d0, d1, (a0) */
+        0x40, 0xc4,             /* move.w sr, d4 */
+    };
+    const uint8_t compare[] = { 0x12, 0x34, 0x56, 0x78 };
+    const uint8_t update[] = { 0x9a, 0xbc, 0xde, 0xf0 };
+    const uint8_t mismatch[] = { 0x30, 0x00, 0x30, 0x00 };
+    uint8_t result[sizeof(compare)];
+    uc_engine *uc;
+    uint32_t a0 = code_start + 0x1000;
+    uint32_t d0 = 0x12345678;
+    uint32_t d1 = 0x9abcdef0;
+    uint32_t d4;
+    uint32_t pc = code_start;
+    uint32_t sr = 0x2710;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_M68K_M68020);
+    OK(uc_mem_write(uc, a0, compare, sizeof(compare)));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result, sizeof(result)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result, update, sizeof(result)) == 0);
+    TEST_CHECK(d0 == 0x12345678);
+    TEST_CHECK((d4 & 0x1f) == 0x14);
+
+    d0 = 0x20002000;
+    sr = 0x2710;
+    OK(uc_mem_write(uc, a0, mismatch, sizeof(mismatch)));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_PC, &pc));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result, sizeof(result)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result, mismatch, sizeof(result)) == 0);
+    TEST_CHECK(d0 == 0x30003000);
+    TEST_CHECK(d1 == 0x9abcdef0);
+    TEST_CHECK((d4 & 0x1f) == 0x10);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68020_cas2_word(void)
+{
+    const uint8_t code[] = {
+        0x0c, 0xfc, 0x80, 0x80, 0x90, 0xc1,
+        /* cas2.w d0:d1, d2:d3, (a0):(a1) */
+        0x40, 0xc4, /* move.w sr, d4 */
+    };
+    const uint8_t compare1[] = { 0x12, 0x34 };
+    const uint8_t compare2[] = { 0x6a, 0xbc };
+    const uint8_t update1[] = { 0x56, 0x78 };
+    const uint8_t update2[] = { 0x2e, 0xf0 };
+    const uint8_t mismatch1[] = { 0x30, 0x03 };
+    const uint8_t mismatch2[] = { 0x40, 0x04 };
+    uint8_t result1[sizeof(compare1)];
+    uint8_t result2[sizeof(compare2)];
+    uc_engine *uc;
+    uint32_t a0 = code_start + 0x1000;
+    uint32_t a1 = code_start + 0x1100;
+    uint32_t d0 = 0xaaaa1234;
+    uint32_t d1 = 0xbbbb6abc;
+    uint32_t d2 = 0xcccc5678;
+    uint32_t d3 = 0xdddd2ef0;
+    uint32_t d4;
+    uint32_t pc = code_start;
+    uint32_t sr = 0x2710;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_M68K_M68020);
+    OK(uc_mem_write(uc, a0, compare1, sizeof(compare1)));
+    OK(uc_mem_write(uc, a1, compare2, sizeof(compare2)));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_A1, &a1));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_write(uc, UC_M68K_REG_D2, &d2));
+    OK(uc_reg_write(uc, UC_M68K_REG_D3, &d3));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result1, sizeof(result1)));
+    OK(uc_mem_read(uc, a1, result2, sizeof(result2)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result1, update1, sizeof(result1)) == 0);
+    TEST_CHECK(memcmp(result2, update2, sizeof(result2)) == 0);
+    TEST_CHECK(d0 == 0xaaaa1234);
+    TEST_CHECK(d1 == 0xbbbb6abc);
+    TEST_CHECK((d4 & 0x1f) == 0x14);
+
+    d0 = 0xaaaa2002;
+    d1 = 0xbbbb1001;
+    sr = 0x2710;
+    OK(uc_mem_write(uc, a0, mismatch1, sizeof(mismatch1)));
+    OK(uc_mem_write(uc, a1, mismatch2, sizeof(mismatch2)));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_write(uc, UC_M68K_REG_PC, &pc));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result1, sizeof(result1)));
+    OK(uc_mem_read(uc, a1, result2, sizeof(result2)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result1, mismatch1, sizeof(result1)) == 0);
+    TEST_CHECK(memcmp(result2, mismatch2, sizeof(result2)) == 0);
+    TEST_CHECK(d0 == 0xaaaa3003);
+    TEST_CHECK(d1 == 0xbbbb4004);
+    TEST_CHECK((d4 & 0x1f) == 0x10);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68020_cas2_long(void)
+{
+    const uint8_t code[] = {
+        0x0e, 0xfc, 0x80, 0x80, 0x90, 0xc1,
+        /* cas2.l d0:d1, d2:d3, (a0):(a1) */
+        0x40, 0xc4, /* move.w sr, d4 */
+    };
+    const uint8_t compare1[] = { 0x12, 0x34, 0x56, 0x78 };
+    const uint8_t compare2[] = { 0x1a, 0xbc, 0xde, 0xf0 };
+    const uint8_t update1[] = { 0x20, 0x00, 0x20, 0x00 };
+    const uint8_t update2[] = { 0x21, 0x00, 0x21, 0x00 };
+    const uint8_t mismatch1[] = { 0x30, 0x00, 0x30, 0x00 };
+    const uint8_t mismatch2[] = { 0x40, 0x00, 0x40, 0x00 };
+    uint8_t result1[sizeof(compare1)];
+    uint8_t result2[sizeof(compare2)];
+    uc_engine *uc;
+    uint32_t a0 = code_start + 0x1000;
+    uint32_t a1 = code_start + 0x1100;
+    uint32_t d0 = 0x12345678;
+    uint32_t d1 = 0x1abcdef0;
+    uint32_t d2 = 0x20002000;
+    uint32_t d3 = 0x21002100;
+    uint32_t d4;
+    uint32_t pc = code_start;
+    uint32_t sr = 0x2710;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_M68K_M68020);
+    OK(uc_mem_write(uc, a0, compare1, sizeof(compare1)));
+    OK(uc_mem_write(uc, a1, compare2, sizeof(compare2)));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_A1, &a1));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_write(uc, UC_M68K_REG_D2, &d2));
+    OK(uc_reg_write(uc, UC_M68K_REG_D3, &d3));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result1, sizeof(result1)));
+    OK(uc_mem_read(uc, a1, result2, sizeof(result2)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result1, update1, sizeof(result1)) == 0);
+    TEST_CHECK(memcmp(result2, update2, sizeof(result2)) == 0);
+    TEST_CHECK(d0 == 0x12345678);
+    TEST_CHECK(d1 == 0x1abcdef0);
+    TEST_CHECK((d4 & 0x1f) == 0x14);
+
+    d0 = 0x20002000;
+    d1 = 0x10001000;
+    sr = 0x2710;
+    OK(uc_mem_write(uc, a0, mismatch1, sizeof(mismatch1)));
+    OK(uc_mem_write(uc, a1, mismatch2, sizeof(mismatch2)));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_write(uc, UC_M68K_REG_PC, &pc));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, a0, result1, sizeof(result1)));
+    OK(uc_mem_read(uc, a1, result2, sizeof(result2)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D4, &d4));
+    TEST_CHECK(memcmp(result1, mismatch1, sizeof(result1)) == 0);
+    TEST_CHECK(memcmp(result2, mismatch2, sizeof(result2)) == 0);
+    TEST_CHECK(d0 == 0x30003000);
+    TEST_CHECK(d1 == 0x40004000);
+    TEST_CHECK((d4 & 0x1f) == 0x10);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68k_fast_count_boundary(void)
+{
+    const uint8_t code[] = {
+        0x70, 0x11, /* moveq #0x11, d0 */
+        0x72, 0x22, /* moveq #0x22, d1 */
+        0x74, 0x33, /* moveq #0x33, d2 */
+    };
+    uc_engine *uc;
+    uint32_t d0 = 0;
+    uint32_t d1 = 0;
+    uint32_t d2 = 0;
+    uint32_t pc = 0;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_M68K_M68000);
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D2, &d2));
+    OK(uc_reg_read(uc, UC_M68K_REG_PC, &pc));
+    TEST_CHECK_(d0 == 0x11, "d0 = 0x%08x", d0);
+    TEST_CHECK_(d1 == 0, "d1 = 0x%08x", d1);
+    TEST_CHECK_(d2 == 0, "d2 = 0x%08x", d2);
+    TEST_CHECK_(pc == (uint32_t)(code_start + 2), "pc = 0x%08x", pc);
+
+    d0 = 0;
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 2));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_D2, &d2));
+    OK(uc_reg_read(uc, UC_M68K_REG_PC, &pc));
+    TEST_CHECK_(d0 == 0x11, "d0 = 0x%08x", d0);
+    TEST_CHECK_(d1 == 0x22, "d1 = 0x%08x", d1);
+    TEST_CHECK_(d2 == 0, "d2 = 0x%08x", d2);
+    TEST_CHECK_(pc == (uint32_t)(code_start + 4), "pc = 0x%08x", pc);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68k_context_roundtrip(void)
+{
+    uc_engine *uc;
+    uc_context *context;
+    uint32_t d0 = 0x11223344;
+    uint32_t pc = code_start + 0x20;
+    uint32_t changed = 0;
+
+    OK(uc_open(UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_write(uc, UC_M68K_REG_PC, &pc));
+    OK(uc_context_alloc(uc, &context));
+    OK(uc_context_save(uc, context));
+
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &changed));
+    OK(uc_reg_write(uc, UC_M68K_REG_PC, &changed));
+    OK(uc_context_restore(uc, context));
+
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &changed));
+    TEST_CHECK(changed == d0);
+    OK(uc_reg_read(uc, UC_M68K_REG_PC, &changed));
+    TEST_CHECK(changed == pc);
+
+    OK(uc_context_free(context));
+    OK(uc_close(uc));
+}
+
 TEST_LIST = {{"test_move_to_sr", test_move_to_sr},
              {"test_sr_contains_flags", test_sr_contains_flags},
              {"test_fetoxm1", test_fetoxm1},
@@ -500,4 +831,12 @@ TEST_LIST = {{"test_move_to_sr", test_move_to_sr},
              {"test_rtr", test_rtr},
              {"test_m68010_move_from_sr_privileged",
               test_m68010_move_from_sr_privileged},
+             {"test_m68020_cas_word", test_m68020_cas_word},
+             {"test_m68020_cas_long", test_m68020_cas_long},
+             {"test_m68020_cas2_word", test_m68020_cas2_word},
+             {"test_m68020_cas2_long", test_m68020_cas2_long},
+             {"test_m68k_fast_count_boundary",
+              test_m68k_fast_count_boundary},
+             {"test_m68k_context_roundtrip",
+              test_m68k_context_roundtrip},
              {NULL, NULL}};

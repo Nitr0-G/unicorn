@@ -65,7 +65,7 @@ static bool cpu_virtual_mem_read(struct uc_struct *uc, vaddr addr, uint32_t prot
 
 static bool cpu_virtual_to_physical(struct uc_struct *uc, vaddr addr, uint32_t prot, uint64_t *paddr)
 {
-    target_ulong res;
+    hwaddr res;
     MMUAccessType access_type;
     int mmu_idx = cpu_mmu_index(uc->cpu->env_ptr, false);
 
@@ -163,9 +163,11 @@ static uc_err uc_set_tlb(struct uc_struct *uc, int mode) {
     switch (mode) {
         case UC_TLB_VIRTUAL:
             uc->cpu->cc->tlb_fill = unicorn_fill_tlb;
+            uc->tlb_mode = UC_TLB_VIRTUAL;
             return UC_ERR_OK;
         case UC_TLB_CPU:
             uc->cpu->cc->tlb_fill = uc->cpu->cc->tlb_fill_cpu;
+            uc->tlb_mode = UC_TLB_CPU;
             return UC_ERR_OK;
         default:
             return UC_ERR_ARG;

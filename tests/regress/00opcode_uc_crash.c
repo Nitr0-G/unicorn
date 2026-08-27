@@ -1,69 +1,72 @@
-#include <stdlib.h>
+#include <inttypes.h>
 #include <stdio.h>
-#include <assert.h>
 
 #include <unicorn/unicorn.h>
 
-#define X86_CODE32 "\x00" // add byte ptr ds:[eax],al
-#define ADDRESS 0x1000000
+#define CODE_ADDRESS UINT64_C(0x1000000)
+#define DATA_ADDRESS UINT32_C(0x1000008)
+#define MAP_SIZE UINT64_C(0x1000)
 
-static void VM_exec(void)
+int main(void)
 {
-    uc_engine *uc;
+    const uint8_t code[] = {0x00, 0x00}; /* add byte ptr [eax], al */
+    uint32_t eax = DATA_ADDRESS;
+    uint32_t eip = 0;
+    uint32_t value = 0;
+    uc_engine *uc = NULL;
     uc_err err;
-    uint32_t tmp;
-    unsigned int r_eax;
 
-    r_eax = 0x1000008;
-
-    // Initialize emulator in X86-32bit mode
     err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc);
-    if(err)
-    {
-        printf("Failed on uc_open() with error returned: %s\n", uc_strerror(err));
-        return;
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_open failed: %s\n", uc_strerror(err));
+        return 1;
+    }
+    err = uc_mem_map(uc, CODE_ADDRESS, MAP_SIZE, UC_PROT_ALL);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_map failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code));
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_write failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_write(uc, UC_X86_REG_EAX, &eax);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_write(EAX) failed: %s\n", uc_strerror(err));
+        goto fail;
     }
 
-    err = uc_mem_map(uc, ADDRESS, (4 * 1024 * 1024), UC_PROT_ALL);
-    if(err != UC_ERR_OK)
-    {
-        printf("Failed to map memory %s\n", uc_strerror(err));
-        return;
+    err = uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code), 0, 1);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_emu_start failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_mem_read(uc, DATA_ADDRESS, &value, sizeof(value));
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_mem_read failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    err = uc_reg_read(uc, UC_X86_REG_EIP, &eip);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_reg_read(EIP) failed: %s\n", uc_strerror(err));
+        goto fail;
+    }
+    if (value != 8 || eip != CODE_ADDRESS + sizeof(code)) {
+        fprintf(stderr,
+                "unexpected result: value=%" PRIu32 ", EIP=0x%" PRIx32 "\n",
+                value, eip);
+        goto fail;
     }
 
-    // write machine code to be emulated to memory
-    err = uc_mem_write(uc, ADDRESS, X86_CODE32, sizeof(X86_CODE32) - 1);
-    if(err != UC_ERR_OK)
-    {
-        printf("Failed to write emulation code to memory, quit!: %s(len %zu)\n", uc_strerror(err), sizeof(X86_CODE32) - 1);
-        return;
+    err = uc_close(uc);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "uc_close failed: %s\n", uc_strerror(err));
+        return 1;
     }
-
-    // initialize machine registers
-    uc_reg_write(uc, UC_X86_REG_EAX, &r_eax);
-
-    // emulate machine code in infinite time
-    err = uc_emu_start(uc, ADDRESS, ADDRESS + (sizeof(X86_CODE32) - 1), 0, 0);
-    if(err)
-    {
-        printf("Failed on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
-
-        uc_close(uc);
-        return;
-    }
-
-    if (!uc_mem_read(uc, ADDRESS+8, &tmp, sizeof(tmp)))
-        printf(">>> Read 4 bytes from [0x%08X] = 0x%08X\n", ADDRESS+8, tmp); //should contain the byte '8'
-    else
-        printf(">>> Failed to read 4 bytes from [0x%08X]\n", ADDRESS+8);
-
-    uc_close(uc);
-
-    puts("No crash. Yay!");
-}
-
-int main(int argc, char *argv[])
-{
-    VM_exec();
     return 0;
+
+fail:
+    uc_close(uc);
+    return 1;
 }

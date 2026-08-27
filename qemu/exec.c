@@ -1361,7 +1361,7 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
                     cpu_loop_exit(cpu);
                 } else {
                     /* Force execution of one instruction next time. */
-                    cpu->cflags_next_tb = 1 | curr_cflags();
+                    cpu->cflags_next_tb = 1 | curr_cflags(cpu->uc);
                     mmap_unlock();
                     cpu_loop_exit_noexc(cpu);
                 }

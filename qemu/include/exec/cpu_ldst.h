@@ -185,5 +185,5 @@ void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
  * Returns true when posible to translate, otherwhise false
  */
 bool tlb_vaddr_to_paddr(CPUArchState *env, abi_ptr addr,
-		        MMUAccessType access_type, int mmu_idx, target_ulong *paddr);
+                        MMUAccessType access_type, int mmu_idx, hwaddr *paddr);
 #endif /* CPU_LDST_H */

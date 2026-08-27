@@ -2855,6 +2855,10 @@ void check_exit_request(TCGContext *tcg_ctx)
     // Unicorn:
     //   For ARM IT block, we couldn't exit in the middle of the
     //   block and this is the our hack here.
+    if (tcg_ctx->skip_next_exit_check) {
+        tcg_ctx->skip_next_exit_check = false;
+        return;
+    }
     if (tcg_ctx->uc->no_exit_request) {
         return;
     }
@@ -2867,7 +2871,12 @@ void check_exit_request(TCGContext *tcg_ctx)
     if (tcg_ctx->delay_slot_flag != NULL) {
         tcg_gen_mov_i32(tcg_ctx, tmp, tcg_ctx->delay_slot_flag);
     }
-    gen_helper_check_exit_request(tcg_ctx, puc, tmp);
+    TCGv_ptr ttb = tcg_const_ptr(tcg_ctx, NULL);
+    TCGv_i32 insns = tcg_const_i32(tcg_ctx, 0);
+
+    gen_helper_check_exit_request(tcg_ctx, puc, tmp, ttb, insns);
+    tcg_temp_free_i32(tcg_ctx, insns);
+    tcg_temp_free_ptr(tcg_ctx, ttb);
     tcg_temp_free_i32(tcg_ctx, tmp);
     tcg_temp_free_ptr(tcg_ctx, puc);
 }

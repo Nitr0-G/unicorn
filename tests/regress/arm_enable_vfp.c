@@ -1,65 +1,44 @@
 #include <unicorn/unicorn.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
 
 #define ADDRESS 0x1000
-#define ARM_VMOV "\xC0\xEF\x10\x00" // VMOV.I32 D16, #0 ; Vector Move
 
 int main(void)
 {
+    /* vadd.f32 s0, s1, s2 */
+    const uint8_t code[] = {0x81, 0x0a, 0x30, 0xee};
+    uint32_t s0 = 0;
+    uint32_t s1 = 0x3f800000;
+    uint32_t s2 = 0x40000000;
+    uint32_t cpacr = 0;
+    uint32_t fpexc = 1U << 30;
     uc_engine *uc;
     uc_err err;
 
     err = uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc);
-    if (err) {
-        printf("uc_open %d\n", err);
+    if (err != UC_ERR_OK) {
+        return 1;
+    }
+    if (uc_ctl_set_cpu_model(uc, UC_CPU_ARM_CORTEX_A15) != UC_ERR_OK ||
+        uc_reg_read(uc, UC_ARM_REG_C1_C0_2, &cpacr) != UC_ERR_OK) {
+        uc_close(uc);
+        return 1;
+    }
+    cpacr |= 0xfU << 20;
+    if (uc_reg_write(uc, UC_ARM_REG_C1_C0_2, &cpacr) != UC_ERR_OK ||
+        uc_reg_write(uc, UC_ARM_REG_FPEXC, &fpexc) != UC_ERR_OK ||
+        uc_reg_write(uc, UC_ARM_REG_S0, &s0) != UC_ERR_OK ||
+        uc_reg_write(uc, UC_ARM_REG_S1, &s1) != UC_ERR_OK ||
+        uc_reg_write(uc, UC_ARM_REG_S2, &s2) != UC_ERR_OK ||
+        uc_mem_map(uc, ADDRESS, 0x1000, UC_PROT_ALL) != UC_ERR_OK ||
+        uc_mem_write(uc, ADDRESS, code, sizeof(code)) != UC_ERR_OK ||
+        uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(code), 0, 1) != UC_ERR_OK ||
+        uc_reg_read(uc, UC_ARM_REG_S0, &s0) != UC_ERR_OK) {
+        uc_close(uc);
         return 1;
     }
 
-    uint64_t tmp_val;
-
-    err = uc_reg_read(uc, UC_ARM_REG_C1_C0_2, &tmp_val);
-    if (err) {
-        printf("uc_open %d\n", err);
+    if (uc_close(uc) != UC_ERR_OK) {
         return 1;
     }
-
-    tmp_val = tmp_val | (0xf << 20);
-    err = uc_reg_write(uc, UC_ARM_REG_C1_C0_2, &tmp_val);
-    if (err) {
-        printf("uc_open %d\n", err);
-        return 1;
-    }
-
-    size_t enable_vfp = 0x40000000;
-    err = uc_reg_write(uc, UC_ARM_REG_FPEXC, &enable_vfp);
-    if (err) {
-        printf("uc_open %d\n", err);
-        return 1;
-    }
-
-    err = uc_mem_map(uc, ADDRESS, 4 * 1024, UC_PROT_ALL);
-    if (err) {
-        printf("uc_mem_map %d\n", err);
-        return 1;
-    }
-
-    err = uc_mem_write(uc, ADDRESS, ARM_VMOV, sizeof(ARM_VMOV) - 1);
-    if (err) {
-        printf("uc_mem_map %s\n", uc_strerror(err));
-        return 1;
-    }
-
-    err = uc_emu_start(uc, ADDRESS, 0, 0, 1);
-    if (err) {
-        printf("uc_emu_start: %s\n", uc_strerror(err));
-        return 1;
-    }
-
-    printf("Success\n");
-
-    uc_close(uc);
-
-    return 0;
+    return s0 == 0x40400000 ? 0 : 1;
 }

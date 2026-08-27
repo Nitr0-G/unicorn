@@ -1151,8 +1151,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
 
     /* Compare masked address with the TLB entry.  */
     ldst->label_ptr[0] = s->code_ptr;
-    // tcg_out_opc_bne(s, TCG_REG_TMP0, TCG_REG_TMP1, 0);
-    tcg_out_opc_beq(s, 0, 0, 0);
+    tcg_out_opc_bne(s, TCG_REG_TMP0, TCG_REG_TMP1, 0);
 
     h->index = TCG_REG_TMP2;
 #else

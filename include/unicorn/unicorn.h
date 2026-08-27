@@ -43,12 +43,14 @@ typedef size_t uc_hook;
 #define DEFAULT_VISIBILITY
 #endif
 
+#if defined(_MSC_VER) || defined(__MINGW32__)
 #ifdef _MSC_VER
 #pragma warning(disable : 4201)
 #pragma warning(disable : 4100)
+#endif
 #ifdef UNICORN_SHARED
 #define UNICORN_EXPORT __declspec(dllexport)
-#else // defined(UNICORN_STATIC)
+#else
 #define UNICORN_EXPORT
 #endif
 #else

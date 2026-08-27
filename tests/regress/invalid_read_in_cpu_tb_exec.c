@@ -1,33 +1,31 @@
 #include <unicorn/unicorn.h>
 
-static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-  printf("hook_block(%p, %"PRIx64", %d, %p)\n", uc, address, size, user_data);
-}
+#define ADDRESS 0x1000000
 
-/*
- * Disassembly according to capstone:
- *   add byte ptr [rip - 1], 0x30
- *   jmp 0x1000000
- */
-#define BINARY "\x80\x05\xff\xff\xff\xff\x30\xeb\xf7\x30"
-#define MEMORY_SIZE 2 * 1024 * 1024
-#define STARTING_ADDRESS 0x1000000
+int main(void)
+{
+    const uint8_t code[] = {
+        0x80, 0x05, 0xff, 0xff, 0xff, 0xff, 0x30, 0xeb, 0xf7, 0x30,
+    };
+    uint8_t immediate = UINT8_MAX;
+    uint64_t rip = UINT64_MAX;
+    uc_engine *uc;
 
-int main(int argc, char **argv, char **envp) {
-  uc_engine *uc;
-  if (uc_open(UC_ARCH_X86, UC_MODE_64, &uc)) {
-    printf("uc_open(…) failed\n");
-    return 1;
-  }
-  uc_mem_map(uc, STARTING_ADDRESS, MEMORY_SIZE, UC_PROT_ALL);
-  if (uc_mem_write(uc, STARTING_ADDRESS, BINARY, sizeof(BINARY) - 1)) {
-    printf("uc_mem_write(…) failed\n");
-    return 1;
-  }
-  uc_hook hook;
-  uc_hook_add(uc, &hook, UC_HOOK_BLOCK, hook_block, NULL, 1, 0);
-  printf("uc_emu_start(…)\n");
-  uc_emu_start(uc, STARTING_ADDRESS, STARTING_ADDRESS + sizeof(BINARY) - 1, 0, 20);
-  printf("done\n");
-  return 0;
+    if (uc_open(UC_ARCH_X86, UC_MODE_64, &uc) != UC_ERR_OK) {
+        return 1;
+    }
+    if (uc_mem_map(uc, ADDRESS, 0x200000, UC_PROT_ALL) != UC_ERR_OK ||
+        uc_mem_write(uc, ADDRESS, code, sizeof(code)) != UC_ERR_OK ||
+        uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(code), 0, 20) != UC_ERR_OK ||
+        uc_mem_read(uc, ADDRESS + 6, &immediate, sizeof(immediate)) !=
+            UC_ERR_OK ||
+        uc_reg_read(uc, UC_X86_REG_RIP, &rip) != UC_ERR_OK) {
+        uc_close(uc);
+        return 1;
+    }
+
+    if (uc_close(uc) != UC_ERR_OK) {
+        return 1;
+    }
+    return immediate == 0 && rip == ADDRESS ? 0 : 1;
 }

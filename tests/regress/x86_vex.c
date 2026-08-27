@@ -1,83 +1,78 @@
-#include "unicorn/unicorn.h"
-#include <assert.h>
-#include <stdio.h>
+#include <string.h>
 
+#include <unicorn/unicorn.h>
 
-#define OK(x) {uc_err __err; if ((__err = x)) { fprintf(stderr, "%s", uc_strerror(__err)); assert(false); } }
-static void test_vmovdqu(void)
+#define CODE_ADDRESS 0x1000
+#define DATA_ADDRESS 0x2000
+
+static bool test_vmovdqu_xmm(void)
 {
+    const uint8_t code[] = {0xc5, 0xfa, 0x6f, 0x07};
+    const uint8_t expected[16] = {
+        0xad, 0xfa, 0x5c, 0x6d, 0x45, 0x4a, 0x93, 0x40,
+        0xd2, 0x00, 0xde, 0x02, 0x89, 0xe8, 0x94, 0x40,
+    };
+    uint8_t xmm0[16] = {0};
+    uint32_t edi = DATA_ADDRESS;
     uc_engine *uc;
 
-    int r_esi = 0x1234;
-    int r_edi = 0x7890;
-
-    uint64_t r_xmm0[2] = {0x08090a0b0c0d0e0f, 0x0001020304050607};
-
-    /* 128 bit at address esi (0x1234) this should not be read into xmm0 */
-    char mem_esi[] = { '\xE7', '\x1D', '\xA7', '\xE8', '\x88', '\xE4', '\x94', '\x40', '\x54', '\x74', '\x24', '\x97', '\x1F', '\x2E', '\xB6', '\x40' };
-
-    /* 128 bit at address edi (0x7890) this SHOULD be read into xmm0 */
-    char mem_edi[] = { '\xAD', '\xFA', '\x5C', '\x6D', '\x45', '\x4A', '\x93', '\x40', '\xD2', '\x00', '\xDE', '\x02', '\x89', '\xE8', '\x94', '\x40' };
-    
-    /* vmovdqu xmm0, [edi] */
-    char code[] = { '\xC5', '\xFA', '\x6F', '\x07' };
-
-    /* initialize memory and run emulation  */
-    OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
-    OK(uc_mem_map(uc, 0, 2 * 1024 * 1024, UC_PROT_ALL));
-
-    OK(uc_mem_write(uc, 0, code, sizeof(code) / sizeof(code[0])));
-
-    // initialize machine registers;
-    OK(uc_reg_write(uc, UC_X86_REG_XMM0, &r_xmm0));
-    
-    OK(uc_reg_write(uc, UC_X86_REG_ESI, &r_esi));
-    OK(uc_reg_write(uc, UC_X86_REG_EDI, &r_edi));
-    OK(uc_mem_write(uc, r_esi, mem_esi, sizeof(mem_esi) / sizeof(mem_esi[0])));
-    OK(uc_mem_write(uc, r_edi, mem_edi, sizeof(mem_edi) / sizeof(mem_edi[0])));
-
-    OK(uc_emu_start(uc, 0, sizeof(code) / sizeof(code[0]), 0, 0));
-
-    /* Read xmm0 after emulation */
-    OK(uc_reg_read(uc, UC_X86_REG_XMM0, &r_xmm0));
-
-
-    assert(0x4094e88902de00d2 == r_xmm0[0] && 0x40934a456d5cfaad == r_xmm0[1]);
-
-    OK(uc_close(uc));
-}
-
-/* https://github.com/unicorn-engine/unicorn/issues/1656 */
-static void test_vex_l(void)
-{
-    uc_engine *uc;
-    uc_err err;
-
-    /* vmovdqu ymm1, [rcx] */
-    char code[] = { '\xC5', '\xFE', '\x6F', '\x09' };
-
-    /* initialize memory and run emulation  */
-    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
-    OK(uc_mem_map(uc, 0, 2 * 1024 * 1024, UC_PROT_ALL));
-
-    OK(uc_mem_write(uc, 0, code, sizeof(code) / sizeof(code[0])));
-
-    err = uc_emu_start(uc, 0, sizeof(code) / sizeof(code[0]), 0, 0);
-    if(err != UC_ERR_INSN_INVALID) {
-        fprintf(stderr, "%s", uc_strerror(err));
-        assert(false);
+    if (uc_open(UC_ARCH_X86, UC_MODE_32, &uc) != UC_ERR_OK) {
+        return false;
+    }
+    if (uc_ctl_set_cpu_model(uc, UC_CPU_X86_HASWELL) != UC_ERR_OK ||
+        uc_mem_map(uc, CODE_ADDRESS, 0x2000, UC_PROT_ALL) != UC_ERR_OK ||
+        uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code)) != UC_ERR_OK ||
+        uc_mem_write(uc, DATA_ADDRESS, expected, sizeof(expected)) !=
+            UC_ERR_OK ||
+        uc_reg_write(uc, UC_X86_REG_EDI, &edi) != UC_ERR_OK ||
+        uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code), 0, 1) !=
+            UC_ERR_OK ||
+        uc_reg_read(uc, UC_X86_REG_XMM0, xmm0) != UC_ERR_OK) {
+        uc_close(uc);
+        return false;
     }
 
-    OK(uc_close(uc));
+    if (uc_close(uc) != UC_ERR_OK) {
+        return false;
+    }
+    return memcmp(xmm0, expected, sizeof(expected)) == 0;
 }
 
-
-/* TODO: Add more vex prefixed instructions
-         Suggestions: vxorpd, vxorps, vandpd, ... */
-int main(int argc, char **argv, char **envp)
+static bool test_vmovdqu_ymm(void)
 {
-        test_vmovdqu();
-        test_vex_l();
-        return 0;
+    const uint8_t code[] = {0xc5, 0xfe, 0x6f, 0x09};
+    const uint8_t expected[32] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+        0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+        0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    };
+    uint8_t ymm1[32] = {0};
+    uint64_t rcx = DATA_ADDRESS;
+    uc_engine *uc;
+
+    if (uc_open(UC_ARCH_X86, UC_MODE_64, &uc) != UC_ERR_OK) {
+        return false;
+    }
+    if (uc_ctl_set_cpu_model(uc, UC_CPU_X86_HASWELL) != UC_ERR_OK ||
+        uc_mem_map(uc, CODE_ADDRESS, 0x2000, UC_PROT_ALL) != UC_ERR_OK ||
+        uc_mem_write(uc, CODE_ADDRESS, code, sizeof(code)) != UC_ERR_OK ||
+        uc_mem_write(uc, DATA_ADDRESS, expected, sizeof(expected)) !=
+            UC_ERR_OK ||
+        uc_reg_write(uc, UC_X86_REG_RCX, &rcx) != UC_ERR_OK ||
+        uc_emu_start(uc, CODE_ADDRESS, CODE_ADDRESS + sizeof(code), 0, 1) !=
+            UC_ERR_OK ||
+        uc_reg_read(uc, UC_X86_REG_YMM1, ymm1) != UC_ERR_OK) {
+        uc_close(uc);
+        return false;
+    }
+
+    if (uc_close(uc) != UC_ERR_OK) {
+        return false;
+    }
+    return memcmp(ymm1, expected, sizeof(expected)) == 0;
 }
 
+int main(void)
+{
+    return test_vmovdqu_xmm() && test_vmovdqu_ymm() ? 0 : 1;
+}
