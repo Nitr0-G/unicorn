@@ -750,7 +750,7 @@ begin
   uc_reg_read(uc, UC_X86_REG_EAX, @r_eax);
   WriteLn(Format('>>> EAX = 0x%x', [r_eax]));
 
-  err := uc_free(context);
+  err := uc_context_free(context);
   if (err <> UC_ERR_OK) then begin
     WriteLn(Format('Failed on uc_free() with error returned %u: %s', [err, uc_strerror(err)]));
     exit;

@@ -483,7 +483,7 @@ The callback will be run when the hook event is hit.
   @uc: handle returned by uc_open()
   @context: pointer to a uc_engine*. This will be updated with the pointer to
     the new context on successful return of this function.
-    Later, this allocated memory must be freed with uc_free().
+    Later, this allocated memory must be freed with uc_context_free().
 
   @return UC_ERR_OK on success, or other value on failure (refer to uc_err enum
     for detailed error).
@@ -491,10 +491,9 @@ The callback will be run when the hook event is hit.
   uc_context_alloc : function ( uc : uc_engine;  var context : uc_context) : uc_err; cdecl ;
 
 (*
-  Free the memory allocated by uc_context_alloc & uc_mem_regions.
+  Free the memory allocated by uc_mem_regions.
 
-  @mem: memory allocated by uc_context_alloc (returned in *context), or
-        by uc_mem_regions (returned in *regions)
+  @mem: memory allocated by uc_mem_regions (returned in *regions)
 
   @return UC_ERR_OK on success, or other value on failure (refer to uc_err enum \
     for detailed error).
@@ -527,6 +526,16 @@ The callback will be run when the hook event is hit.
     for detailed error).
 *)
   uc_context_restore : function(uc : uc_engine; context : uc_context) : uc_err; cdecl;
+
+(*
+  Free the context allocated by uc_context_alloc().
+
+  @context: handle returned by uc_context_alloc()
+
+  @return UC_ERR_OK on success, or other value on failure (refer to uc_err enum
+    for detailed error).
+*)
+  uc_context_free : function(context : uc_context) : uc_err; cdecl;
 
 
 {============================= Global Functions ================================}
@@ -638,6 +647,9 @@ begin
 
     @uc_context_restore := dyn_loadfunc('uc_context_restore');
     if (@uc_context_restore = nil) then exit(false);
+
+    @uc_context_free := dyn_loadfunc('uc_context_free');
+    if (@uc_context_free = nil) then exit(false);
 
     @uc_free := dyn_loadfunc('uc_free');
     if (@uc_free = nil) then exit(false);

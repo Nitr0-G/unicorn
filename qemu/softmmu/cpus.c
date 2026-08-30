@@ -103,7 +103,6 @@ static int tcg_cpu_exec(struct uc_struct *uc)
 
                 // resume cpu
                 cpu->halted = 0;
-                qatomic_set(&cpu->exit_request, 0);
                 cpu->exception_index = -1;
                 cpu_resume(cpu);
             } else if (uc_stop_requested(uc)) {
@@ -135,9 +134,7 @@ static int tcg_cpu_exec(struct uc_struct *uc)
         }
     }
     uc->exit_request = 0;
-    qatomic_set(&uc->cpu->exit_request, 0);
     uc->cpu->icount_decr_ptr->u16.high = 0;
-    qatomic_set(&uc->cpu->tcg_exit_req, 0);
 
     return finish;
 }
@@ -212,7 +209,6 @@ void resume_all_vcpus(struct uc_struct* uc)
 {
     CPUState *cpu = uc->cpu;
     cpu->halted = 0;
-    qatomic_set(&cpu->exit_request, 0);
     cpu->exception_index = -1;
     cpu_resume(cpu);
     /* static void qemu_tcg_cpu_loop(struct uc_struct *uc) */

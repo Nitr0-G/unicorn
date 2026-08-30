@@ -189,7 +189,7 @@ static void test_arm64eb(void)
 
     // now print out some registers
     printf(">>> Emulation done. Below is the CPU context\n");
-    printf(">>> As big endian, X15 should be 0x78:\n");
+    printf(">>> As big endian, X15 should be 0x12:\n");
 
     uc_reg_read(uc, UC_ARM64_REG_X15, &x15);
     printf(">>> X15 = 0x%" PRIx64 "\n", x15);

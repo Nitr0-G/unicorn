@@ -4,9 +4,15 @@
 #ifndef UNICORN_ARCH_POSTFIX
 #define UNICORN_ARCH_POSTFIX _sparc
 #endif
+#define gen_helper_check_counted_entry gen_helper_check_counted_entry_sparc
 #define gen_helper_check_exit_request gen_helper_check_exit_request_sparc
+#define gen_helper_exit_request gen_helper_exit_request_sparc
+#define helper_check_counted_entry helper_check_counted_entry_sparc
+#define helper_check_exit_request helper_check_exit_request_sparc
+#define helper_exit_request helper_exit_request_sparc
 #define helper_uc_tracecode_single helper_uc_tracecode_single_sparc
 #define cpu_restore_icount cpu_restore_icount_sparc
+#define cpu_tcg_exit_request cpu_tcg_exit_request_sparc
 #define unicorn_fill_tlb unicorn_fill_tlb_sparc
 #define reg_read reg_read_sparc
 #define reg_write reg_write_sparc
@@ -58,6 +64,8 @@
 #define address_space_dispatch_compact address_space_dispatch_compact_sparc
 #define flatview_translate flatview_translate_sparc
 #define flatview_copy flatview_copy_sparc
+#define flatview_reserve flatview_reserve_sparc
+#define address_space_restore_flatview address_space_restore_flatview_sparc
 #define address_space_translate_for_iotlb address_space_translate_for_iotlb_sparc
 #define qemu_get_cpu qemu_get_cpu_sparc
 #define cpu_address_space_init cpu_address_space_init_sparc
@@ -133,6 +141,10 @@
 #define memory_unmap memory_unmap_sparc
 #define memory_moveout memory_moveout_sparc
 #define memory_movein memory_movein_sparc
+#define memory_mapping_restore_topology memory_mapping_restore_topology_sparc
+#define memory_mapping_free memory_mapping_free_sparc
+#define memory_mapping_prune memory_mapping_prune_sparc
+#define memory_mapping_normalize memory_mapping_normalize_sparc
 #define memory_free memory_free_sparc
 #define flatview_unref flatview_unref_sparc
 #define address_space_get_flatview address_space_get_flatview_sparc

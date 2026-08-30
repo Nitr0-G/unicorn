@@ -15275,6 +15275,15 @@ static void disas_a64_insn(CPUARMState *env, DisasContext *s)
     s->insn = insn;
     s->base.pc_next += 4;
 
+    if (HOOK_EXISTS_BOUNDED(env->uc, UC_HOOK_MEM_FETCH, s->pc_curr)) {
+        TCGContext *tcg_ctx = env->uc->tcg_ctx;
+
+        gen_a64_set_pc_im(tcg_ctx, s->pc_curr);
+        gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, env->uc,
+                          s->pc_curr);
+        check_exit_request(tcg_ctx);
+    }
+
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(env->uc, UC_HOOK_CODE, s->pc_curr)) {
 

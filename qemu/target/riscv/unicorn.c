@@ -7,6 +7,7 @@
 #include "cpu.h"
 #include "unicorn_common.h"
 #include "cpu_bits.h"
+#include "debug.h"
 #include <unicorn/riscv.h>
 #include "unicorn.h"
 #include <string.h>
@@ -479,6 +480,17 @@ static bool riscv_insn_hook_validate(uint32_t insn_enum)
     return false;
 }
 
+static uc_err riscv_context_restore(struct uc_struct *uc,
+                                    uc_context *context)
+{
+    CPURISCVState *env = uc->cpu->env_ptr;
+    size_t pointer_offset = offsetof(CPURISCVState, cpu_breakpoint);
+
+    memcpy(env, context->data, pointer_offset);
+    riscv_trigger_update_all(env);
+    return UC_ERR_OK;
+}
+
 static int riscv_cpus_init(struct uc_struct *uc, const char *cpu_model)
 {
 
@@ -505,5 +517,6 @@ void uc_init(struct uc_struct *uc)
     uc->insn_hook_validate = riscv_insn_hook_validate;
     uc->cpus_init = riscv_cpus_init;
     uc->cpu_context_size = offsetof(CPURISCVState, rdtime_fn);
+    uc->context_restore = riscv_context_restore;
     uc_common_init(uc);
 }

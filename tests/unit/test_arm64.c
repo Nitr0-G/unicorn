@@ -123,6 +123,153 @@ static void test_arm64_code_patching_count(void)
     OK(uc_close(uc));
 }
 
+typedef struct Arm64CallbackSmc {
+    uint64_t patch_address;
+    uint32_t patch;
+    uint32_t entry_count;
+    uc_err write_error;
+    bool patched;
+} Arm64CallbackSmc;
+
+static void test_arm64_callback_smc_hook(uc_engine *uc, uint64_t address,
+                                         uint32_t size, void *user_data)
+{
+    Arm64CallbackSmc *smc = (Arm64CallbackSmc *)user_data;
+
+    (void)size;
+    if (address != code_start) {
+        return;
+    }
+
+    smc->entry_count++;
+    if (!smc->patched) {
+        smc->patched = true;
+        smc->write_error = uc_mem_write(uc, smc->patch_address, &smc->patch,
+                                        sizeof(smc->patch));
+    }
+}
+
+static void test_arm64_callback_active_tb_smc(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0xd503201f), /* nop */
+        LEINT32(0x52800021), /* mov w1,#1 */
+        LEINT32(0x52800062), /* mov w2,#3 */
+    };
+    Arm64CallbackSmc smc = {
+        .patch_address = code_start + 4,
+        .patch = LEINT32(0x528000e1), /* mov w1,#7 */
+        .write_error = UC_ERR_OK,
+    };
+    uc_engine *uc;
+    uc_hook hook;
+    uint64_t x1 = 0;
+    uint64_t x2 = 0;
+
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM64_A72);
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, test_arm64_callback_smc_hook, &smc,
+                   1, 0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(smc.write_error);
+    OK(uc_reg_read(uc, UC_ARM64_REG_X1, &x1));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X2, &x2));
+    TEST_CHECK(smc.patched);
+    TEST_CHECK_(smc.entry_count == 2, "entry_count=%u", smc.entry_count);
+    TEST_CHECK_(x1 == 7, "x1=0x%llx", (unsigned long long)x1);
+    TEST_CHECK_(x2 == 3, "x2=0x%llx", (unsigned long long)x2);
+
+    OK(uc_close(uc));
+}
+
+static void test_arm64_guest_store_cached_tb_smc(void)
+{
+    const uint32_t target_code[] = {
+        LEINT32(0x52800022), /* mov w2,#1 */
+        LEINT32(0x52800063), /* mov w3,#3 */
+    };
+    const uint32_t writer_code[] = {
+        LEINT32(0xb9000001), /* str w1,[x0] */
+    };
+    const uint32_t patch = LEINT32(0x52800102); /* mov w2,#8 */
+    const uint64_t writer_address = code_start + 0x100;
+    uc_engine *uc;
+    uint64_t x0 = code_start;
+    uint64_t x1 = 0x52800102;
+    uint64_t x2 = 0;
+    uint64_t x3 = 0;
+    uint32_t stored = 0;
+
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, (const char *)target_code,
+                    sizeof(target_code), UC_CPU_ARM64_A72);
+    OK(uc_mem_write(uc, writer_address, writer_code, sizeof(writer_code)));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(target_code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X2, &x2));
+    TEST_CHECK_(x2 == 1, "initial x2=0x%llx", (unsigned long long)x2);
+
+    x2 = 0;
+    OK(uc_reg_write(uc, UC_ARM64_REG_X2, &x2));
+    OK(uc_reg_write(uc, UC_ARM64_REG_X0, &x0));
+    OK(uc_reg_write(uc, UC_ARM64_REG_X1, &x1));
+
+    OK(uc_emu_start(uc, writer_address, writer_address + sizeof(writer_code), 0,
+                    0));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(target_code), 0, 0));
+
+    OK(uc_mem_read(uc, code_start, &stored, sizeof(stored)));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X2, &x2));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X3, &x3));
+    TEST_CHECK(stored == patch);
+    TEST_CHECK_(x2 == 8, "x2=0x%llx", (unsigned long long)x2);
+    TEST_CHECK_(x3 == 3, "x3=0x%llx", (unsigned long long)x3);
+
+    OK(uc_close(uc));
+}
+
+static void test_arm64_guest_smc_cache_maintenance(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0xb9000001), /* str w1,[x0] */
+        LEINT32(0xd50b7b20), /* dc cvau,x0 */
+        LEINT32(0xd5033b9f), /* dsb ish */
+        LEINT32(0xd50b7520), /* ic ivau,x0 */
+        LEINT32(0xd5033b9f), /* dsb ish */
+        LEINT32(0xd5033fdf), /* isb */
+        LEINT32(0x52800022), /* mov w2,#1 */
+        LEINT32(0x52800063), /* mov w3,#3 */
+    };
+    const uint32_t patch = LEINT32(0x52800102); /* mov w2,#8 */
+    const uint64_t patch_address = code_start + 6 * sizeof(uint32_t);
+    const uint64_t code_end = code_start + sizeof(code);
+    uc_engine *uc;
+    uint64_t x0 = patch_address;
+    uint64_t x1 = 0x52800102;
+    uint64_t x2 = 0;
+    uint64_t x3 = 0;
+    uint64_t pc = 0;
+    uint32_t stored = 0;
+
+    uc_common_setup(&uc, UC_ARCH_ARM64, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM64_A72);
+    OK(uc_reg_write(uc, UC_ARM64_REG_X0, &x0));
+    OK(uc_reg_write(uc, UC_ARM64_REG_X1, &x1));
+
+    OK(uc_emu_start(uc, code_start, code_end, 0, 0));
+
+    OK(uc_mem_read(uc, patch_address, &stored, sizeof(stored)));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X2, &x2));
+    OK(uc_reg_read(uc, UC_ARM64_REG_X3, &x3));
+    OK(uc_reg_read(uc, UC_ARM64_REG_PC, &pc));
+    TEST_CHECK(stored == patch);
+    TEST_CHECK_(x2 == 8, "x2=0x%llx", (unsigned long long)x2);
+    TEST_CHECK_(x3 == 3, "x3=0x%llx", (unsigned long long)x3);
+    TEST_CHECK_(pc == code_end, "pc=0x%llx", (unsigned long long)pc);
+
+    OK(uc_close(uc));
+}
+
 static void test_arm64_v8_cas(void)
 {
     uc_engine *uc;
@@ -232,8 +379,8 @@ static void test_arm64_lse_signed_minmax_byte(void)
     OK(uc_reg_read(uc, UC_ARM64_REG_X2, &x2));
     OK(uc_reg_read(uc, UC_ARM64_REG_X4, &x4));
     OK(uc_mem_read(uc, 0x40000, &data, sizeof(data)));
-    TEST_CHECK_(x2 == 0x80, "x2=0x%llx", x2);
-    TEST_CHECK_(x4 == 0x7f, "x4=0x%llx", x4);
+    TEST_CHECK_(x2 == 0x80, "x2=0x%llx", (unsigned long long)x2);
+    TEST_CHECK_(x4 == 0x7f, "x4=0x%llx", (unsigned long long)x4);
     TEST_CHECK_(data == 0x80, "data=0x%x", data);
     OK(uc_close(uc));
 }
@@ -286,7 +433,8 @@ static void test_arm64_read_sctlr(void)
 static uint32_t test_arm64_hook_insn_mrs_count;
 
 static uint32_t test_arm64_hook_insn_mrs_cb(uc_engine *uc, uc_arm64_reg reg,
-                                       const uc_arm64_cp_reg *cp_reg)
+                                            const uc_arm64_cp_reg *cp_reg,
+                                            void *user_data)
 {
     uint64_t r_x2 = 0x114514;
 
@@ -338,6 +486,19 @@ static int test_arm64_hook_insn_wfi_callback(uc_engine *uc, void *user_data)
     return 0;
 }
 
+static uint32_t test_arm64_hook_insn_mrs_unrelated_callback(
+    uc_engine *uc, uc_arm64_reg reg, const uc_arm64_cp_reg *cp_reg,
+    void *user_data)
+{
+    WFI_HOOK_INSN_RESULT *result = (WFI_HOOK_INSN_RESULT *)user_data;
+
+    (void)uc;
+    (void)reg;
+    (void)cp_reg;
+    result->called = true;
+    return 0;
+}
+
 static void test_arm64_hook_insn_wfi(void)
 {
     uc_engine *uc;
@@ -352,8 +513,8 @@ static void test_arm64_hook_insn_wfi(void)
     OK(uc_hook_add(uc, &hook, UC_HOOK_INSN, test_arm64_hook_insn_wfi_callback, &result, 1, 0,
                    UC_ARM64_INS_WFI));
     OK(uc_hook_add(uc, &unrelated_hook, UC_HOOK_INSN,
-                   test_arm64_hook_insn_wfi_callback, &unrelated, 1, 0,
-                   UC_ARM64_INS_MRS));
+                   test_arm64_hook_insn_mrs_unrelated_callback, &unrelated,
+                   1, 0, UC_ARM64_INS_MRS));
 
     OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
     TEST_CHECK(result.called == true);
@@ -365,8 +526,8 @@ static void test_arm64_hook_insn_wfi(void)
 }
 
 static bool test_arm64_correct_address_in_small_jump_hook_callback(
-    uc_engine *uc, int type, uint64_t address, int size, int64_t value,
-    void *user_data)
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
 {
     // Check registers
     uint64_t r_x0 = 0x0;
@@ -413,8 +574,8 @@ static void test_arm64_correct_address_in_small_jump_hook(void)
 }
 
 static bool test_arm64_correct_address_in_long_jump_hook_callback(
-    uc_engine *uc, int type, uint64_t address, int size, int64_t value,
-    void *user_data)
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
 {
     // Check registers
     uint64_t r_x0 = 0x0;
@@ -500,12 +661,10 @@ static void test_arm64_block_sync_pc(void)
     OK(uc_close(uc));
 }
 
-static bool
-test_arm64_block_invalid_mem_read_write_sync_cb(uc_engine *uc, int type,
-                                                uint64_t address, int size,
-                                                int64_t value, void *user_data)
+static void test_arm64_block_invalid_mem_read_write_sync_cb(
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
 {
-    return 0;
 }
 
 static void test_arm64_block_invalid_mem_read_write_sync(void)
@@ -763,9 +922,9 @@ static void test_arm64_mem_prot_regress(void)
     OK(uc_close(uc));
 }
 
-static bool test_arm64_mem_read_write_cb(uc_engine *uc, int type,
-                                         uint64_t address, int size,
-                                         int64_t value, void *user_data)
+static void test_arm64_mem_read_write_cb(uc_engine *uc, uc_mem_type type,
+                                        uint64_t address, int size,
+                                        int64_t value, void *user_data)
 {
     uint64_t *count = (uint64_t *)user_data;
     switch (type) {
@@ -777,7 +936,6 @@ static bool test_arm64_mem_read_write_cb(uc_engine *uc, int type,
         break;
     }
 
-    return 0;
 }
 static void test_arm64_mem_hook_read_write(void)
 {
@@ -6987,6 +7145,112 @@ static void test_arm64_sme_context_save_restore(void)
     OK(uc_close(uc));
 }
 
+typedef struct Arm64IntrCapture {
+    uint32_t count;
+    uint32_t intno;
+} Arm64IntrCapture;
+
+static void test_arm64_context_debug_intr_cb(uc_engine *uc, uint32_t intno,
+                                             void *user_data)
+{
+    Arm64IntrCapture *capture = (Arm64IntrCapture *)user_data;
+
+    capture->count++;
+    capture->intno = intno;
+    uc_emu_stop(uc);
+}
+
+static void test_arm64_context_check_debug_state(uc_engine *uc,
+                                                 Arm64IntrCapture *capture)
+{
+    uc_hook hook;
+
+    OK(uc_hook_add(uc, &hook, UC_HOOK_INTR,
+                   test_arm64_context_debug_intr_cb, capture, 1, 0));
+
+    OK(uc_emu_start(uc, code_start + 20, code_start + 24, 0, 1));
+    TEST_CHECK_(capture->count == 1,
+                "breakpoint count=%u intno=%u", capture->count,
+                capture->intno);
+
+    capture->count = 0;
+    capture->intno = 0;
+    OK(uc_emu_start(uc, code_start + 24, code_start + 28, 0, 1));
+    TEST_CHECK_(capture->count == 1,
+                "watchpoint count=%u intno=%u", capture->count,
+                capture->intno);
+    OK(uc_hook_del(uc, hook));
+}
+
+static void test_arm64_context_debug_lifecycle(void)
+{
+    const uint32_t dbgbvr0_el1[5] = {2, 0, 0, 0, 4};
+    const uint32_t dbgbcr0_el1[5] = {2, 0, 0, 0, 5};
+    const uint32_t dbgwvr0_el1[5] = {2, 0, 0, 0, 6};
+    const uint32_t dbgwcr0_el1[5] = {2, 0, 0, 0, 7};
+    const uint32_t mdscr_el1[5] = {2, 0, 0, 2, 2};
+    const uint64_t breakpoint_address = code_start + 20;
+    const uint64_t watchpoint_address = code_start + 0x100;
+    const uint64_t breakpoint_control = 1U | (3U << 1) | (0xfU << 5);
+    const uint64_t watchpoint_control =
+        1U | (3U << 1) | (2U << 3) | (0xfU << 5);
+    const uint64_t mdscr = (1U << 15) | (1U << 13);
+    const uint64_t stored_value = 0x12345678;
+    const uint32_t pstate_el1h = 5;
+    Arm64IntrCapture capture = {0};
+    uc_engine *source;
+    uc_engine *destination;
+    uc_context *context;
+    uint8_t code[28];
+    uint64_t disabled = 0;
+
+    test_arm64_emit32(code, 0,
+                      test_arm64_msr_sysreg(0, dbgbvr0_el1));
+    test_arm64_emit32(code, 4,
+                      test_arm64_msr_sysreg(1, dbgbcr0_el1));
+    test_arm64_emit32(code, 8,
+                      test_arm64_msr_sysreg(2, dbgwvr0_el1));
+    test_arm64_emit32(code, 12,
+                      test_arm64_msr_sysreg(3, dbgwcr0_el1));
+    test_arm64_emit32(code, 16,
+                      test_arm64_msr_sysreg(4, mdscr_el1));
+    test_arm64_emit32(code, 20, 0xd503201f); /* nop */
+    test_arm64_emit32(code, 24, 0xb9000046); /* str w6, [x2] */
+
+    uc_common_setup(&source, UC_ARCH_ARM64, UC_MODE_ARM,
+                    (const char *)code, sizeof(code), UC_CPU_ARM64_MAX);
+    uc_common_setup(&destination, UC_ARCH_ARM64, UC_MODE_ARM,
+                    (const char *)code, sizeof(code), UC_CPU_ARM64_MAX);
+    OK(uc_reg_write(source, UC_ARM64_REG_PSTATE, &pstate_el1h));
+    OK(uc_reg_write(source, UC_ARM64_REG_X0, &breakpoint_address));
+    OK(uc_reg_write(source, UC_ARM64_REG_X1, &breakpoint_control));
+    OK(uc_reg_write(source, UC_ARM64_REG_X2, &watchpoint_address));
+    OK(uc_reg_write(source, UC_ARM64_REG_X3, &watchpoint_control));
+    OK(uc_reg_write(source, UC_ARM64_REG_X4, &mdscr));
+    OK(uc_reg_write(source, UC_ARM64_REG_X6, &stored_value));
+    OK(uc_emu_start(source, code_start, breakpoint_address, 0, 5));
+    test_arm64_context_check_debug_state(source, &capture);
+    capture = (Arm64IntrCapture){0};
+
+    OK(uc_context_alloc(source, &context));
+    OK(uc_context_save(source, context));
+
+    OK(uc_reg_write(source, UC_ARM64_REG_X1, &disabled));
+    OK(uc_emu_start(source, code_start + 4, code_start + 8, 0, 1));
+    OK(uc_reg_write(source, UC_ARM64_REG_X3, &disabled));
+    OK(uc_emu_start(source, code_start + 12, code_start + 16, 0, 1));
+    OK(uc_context_restore(source, context));
+    test_arm64_context_check_debug_state(source, &capture);
+
+    capture = (Arm64IntrCapture){0};
+    OK(uc_close(source));
+    OK(uc_context_restore(destination, context));
+    test_arm64_context_check_debug_state(destination, &capture);
+
+    OK(uc_context_free(context));
+    OK(uc_close(destination));
+}
+
 static void test_arm64_sme_mova_q_horizontal(void)
 {
     const uint32_t SMCR_EL1[5] = { 3, 0, 1, 2, 6 };
@@ -12106,7 +12370,7 @@ static void test_arm64_mte_dc_zva_original_fault_addr(void)
                             0, 0) == UC_ERR_WRITE_UNMAPPED);
     OK(uc_ctl_get_invalid_addr(uc, &invalid_addr));
     TEST_CHECK_(invalid_addr == 0x40020, "invalid_addr=0x%llx",
-                invalid_addr);
+                (unsigned long long)invalid_addr);
     OK(uc_close(uc));
 }
 
@@ -12618,206 +12882,183 @@ static void test_arm64_mte_requires_max(void)
     OK(uc_close(uc));
 }
 
-TEST_LIST = {{"test_arm64_until", test_arm64_until},
-             {"test_arm64_code_patching", test_arm64_code_patching},
-             {"test_arm64_code_patching_count", test_arm64_code_patching_count},
-             {"test_arm64_v8_cas", test_arm64_v8_cas},
-             {"test_arm64_lse_rcpc_unaligned",
-              test_arm64_lse_rcpc_unaligned},
-             {"test_arm64_lse_signed_minmax_byte",
-              test_arm64_lse_signed_minmax_byte},
-             {"test_arm64_lse_rcpc_id_registers",
-              test_arm64_lse_rcpc_id_registers},
-             {"test_arm64_lse_rcpc_a72_rejects",
-              test_arm64_lse_rcpc_a72_rejects},
-             {"test_arm64_dgh_hint", test_arm64_dgh_hint},
-             {"test_arm64_read_sctlr", test_arm64_read_sctlr},
-             {"test_arm64_eret_el1_to_el0", test_arm64_eret_el1_to_el0},
-             {"test_arm64_eret_illegal_spsr",
-              test_arm64_eret_illegal_spsr},
-             {"test_arm64_hook_insn_mrs", test_arm64_hook_insn_mrs},
-             {"test_arm64_hook_insn_wfi", test_arm64_hook_insn_wfi},
-             {"test_arm64_correct_address_in_small_jump_hook",
-              test_arm64_correct_address_in_small_jump_hook},
-             {"test_arm64_correct_address_in_long_jump_hook",
-              test_arm64_correct_address_in_long_jump_hook},
-             {"test_arm64_block_sync_pc", test_arm64_block_sync_pc},
-             {"test_arm64_block_invalid_mem_read_write_sync",
-              test_arm64_block_invalid_mem_read_write_sync},
-             {"test_arm64_mmu", test_arm64_mmu},
-             {"test_arm64_pc_wrap", test_arm64_pc_wrap},
-             {"test_arm64_mem_prot_regress", test_arm64_mem_prot_regress},
-             {"test_arm64_mem_hook_read_write", test_arm64_mem_hook_read_write},
-             {"test_arm64_pc_guarantee", test_arm64_pc_guarantee},
-             {"test_arm64_sve_id_registers", test_arm64_sve_id_registers},
-             {"test_arm64_sme_foundation", test_arm64_sme_foundation},
-             {"test_arm64_sme_svlength", test_arm64_sme_svlength},
-             {"test_arm64_sme_nonstreaming_sve_ffr",
-              test_arm64_sme_nonstreaming_sve_ffr},
-             {"test_arm64_sme_nonstreaming_sve_misc",
-              test_arm64_sme_nonstreaming_sve_misc},
-             {"test_arm64_sme_zero_mova", test_arm64_sme_zero_mova},
-             {"test_arm64_sme_context_save_restore",
-              test_arm64_sme_context_save_restore},
-             {"test_arm64_sme_mova_q_horizontal",
-              test_arm64_sme_mova_q_horizontal},
-             {"test_arm64_sme_adda", test_arm64_sme_adda},
-             {"test_arm64_sme_ldstr", test_arm64_sme_ldstr},
-             {"test_arm64_sme_ldst1", test_arm64_sme_ldst1},
-             {"test_arm64_sme_ldst1_fault_no_partial",
-              test_arm64_sme_ldst1_fault_no_partial},
-             {"test_arm64_sme_psel", test_arm64_sme_psel},
-             {"test_arm64_sme_ldst1_mte", test_arm64_sme_ldst1_mte},
-             {"test_arm64_sme_imopa", test_arm64_sme_imopa},
-             {"test_arm64_sme_fpout", test_arm64_sme_fpout},
-             {"test_arm64_advsimd_aes_sha256",
-              test_arm64_advsimd_aes_sha256},
-             {"test_arm64_advsimd_sha512_gating",
-              test_arm64_advsimd_sha512_gating},
-             {"test_arm64_i8mm_advsimd", test_arm64_i8mm_advsimd},
-             {"test_arm64_bf16_advsimd", test_arm64_bf16_advsimd},
-             {"test_arm64_pauth_vanilla", test_arm64_pauth_vanilla},
-             {"test_arm64_pauth_ctl", test_arm64_pauth_ctl},
-             {"test_arm64_mte_register_only", test_arm64_mte_register_only},
-             {"test_arm64_mte_ata_tag_generation",
-              test_arm64_mte_ata_tag_generation},
-             {"test_arm64_mte_tag_load_store",
-              test_arm64_mte_tag_load_store},
-             {"test_arm64_mte_tag_snapshot", test_arm64_mte_tag_snapshot},
-             {"test_arm64_mte_tag_multiple", test_arm64_mte_tag_multiple},
-             {"test_arm64_mte_checked_scalar_access",
-              test_arm64_mte_checked_scalar_access},
-             {"test_arm64_mte_tco_msr_imm",
-              test_arm64_mte_tco_msr_imm},
-             {"test_arm64_mte_simd_fp_single_access",
-              test_arm64_mte_simd_fp_single_access},
-             {"test_arm64_mte_advsimd_struct_range",
-              test_arm64_mte_advsimd_struct_range},
-             {"test_arm64_mte_lse_atomic_asym_sync_no_side_effect",
-              test_arm64_mte_lse_atomic_asym_sync_no_side_effect},
-             {"test_arm64_mte_ldapr_sync_tag_check",
-              test_arm64_mte_ldapr_sync_tag_check},
-             {"test_arm64_mte_lse_cas_asym_async_side_effect",
-              test_arm64_mte_lse_cas_asym_async_side_effect},
-             {"test_arm64_mte_exclusive_asym_access",
-              test_arm64_mte_exclusive_asym_access},
-             {"test_arm64_mte_sp_addressing_tagchecked",
-             test_arm64_mte_sp_addressing_tagchecked},
-             {"test_arm64_mte_sp_writeback_tagchecked",
-              test_arm64_mte_sp_writeback_tagchecked},
-             {"test_arm64_mte_pair_sp_tagchecked",
-              test_arm64_mte_pair_sp_tagchecked},
-             {"test_arm64_mte_pac_load_sp_tagchecked",
-              test_arm64_mte_pac_load_sp_tagchecked},
-             {"test_arm64_mte_tcma0_tag_zero_unchecked",
-              test_arm64_mte_tcma0_tag_zero_unchecked},
-             {"test_arm64_mte_ldapur_stlur_unchecked",
-              test_arm64_mte_ldapur_stlur_unchecked},
-             {"test_arm64_mte_ldapur_stlur_variants_unchecked",
-              test_arm64_mte_ldapur_stlur_variants_unchecked},
-             {"test_arm64_mte_unpriv_sp_no_tag_check",
-              test_arm64_mte_unpriv_sp_no_tag_check},
-             {"test_arm64_mte_unpriv_async_tag_check",
-              test_arm64_mte_unpriv_async_tag_check},
-             {"test_arm64_mte_page_attrs", test_arm64_mte_page_attrs},
-             {"test_arm64_bti_guarded_page", test_arm64_bti_guarded_page},
-             {"test_arm64_mte_hcr_dct", test_arm64_mte_hcr_dct},
-             {"test_arm64_mte_cross_page_fault_priority",
-              test_arm64_mte_cross_page_fault_priority},
-             {"test_arm64_mte_ata_disabled_tag_op_probe",
-              test_arm64_mte_ata_disabled_tag_op_probe},
-             {"test_arm64_sve2_non_temporal_gather_scatter",
-              test_arm64_sve2_non_temporal_gather_scatter},
-             {"test_arm64_sve2_bitwise_ternary",
-              test_arm64_sve2_bitwise_ternary},
-             {"test_arm64_sve2_xar", test_arm64_sve2_xar},
-             {"test_arm64_sve2_pmull", test_arm64_sve2_pmull},
-             {"test_arm64_sve2_mul_base", test_arm64_sve2_mul_base},
-             {"test_arm64_sve2_mul_indexed", test_arm64_sve2_mul_indexed},
-             {"test_arm64_sve2_widen_indexed",
-             test_arm64_sve2_widen_indexed},
-             {"test_arm64_sve2_widen_accumulate",
-             test_arm64_sve2_widen_accumulate},
-             {"test_arm64_sve2_abs_accumulate",
-             test_arm64_sve2_abs_accumulate},
-             {"test_arm64_sve2_cadd_sqcadd",
-              test_arm64_sve2_cadd_sqcadd},
-             {"test_arm64_sve2_sqrdmla", test_arm64_sve2_sqrdmla},
-             {"test_arm64_sve2_complex_dot",
-             test_arm64_sve2_complex_dot},
-             {"test_arm64_sve_i8mm", test_arm64_sve_i8mm},
-             {"test_arm64_sve_bf16", test_arm64_sve_bf16},
-             {"test_arm64_sve_f32mm_f64mm", test_arm64_sve_f32mm_f64mm},
-             {"test_arm64_sve2_fp_convert", test_arm64_sve2_fp_convert},
-             {"test_arm64_sve2_fp_pairwise_flogb",
-              test_arm64_sve2_fp_pairwise_flogb},
-             {"test_arm64_sve2_fmlal", test_arm64_sve2_fmlal},
-             {"test_arm64_sve2_widen_add_shift",
-              test_arm64_sve2_widen_add_shift},
-             {"test_arm64_sve2_addhn", test_arm64_sve2_addhn},
-             {"test_arm64_sve2_xtn", test_arm64_sve2_xtn},
-             {"test_arm64_sve2_shift_narrow",
-             test_arm64_sve2_shift_narrow},
-             {"test_arm64_sve2_shift_accumulate",
-              test_arm64_sve2_shift_accumulate},
-             {"test_arm64_sve2_shift_insert",
-              test_arm64_sve2_shift_insert},
-             {"test_arm64_sve2_sat_unary", test_arm64_sve2_sat_unary},
-             {"test_arm64_sve2_adalp", test_arm64_sve2_adalp},
-             {"test_arm64_sve2_halving_add_sub",
-              test_arm64_sve2_halving_add_sub},
-             {"test_arm64_sve2_pairwise_pred",
-              test_arm64_sve2_pairwise_pred},
-             {"test_arm64_sve2_saturating_add_sub",
-             test_arm64_sve2_saturating_add_sub},
-             {"test_arm64_sve2_int_estimate",
-              test_arm64_sve2_int_estimate},
-             {"test_arm64_sve2_variable_shift",
-              test_arm64_sve2_variable_shift},
-             {"test_arm64_sve2_eor_adcl", test_arm64_sve2_eor_adcl},
-             {"test_arm64_sve2_bitperm", test_arm64_sve2_bitperm},
-             {"test_arm64_sve2_match_hist", test_arm64_sve2_match_hist},
-             {"test_arm64_sve2_crypto", test_arm64_sve2_crypto},
-             {"test_arm64_sve2_ext", test_arm64_sve2_ext},
-             {"test_arm64_sve2_splice", test_arm64_sve2_splice},
-             {"test_arm64_sve2_tbl_tbx", test_arm64_sve2_tbl_tbx},
-             {"test_arm64_sve2_ld1ro", test_arm64_sve2_ld1ro},
-             {"test_arm64_mte_sve_contiguous_access",
-              test_arm64_mte_sve_contiguous_access},
-             {"test_arm64_mte_sve_gather_scatter_sizem1",
-              test_arm64_mte_sve_gather_scatter_sizem1},
-             {"test_arm64_mte_sve_whole_register_access",
-              test_arm64_mte_sve_whole_register_access},
-             {"test_arm64_sve_contiguous_store_fault_no_partial",
-              test_arm64_sve_contiguous_store_fault_no_partial},
-             {"test_arm64_sve_scatter_store_fault_no_partial",
-              test_arm64_sve_scatter_store_fault_no_partial},
-             {"test_arm64_sve_ldff1_split_first_element",
-              test_arm64_sve_ldff1_split_first_element},
-             {"test_arm64_sve_ldnf1_split_first_element",
-              test_arm64_sve_ldnf1_split_first_element},
-             {"test_arm64_mte_tag_split_lifecycle",
-              test_arm64_mte_tag_split_lifecycle},
-             {"test_arm64_mte_stgp", test_arm64_mte_stgp},
-             {"test_arm64_mte_dc_zva_checked",
-              test_arm64_mte_dc_zva_checked},
-             {"test_arm64_mte_dc_zva_original_fault_addr",
-              test_arm64_mte_dc_zva_original_fault_addr},
-             {"test_arm64_mte_dc_gva_gzva", test_arm64_mte_dc_gva_gzva},
-             {"test_arm64_mte_dc_gva_probe", test_arm64_mte_dc_gva_probe},
-             {"test_arm64_mte_cache_ops", test_arm64_mte_cache_ops},
-             {"test_arm64_generic_timer_state", test_arm64_generic_timer_state},
-             {"test_arm64_pmu_counter_delta", test_arm64_pmu_counter_delta},
-             {"test_arm64_pmu_pmuv3p5_event_counter",
-              test_arm64_pmu_pmuv3p5_event_counter},
-             {"test_arm64_pmu_el2_hlp_long_counter",
-             test_arm64_pmu_el2_hlp_long_counter},
-             {"test_arm64_pmu_el0_direct_counter_access",
-              test_arm64_pmu_el0_direct_counter_access},
-             {"test_arm64_pmu_effective_mdcr_el2",
-              test_arm64_pmu_effective_mdcr_el2},
-             {"test_arm64_pmu_pmcr_n_from_mdcr_el2",
-              test_arm64_pmu_pmcr_n_from_mdcr_el2},
-             {"test_arm64_vhe_el12_aliases", test_arm64_vhe_el12_aliases},
-             {"test_arm64_mte_requires_max", test_arm64_mte_requires_max},
-             {NULL, NULL}};
+TEST_LIST = {
+    {"test_arm64_until", test_arm64_until},
+    {"test_arm64_code_patching", test_arm64_code_patching},
+    {"test_arm64_code_patching_count", test_arm64_code_patching_count},
+    {"test_arm64_callback_active_tb_smc", test_arm64_callback_active_tb_smc},
+    {"test_arm64_guest_store_cached_tb_smc",
+     test_arm64_guest_store_cached_tb_smc},
+    {"test_arm64_guest_smc_cache_maintenance",
+     test_arm64_guest_smc_cache_maintenance},
+    {"test_arm64_v8_cas", test_arm64_v8_cas},
+    {"test_arm64_lse_rcpc_unaligned", test_arm64_lse_rcpc_unaligned},
+    {"test_arm64_lse_signed_minmax_byte", test_arm64_lse_signed_minmax_byte},
+    {"test_arm64_lse_rcpc_id_registers", test_arm64_lse_rcpc_id_registers},
+    {"test_arm64_lse_rcpc_a72_rejects", test_arm64_lse_rcpc_a72_rejects},
+    {"test_arm64_dgh_hint", test_arm64_dgh_hint},
+    {"test_arm64_read_sctlr", test_arm64_read_sctlr},
+    {"test_arm64_eret_el1_to_el0", test_arm64_eret_el1_to_el0},
+    {"test_arm64_eret_illegal_spsr", test_arm64_eret_illegal_spsr},
+    {"test_arm64_hook_insn_mrs", test_arm64_hook_insn_mrs},
+    {"test_arm64_hook_insn_wfi", test_arm64_hook_insn_wfi},
+    {"test_arm64_correct_address_in_small_jump_hook",
+     test_arm64_correct_address_in_small_jump_hook},
+    {"test_arm64_correct_address_in_long_jump_hook",
+     test_arm64_correct_address_in_long_jump_hook},
+    {"test_arm64_block_sync_pc", test_arm64_block_sync_pc},
+    {"test_arm64_block_invalid_mem_read_write_sync",
+     test_arm64_block_invalid_mem_read_write_sync},
+    {"test_arm64_mmu", test_arm64_mmu},
+    {"test_arm64_pc_wrap", test_arm64_pc_wrap},
+    {"test_arm64_mem_prot_regress", test_arm64_mem_prot_regress},
+    {"test_arm64_mem_hook_read_write", test_arm64_mem_hook_read_write},
+    {"test_arm64_pc_guarantee", test_arm64_pc_guarantee},
+    {"test_arm64_sve_id_registers", test_arm64_sve_id_registers},
+    {"test_arm64_sme_foundation", test_arm64_sme_foundation},
+    {"test_arm64_sme_svlength", test_arm64_sme_svlength},
+    {"test_arm64_sme_nonstreaming_sve_ffr",
+     test_arm64_sme_nonstreaming_sve_ffr},
+    {"test_arm64_sme_nonstreaming_sve_misc",
+     test_arm64_sme_nonstreaming_sve_misc},
+    {"test_arm64_sme_zero_mova", test_arm64_sme_zero_mova},
+    {"test_arm64_sme_context_save_restore",
+     test_arm64_sme_context_save_restore},
+    {"test_arm64_context_debug_lifecycle",
+     test_arm64_context_debug_lifecycle},
+    {"test_arm64_sme_mova_q_horizontal", test_arm64_sme_mova_q_horizontal},
+    {"test_arm64_sme_adda", test_arm64_sme_adda},
+    {"test_arm64_sme_ldstr", test_arm64_sme_ldstr},
+    {"test_arm64_sme_ldst1", test_arm64_sme_ldst1},
+    {"test_arm64_sme_ldst1_fault_no_partial",
+     test_arm64_sme_ldst1_fault_no_partial},
+    {"test_arm64_sme_psel", test_arm64_sme_psel},
+    {"test_arm64_sme_ldst1_mte", test_arm64_sme_ldst1_mte},
+    {"test_arm64_sme_imopa", test_arm64_sme_imopa},
+    {"test_arm64_sme_fpout", test_arm64_sme_fpout},
+    {"test_arm64_advsimd_aes_sha256", test_arm64_advsimd_aes_sha256},
+    {"test_arm64_advsimd_sha512_gating", test_arm64_advsimd_sha512_gating},
+    {"test_arm64_i8mm_advsimd", test_arm64_i8mm_advsimd},
+    {"test_arm64_bf16_advsimd", test_arm64_bf16_advsimd},
+    {"test_arm64_pauth_vanilla", test_arm64_pauth_vanilla},
+    {"test_arm64_pauth_ctl", test_arm64_pauth_ctl},
+    {"test_arm64_mte_register_only", test_arm64_mte_register_only},
+    {"test_arm64_mte_ata_tag_generation", test_arm64_mte_ata_tag_generation},
+    {"test_arm64_mte_tag_load_store", test_arm64_mte_tag_load_store},
+    {"test_arm64_mte_tag_snapshot", test_arm64_mte_tag_snapshot},
+    {"test_arm64_mte_tag_multiple", test_arm64_mte_tag_multiple},
+    {"test_arm64_mte_checked_scalar_access",
+     test_arm64_mte_checked_scalar_access},
+    {"test_arm64_mte_tco_msr_imm", test_arm64_mte_tco_msr_imm},
+    {"test_arm64_mte_simd_fp_single_access",
+     test_arm64_mte_simd_fp_single_access},
+    {"test_arm64_mte_advsimd_struct_range",
+     test_arm64_mte_advsimd_struct_range},
+    {"test_arm64_mte_lse_atomic_asym_sync_no_side_effect",
+     test_arm64_mte_lse_atomic_asym_sync_no_side_effect},
+    {"test_arm64_mte_ldapr_sync_tag_check",
+     test_arm64_mte_ldapr_sync_tag_check},
+    {"test_arm64_mte_lse_cas_asym_async_side_effect",
+     test_arm64_mte_lse_cas_asym_async_side_effect},
+    {"test_arm64_mte_exclusive_asym_access",
+     test_arm64_mte_exclusive_asym_access},
+    {"test_arm64_mte_sp_addressing_tagchecked",
+     test_arm64_mte_sp_addressing_tagchecked},
+    {"test_arm64_mte_sp_writeback_tagchecked",
+     test_arm64_mte_sp_writeback_tagchecked},
+    {"test_arm64_mte_pair_sp_tagchecked", test_arm64_mte_pair_sp_tagchecked},
+    {"test_arm64_mte_pac_load_sp_tagchecked",
+     test_arm64_mte_pac_load_sp_tagchecked},
+    {"test_arm64_mte_tcma0_tag_zero_unchecked",
+     test_arm64_mte_tcma0_tag_zero_unchecked},
+    {"test_arm64_mte_ldapur_stlur_unchecked",
+     test_arm64_mte_ldapur_stlur_unchecked},
+    {"test_arm64_mte_ldapur_stlur_variants_unchecked",
+     test_arm64_mte_ldapur_stlur_variants_unchecked},
+    {"test_arm64_mte_unpriv_sp_no_tag_check",
+     test_arm64_mte_unpriv_sp_no_tag_check},
+    {"test_arm64_mte_unpriv_async_tag_check",
+     test_arm64_mte_unpriv_async_tag_check},
+    {"test_arm64_mte_page_attrs", test_arm64_mte_page_attrs},
+    {"test_arm64_bti_guarded_page", test_arm64_bti_guarded_page},
+    {"test_arm64_mte_hcr_dct", test_arm64_mte_hcr_dct},
+    {"test_arm64_mte_cross_page_fault_priority",
+     test_arm64_mte_cross_page_fault_priority},
+    {"test_arm64_mte_ata_disabled_tag_op_probe",
+     test_arm64_mte_ata_disabled_tag_op_probe},
+    {"test_arm64_sve2_non_temporal_gather_scatter",
+     test_arm64_sve2_non_temporal_gather_scatter},
+    {"test_arm64_sve2_bitwise_ternary", test_arm64_sve2_bitwise_ternary},
+    {"test_arm64_sve2_xar", test_arm64_sve2_xar},
+    {"test_arm64_sve2_pmull", test_arm64_sve2_pmull},
+    {"test_arm64_sve2_mul_base", test_arm64_sve2_mul_base},
+    {"test_arm64_sve2_mul_indexed", test_arm64_sve2_mul_indexed},
+    {"test_arm64_sve2_widen_indexed", test_arm64_sve2_widen_indexed},
+    {"test_arm64_sve2_widen_accumulate", test_arm64_sve2_widen_accumulate},
+    {"test_arm64_sve2_abs_accumulate", test_arm64_sve2_abs_accumulate},
+    {"test_arm64_sve2_cadd_sqcadd", test_arm64_sve2_cadd_sqcadd},
+    {"test_arm64_sve2_sqrdmla", test_arm64_sve2_sqrdmla},
+    {"test_arm64_sve2_complex_dot", test_arm64_sve2_complex_dot},
+    {"test_arm64_sve_i8mm", test_arm64_sve_i8mm},
+    {"test_arm64_sve_bf16", test_arm64_sve_bf16},
+    {"test_arm64_sve_f32mm_f64mm", test_arm64_sve_f32mm_f64mm},
+    {"test_arm64_sve2_fp_convert", test_arm64_sve2_fp_convert},
+    {"test_arm64_sve2_fp_pairwise_flogb", test_arm64_sve2_fp_pairwise_flogb},
+    {"test_arm64_sve2_fmlal", test_arm64_sve2_fmlal},
+    {"test_arm64_sve2_widen_add_shift", test_arm64_sve2_widen_add_shift},
+    {"test_arm64_sve2_addhn", test_arm64_sve2_addhn},
+    {"test_arm64_sve2_xtn", test_arm64_sve2_xtn},
+    {"test_arm64_sve2_shift_narrow", test_arm64_sve2_shift_narrow},
+    {"test_arm64_sve2_shift_accumulate", test_arm64_sve2_shift_accumulate},
+    {"test_arm64_sve2_shift_insert", test_arm64_sve2_shift_insert},
+    {"test_arm64_sve2_sat_unary", test_arm64_sve2_sat_unary},
+    {"test_arm64_sve2_adalp", test_arm64_sve2_adalp},
+    {"test_arm64_sve2_halving_add_sub", test_arm64_sve2_halving_add_sub},
+    {"test_arm64_sve2_pairwise_pred", test_arm64_sve2_pairwise_pred},
+    {"test_arm64_sve2_saturating_add_sub", test_arm64_sve2_saturating_add_sub},
+    {"test_arm64_sve2_int_estimate", test_arm64_sve2_int_estimate},
+    {"test_arm64_sve2_variable_shift", test_arm64_sve2_variable_shift},
+    {"test_arm64_sve2_eor_adcl", test_arm64_sve2_eor_adcl},
+    {"test_arm64_sve2_bitperm", test_arm64_sve2_bitperm},
+    {"test_arm64_sve2_match_hist", test_arm64_sve2_match_hist},
+    {"test_arm64_sve2_crypto", test_arm64_sve2_crypto},
+    {"test_arm64_sve2_ext", test_arm64_sve2_ext},
+    {"test_arm64_sve2_splice", test_arm64_sve2_splice},
+    {"test_arm64_sve2_tbl_tbx", test_arm64_sve2_tbl_tbx},
+    {"test_arm64_sve2_ld1ro", test_arm64_sve2_ld1ro},
+    {"test_arm64_mte_sve_contiguous_access",
+     test_arm64_mte_sve_contiguous_access},
+    {"test_arm64_mte_sve_gather_scatter_sizem1",
+     test_arm64_mte_sve_gather_scatter_sizem1},
+    {"test_arm64_mte_sve_whole_register_access",
+     test_arm64_mte_sve_whole_register_access},
+    {"test_arm64_sve_contiguous_store_fault_no_partial",
+     test_arm64_sve_contiguous_store_fault_no_partial},
+    {"test_arm64_sve_scatter_store_fault_no_partial",
+     test_arm64_sve_scatter_store_fault_no_partial},
+    {"test_arm64_sve_ldff1_split_first_element",
+     test_arm64_sve_ldff1_split_first_element},
+    {"test_arm64_sve_ldnf1_split_first_element",
+     test_arm64_sve_ldnf1_split_first_element},
+    {"test_arm64_mte_tag_split_lifecycle", test_arm64_mte_tag_split_lifecycle},
+    {"test_arm64_mte_stgp", test_arm64_mte_stgp},
+    {"test_arm64_mte_dc_zva_checked", test_arm64_mte_dc_zva_checked},
+    {"test_arm64_mte_dc_zva_original_fault_addr",
+     test_arm64_mte_dc_zva_original_fault_addr},
+    {"test_arm64_mte_dc_gva_gzva", test_arm64_mte_dc_gva_gzva},
+    {"test_arm64_mte_dc_gva_probe", test_arm64_mte_dc_gva_probe},
+    {"test_arm64_mte_cache_ops", test_arm64_mte_cache_ops},
+    {"test_arm64_generic_timer_state", test_arm64_generic_timer_state},
+    {"test_arm64_pmu_counter_delta", test_arm64_pmu_counter_delta},
+    {"test_arm64_pmu_pmuv3p5_event_counter",
+     test_arm64_pmu_pmuv3p5_event_counter},
+    {"test_arm64_pmu_el2_hlp_long_counter",
+     test_arm64_pmu_el2_hlp_long_counter},
+    {"test_arm64_pmu_el0_direct_counter_access",
+     test_arm64_pmu_el0_direct_counter_access},
+    {"test_arm64_pmu_effective_mdcr_el2", test_arm64_pmu_effective_mdcr_el2},
+    {"test_arm64_pmu_pmcr_n_from_mdcr_el2",
+     test_arm64_pmu_pmcr_n_from_mdcr_el2},
+    {"test_arm64_vhe_el12_aliases", test_arm64_vhe_el12_aliases},
+    {"test_arm64_mte_requires_max", test_arm64_mte_requires_max},
+    {NULL, NULL}};

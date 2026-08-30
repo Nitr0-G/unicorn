@@ -26,7 +26,7 @@ static uint64_t DATABASE = 0x40000000;
 static uint64_t BLOCKSIZE = 0x10000;
 static size_t NRUNS = 200;
 
-static int callback_mem_prot(uc_engine *uc, uc_mem_type type, uint64_t addr, uint32_t size, int64_t value, void *data)
+static bool callback_mem_prot(uc_engine *uc, uc_mem_type type, uint64_t addr, int size, int64_t value, void *data)
 {
     printf("callback mem prot: 0x%lX, type: %X\n", addr, type);
     return false;

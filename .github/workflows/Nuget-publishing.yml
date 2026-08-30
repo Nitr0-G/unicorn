@@ -31,9 +31,6 @@ on:
 permissions:
   packages: write
 
-env:
-  CTEST_PARALLEL_LEVEL: 40
-
 jobs:
   Windows:
     runs-on: ${{ matrix.config.os }}
@@ -67,6 +64,11 @@ jobs:
         compiler: [ gcc ]
     steps:
       - uses: actions/checkout@v4
+      - name: 'Determine test parallelism'
+        shell: pwsh
+        run: |
+          "CTEST_PARALLEL_LEVEL=$([Environment]::ProcessorCount)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: '🛠️ Win MSVC 64 setup'
         if: contains(matrix.config.name, 'MSVC 64')
@@ -96,7 +98,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ matrix.config.build_type }}
           cmake --install . --strip --config ${{ matrix.config.build_type }}
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ matrix.config.build_type }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" -VV -C ${{ matrix.config.build_type }}
           # vctip.exe (MSVC telemetry) and antivirus scans may transiently hold
           # handles inside the build directory and make the rename fail, so
           # retry for a while, killing vctip on each attempt
@@ -133,7 +135,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ matrix.config.build_type }}
           cmake --install . --strip --config ${{ matrix.config.build_type }}
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ matrix.config.build_type }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" -VV -C ${{ matrix.config.build_type }}
           # vctip.exe (MSVC telemetry) and antivirus scans may transiently hold
           # handles inside the build directory and make the rename fail, so
           # retry for a while, killing vctip on each attempt
@@ -180,6 +182,9 @@ jobs:
         compiler: [ gcc ]
     steps:
       - uses: actions/checkout@v4
+      - name: 'Determine test parallelism'
+        shell: bash
+        run: echo "CTEST_PARALLEL_LEVEL=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
 
       - name: '🚧 Mac build'
         if: contains(matrix.config.name, 'macos-x64')
@@ -198,7 +203,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ matrix.config.build_type }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ matrix.config.build_type }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" -VV -C ${{ matrix.config.build_type }}
 
       - name: '📦 Pack artifact'
         if: always()
@@ -265,6 +270,9 @@ jobs:
         compiler: [ gcc ]
     steps:
       - uses: actions/checkout@v4
+      - name: 'Determine test parallelism'
+        shell: bash
+        run: echo "CTEST_PARALLEL_LEVEL=$(getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
 
       - name: '🚧 Linux x64/x86 build'
         if: contains(matrix.config.arch, 'x64') || contains(matrix.config.arch, 'x86')
@@ -291,7 +299,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ matrix.config.build_type }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ matrix.config.build_type }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" -VV -C ${{ matrix.config.build_type }}
 
       - name: '🚧 Linux aarch64 build'
         if: contains(matrix.config.arch, 'aarch64')
@@ -309,7 +317,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX:PATH=instdir
           cmake --build . --config ${{ matrix.config.build_type }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ matrix.config.build_type }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" -VV -C ${{ matrix.config.build_type }}
 
       - name: '🚧 Linux ppc64le build'
         if: contains(matrix.config.arch, 'ppc64le')
@@ -335,7 +343,7 @@ jobs:
               -DCMAKE_INSTALL_PREFIX:PATH=/instdir
             cmake --build . --config ${{ matrix.config.build_type }}
             cmake --install . --strip
-            ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} -VV -C ${{ matrix.config.build_type }}
+            ctest --parallel "$(getconf _NPROCESSORS_ONLN)" -VV -C ${{ matrix.config.build_type }}
 
       - name: '📦 Pack artifact'
         if: always()

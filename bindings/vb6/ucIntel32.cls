@@ -643,7 +643,7 @@ Function saveContext() As Long
     
     If e <> uc_err_ok Then
         errMsg = err2str(e)
-        e = ucs_free(hContext)
+        e = ucs_context_free(hContext)
         If e <> uc_err_ok Then errMsg = errMsg & " error freeing context: " & err2str(e)
         Exit Function
     End If
@@ -670,7 +670,7 @@ End Function
 
 Function freeContext(hContext As Long) As Boolean
     Dim e As uc_err
-    e = ucs_free(hContext)
+    e = ucs_context_free(hContext)
     If e <> uc_err_ok Then
         errMsg = err2str(e)
     Else

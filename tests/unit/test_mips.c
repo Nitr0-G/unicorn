@@ -14,6 +14,14 @@ const uint64_t code_len = 0x4000;
 #define MIPS_CP0_STATUS_CU1 (1u << 29)
 #define MIPS_CP0_STATUS_MX (1u << 24)
 
+#define MIPS_MSACSR_RM_UP 2u
+#define MIPS_MSACSR_FLAG_INEXACT (1u << 2)
+#define MIPS_MSACSR_CAUSE_INEXACT (1u << 12)
+#define MIPS_MSACSR_FS (1u << 24)
+
+#define MIPS_FCSR_RM_DOWN 3u
+#define MIPS_FCSR_FS (1u << 24)
+
 static uint32_t mips_bitswap32(uint32_t value)
 {
     value = ((value >> 1) & 0x55555555) | ((value & 0x55555555) << 1);
@@ -162,6 +170,55 @@ static void test_mips_stop_at_delay_slot(void)
     OK(uc_close(uc));
 }
 
+typedef struct MipsDelaySlotStop {
+    uc_err error;
+    uint32_t calls;
+} MipsDelaySlotStop;
+
+static void mips_delay_slot_stop_cb(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data)
+{
+    MipsDelaySlotStop *stop = (MipsDelaySlotStop *)user_data;
+
+    stop->calls++;
+    stop->error = uc_emu_stop(uc);
+}
+
+static void test_mips_delay_slot_pending_stop(void)
+{
+    const uint8_t code[] = {
+        0x01, 0x00, 0x00, 0x10, /* beq $zero,$zero,code_start + 8 */
+        0x01, 0x00, 0x42, 0x24, /* addiu $v0,$v0,1 */
+        0x01, 0x00, 0x63, 0x24, /* addiu $v1,$v1,1 */
+    };
+    MipsDelaySlotStop stop = {0};
+    uint32_t pc;
+    uint32_t v0 = 0;
+    uint32_t v1 = 0;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_MIPS,
+                    UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN,
+                    (const char *)code, sizeof(code));
+    OK(uc_reg_write(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_V1, &v1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, mips_delay_slot_stop_cb,
+                   &stop, code_start + 4, code_start + 4));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(stop.error);
+    OK(uc_reg_read(uc, UC_MIPS_REG_PC, &pc));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    TEST_CHECK(stop.calls == 1);
+    TEST_CHECK_(pc == code_start + 8, "pc=0x%x", pc);
+    TEST_CHECK(v0 == 1);
+    TEST_CHECK(v1 == 0);
+
+    OK(uc_close(uc));
+}
+
 typedef struct MipsCodeTrace {
     uint64_t address[3];
     uint32_t size[3];
@@ -181,6 +238,15 @@ static void mips_code_trace_hook(uc_engine *uc, uint64_t address,
     trace->count++;
 }
 
+static void mips_fetch_trace_hook(uc_engine *uc, uc_mem_type type,
+                                  uint64_t address, int size, int64_t value,
+                                  void *user_data)
+{
+    TEST_CHECK(type == UC_MEM_FETCH);
+    TEST_CHECK(value == 0);
+    mips_code_trace_hook(uc, address, size, user_data);
+}
+
 static void test_mips_not_taken_branch_likely_code_hook(void)
 {
     const uint32_t code[] = {
@@ -188,10 +254,13 @@ static void test_mips_not_taken_branch_likely_code_hook(void)
         BEINT32(0x24420001), /* addiu v0, v0, 1 */
         BEINT32(0x24630001), /* addiu v1, v1, 1 */
     };
-    MipsCodeTrace trace = { 0 };
+    MipsCodeTrace code_trace = { 0 };
+    MipsCodeTrace fetch_trace = { 0 };
     uc_engine *uc;
-    uc_hook hook;
+    uc_hook code_hook;
+    uc_hook fetch_hook;
     uint32_t equal = 0x12345678;
+    uint32_t unequal = 0;
     uint32_t v0 = 0;
     uint32_t v1 = 0;
 
@@ -200,8 +269,10 @@ static void test_mips_not_taken_branch_likely_code_hook(void)
                     (const char *)code, sizeof(code));
     OK(uc_reg_write(uc, UC_MIPS_REG_T0, &equal));
     OK(uc_reg_write(uc, UC_MIPS_REG_T1, &equal));
-    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, mips_code_trace_hook, &trace,
-                   1, 0));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE, mips_code_trace_hook,
+                   &code_trace, 1, 0));
+    OK(uc_hook_add(uc, &fetch_hook, UC_HOOK_MEM_FETCH,
+                   mips_fetch_trace_hook, &fetch_trace, 1, 0));
 
     OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
 
@@ -209,13 +280,218 @@ static void test_mips_not_taken_branch_likely_code_hook(void)
     OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
     TEST_CHECK(v0 == 0);
     TEST_CHECK(v1 == 1);
-    TEST_CHECK_(trace.count == 2, "trace.count=%u", trace.count);
-    TEST_CHECK(trace.address[0] == code_start);
-    TEST_CHECK_(trace.address[1] == code_start + 8,
-                "trace.address[1]=0x%llx",
-                (unsigned long long)trace.address[1]);
-    TEST_CHECK(trace.size[0] == 4);
-    TEST_CHECK(trace.size[1] == 4);
+    TEST_CHECK_(code_trace.count == 2, "code_trace.count=%u",
+                code_trace.count);
+    TEST_CHECK(code_trace.address[0] == code_start);
+    TEST_CHECK(code_trace.address[1] == code_start + 8);
+    TEST_CHECK(code_trace.size[0] == 4);
+    TEST_CHECK(code_trace.size[1] == 4);
+    TEST_CHECK_(fetch_trace.count == 2, "fetch_trace.count=%u",
+                fetch_trace.count);
+    TEST_CHECK(fetch_trace.address[0] == code_start);
+    TEST_CHECK(fetch_trace.address[1] == code_start + 8);
+    TEST_CHECK(fetch_trace.size[0] == 4);
+    TEST_CHECK(fetch_trace.size[1] == 4);
+
+    memset(&code_trace, 0, sizeof(code_trace));
+    memset(&fetch_trace, 0, sizeof(fetch_trace));
+    v0 = 0;
+    v1 = 0;
+    OK(uc_reg_write(uc, UC_MIPS_REG_T1, &unequal));
+    OK(uc_reg_write(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_V1, &v1));
+
+    /* Reuse the cached TB and take the branch-likely delay slot. */
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    TEST_CHECK(v0 == 1);
+    TEST_CHECK(v1 == 1);
+    TEST_CHECK(code_trace.count == 3);
+    TEST_CHECK(fetch_trace.count == 3);
+    for (uint32_t i = 0; i < 3; i++) {
+        TEST_CHECK(code_trace.address[i] == code_start + i * 4);
+        TEST_CHECK(fetch_trace.address[i] == code_start + i * 4);
+        TEST_CHECK(code_trace.size[i] == 4);
+        TEST_CHECK(fetch_trace.size[i] == 4);
+    }
+
+    OK(uc_hook_del(uc, fetch_hook));
+    OK(uc_hook_del(uc, code_hook));
+    OK(uc_close(uc));
+}
+
+typedef struct MipsDelaySlotCallbackSmc {
+    uint64_t patch_address;
+    uint64_t address[3];
+    uint32_t pc[3];
+    uint32_t size[3];
+    uint32_t replacement;
+    uint32_t count;
+    uc_err read_error;
+    uc_err write_error;
+    bool patched;
+} MipsDelaySlotCallbackSmc;
+
+static void mips_delay_slot_callback_smc_hook(uc_engine *uc,
+                                               uint64_t address,
+                                               uint32_t size, void *user_data)
+{
+    MipsDelaySlotCallbackSmc *smc =
+        (MipsDelaySlotCallbackSmc *)user_data;
+    uint32_t index = smc->count;
+    uint32_t pc = 0;
+    uc_err err;
+
+    err = uc_reg_read(uc, UC_MIPS_REG_PC, &pc);
+    if (smc->read_error == UC_ERR_OK) {
+        smc->read_error = err;
+    }
+    if (index < 3) {
+        smc->address[index] = address;
+        smc->pc[index] = pc;
+        smc->size[index] = size;
+    }
+    smc->count++;
+
+    if (smc->count == 2) {
+        smc->patched = true;
+        smc->write_error =
+            uc_mem_write(uc, smc->patch_address, &smc->replacement,
+                         sizeof(smc->replacement));
+    }
+}
+
+static void test_mips_big_endian_delay_slot_callback_smc(void)
+{
+    const uint32_t code[] = {
+        BEINT32(0x10000001), /* beq zero,zero,+1 */
+        BEINT32(0x24020001), /* addiu v0,zero,1 */
+        BEINT32(0x24030003), /* addiu v1,zero,3 */
+    };
+    MipsDelaySlotCallbackSmc smc = {
+        .patch_address = code_start + 4,
+        .replacement = BEINT32(0x24020002), /* addiu v0,zero,2 */
+        .read_error = UC_ERR_OK,
+        .write_error = UC_ERR_OK,
+    };
+    uc_engine *uc;
+    uc_hook hook;
+    uint32_t stored = 0;
+    uint32_t v0 = 0;
+    uint32_t v1 = 0;
+    uint32_t i;
+
+    uc_common_setup(&uc, UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   mips_delay_slot_callback_smc_hook, &smc, code_start,
+                   code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    OK(smc.read_error);
+    TEST_CHECK(!smc.patched);
+    TEST_CHECK_(smc.count == 1, "first count=%u", smc.count);
+    TEST_CHECK_(smc.address[0] == code_start, "first address=0x%llx",
+                (unsigned long long)smc.address[0]);
+    TEST_CHECK_(smc.pc[0] == code_start, "first pc=0x%x", smc.pc[0]);
+    TEST_CHECK_(smc.size[0] == 4, "first size=%u", smc.size[0]);
+    TEST_CHECK_(v0 == 1, "first v0=0x%x", v0);
+    TEST_CHECK_(v1 == 3, "first v1=0x%x", v1);
+
+    v0 = 0;
+    v1 = 0;
+    OK(uc_reg_write(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_V1, &v1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(smc.read_error);
+    OK(smc.write_error);
+    OK(uc_mem_read(uc, smc.patch_address, &stored, sizeof(stored)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    TEST_CHECK(smc.patched);
+    TEST_CHECK_(smc.count == 3, "final count=%u", smc.count);
+    for (i = 0; i < 3; i++) {
+        TEST_CHECK_(smc.address[i] == code_start,
+                    "address[%u]=0x%llx", i,
+                    (unsigned long long)smc.address[i]);
+        TEST_CHECK_(smc.pc[i] == code_start, "pc[%u]=0x%x", i, smc.pc[i]);
+        TEST_CHECK_(smc.size[i] == 4, "size[%u]=%u", i, smc.size[i]);
+    }
+    TEST_CHECK_(stored == smc.replacement, "stored=0x%08x", stored);
+    TEST_CHECK_(v0 == 2, "second v0=0x%x", v0);
+    TEST_CHECK_(v1 == 3, "second v1=0x%x", v1);
+
+    OK(uc_close(uc));
+}
+
+typedef struct MipsDelaySlotMemoryTrace {
+    uint64_t address;
+    uint64_t pc;
+    int size;
+    int64_t value;
+    uint32_t count;
+    uc_err read_error;
+} MipsDelaySlotMemoryTrace;
+
+static void mips_delay_slot_memory_hook(uc_engine *uc, uc_mem_type type,
+                                        uint64_t address, int size,
+                                        int64_t value, void *user_data)
+{
+    MipsDelaySlotMemoryTrace *trace = (MipsDelaySlotMemoryTrace *)user_data;
+    uint32_t pc = 0;
+
+    (void)type;
+    trace->read_error = uc_reg_read(uc, UC_MIPS_REG_PC, &pc);
+    trace->address = address;
+    trace->pc = pc;
+    trace->size = size;
+    trace->value = value;
+    trace->count++;
+}
+
+static void test_mips_big_endian_delay_slot_memory_hook_pc(void)
+{
+    const uint32_t code[] = {
+        BEINT32(0x10000001), /* beq zero,zero,+1 */
+        BEINT32(0xad090000), /* sw t1,0(t0) */
+        BEINT32(0x24020007), /* addiu v0,zero,7 */
+    };
+    const uint64_t data_address = code_start + 0x2000;
+    MipsDelaySlotMemoryTrace trace = {.read_error = UC_ERR_OK};
+    uc_engine *uc;
+    uc_hook hook;
+    uint32_t t0 = (uint32_t)data_address;
+    uint32_t t1 = 0x11223344;
+    uint32_t stored = 0;
+    uint32_t v0 = 0;
+
+    uc_common_setup(&uc, UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &t0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T1, &t1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE, mips_delay_slot_memory_hook,
+                   &trace, data_address, data_address + sizeof(stored) - 1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(trace.read_error);
+    OK(uc_mem_read(uc, data_address, &stored, sizeof(stored)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    TEST_CHECK_(trace.count == 1, "trace.count=%u", trace.count);
+    TEST_CHECK(trace.address == data_address);
+    TEST_CHECK_(trace.pc == code_start + 4, "trace.pc=0x%llx",
+                (unsigned long long)trace.pc);
+    TEST_CHECK(trace.size == 4);
+    TEST_CHECK((uint32_t)trace.value == t1);
+    TEST_CHECK(stored == BEINT32(t1));
+    TEST_CHECK(v0 == 7);
 
     OK(uc_close(uc));
 }
@@ -488,6 +764,305 @@ static void test_mips_msa_addv_b(void)
     OK(uc_close(uc));
 }
 
+static void test_mips_msa_branch_delay_slot(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0x40888005), /* mtc0 t0,Config5,5 */
+        LEINT32(0x45610002), /* bz.v w1,+2 */
+        LEINT32(0x24020001), /* addiu v0,zero,1 */
+        LEINT32(0x24030002), /* addiu v1,zero,2 */
+        LEINT32(0x24040003), /* addiu a0,zero,3 */
+    };
+    const uint8_t zero[16] = {0};
+    const uint8_t nonzero[16] = {1};
+    uc_engine *uc;
+    uint32_t status;
+    uint32_t config5 = 1u << 27;
+    uint32_t v0 = 0;
+    uint32_t v1 = 0;
+    uint32_t a0 = 0;
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= MIPS_CP0_STATUS_CU1 | MIPS_CP0_STATUS_FR;
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &config5));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W1, zero));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    OK(uc_reg_read(uc, UC_MIPS_REG_A0, &a0));
+    TEST_CHECK(v0 == 1);
+    TEST_CHECK(v1 == 0);
+    TEST_CHECK(a0 == 3);
+
+    v0 = 0;
+    v1 = 0;
+    a0 = 0;
+    OK(uc_reg_write(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_V1, &v1));
+    OK(uc_reg_write(uc, UC_MIPS_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W1, nonzero));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &config5));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_V0, &v0));
+    OK(uc_reg_read(uc, UC_MIPS_REG_V1, &v1));
+    OK(uc_reg_read(uc, UC_MIPS_REG_A0, &a0));
+    TEST_CHECK(v0 == 1);
+    TEST_CHECK(v1 == 2);
+    TEST_CHECK(a0 == 3);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_msa_saturation(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0x40888005), /* mtc0 t0,Config5,5 */
+        LEINT32(0x790208d0), /* adds_s.b w3,w1,w2 */
+        LEINT32(0x7873090a), /* sat_s.b w4,w1,3 */
+    };
+    const uint8_t lhs[16] = {
+        0x78, 0x88, 0x7f, 0x80, 0x06, 0xfa, 0x08, 0xf8,
+        0x01, 0xff, 0x40, 0xc0, 0x7e, 0x82, 0x00, 0x80,
+    };
+    const uint8_t rhs[16] = {
+        0x14, 0xec, 0x01, 0xff, 0x03, 0xfd, 0x01, 0xff,
+        0x02, 0xfe, 0x40, 0xc0, 0x01, 0xff, 0x7f, 0x80,
+    };
+    const uint8_t expected_add[16] = {
+        0x7f, 0x80, 0x7f, 0x80, 0x09, 0xf7, 0x09, 0xf7,
+        0x03, 0xfd, 0x7f, 0x80, 0x7f, 0x81, 0x7f, 0x80,
+    };
+    const uint8_t expected_sat[16] = {
+        0x07, 0xf8, 0x07, 0xf8, 0x06, 0xfa, 0x07, 0xf8,
+        0x01, 0xff, 0x07, 0xf8, 0x07, 0xf8, 0x00, 0xf8,
+    };
+    uint8_t add_result[16] = {0};
+    uint8_t sat_result[16] = {0};
+    uc_engine *uc;
+    uint32_t status;
+    uint32_t config5 = 1u << 27;
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= MIPS_CP0_STATUS_CU1 | MIPS_CP0_STATUS_FR;
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &config5));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W1, lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W2, rhs));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_W3, add_result));
+    OK(uc_reg_read(uc, UC_MIPS_REG_W4, sat_result));
+    TEST_CHECK(memcmp(add_result, expected_add, sizeof(expected_add)) == 0);
+    TEST_CHECK(memcmp(sat_result, expected_sat, sizeof(expected_sat)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_msa_fp_nan_compare(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0x40888005), /* mtc0 t0,Config5,5 */
+        LEINT32(0x7882095a), /* fceq.w w5,w1,w2 */
+        LEINT32(0x7842099a), /* fcun.w w6,w1,w2 */
+    };
+    const uint32_t lhs[4] = {
+        0x3f800000,
+        0x7fc00000,
+        0x80000000,
+        0x40000000,
+    };
+    const uint32_t rhs[4] = {
+        0x3f800000,
+        0x3f800000,
+        0x00000000,
+        0x40400000,
+    };
+    const uint32_t expected_equal[4] = {
+        UINT32_MAX,
+        0,
+        UINT32_MAX,
+        0,
+    };
+    const uint32_t expected_unordered[4] = {
+        0,
+        UINT32_MAX,
+        0,
+        0,
+    };
+    uint32_t equal[4] = {0};
+    uint32_t unordered[4] = {0};
+    uc_engine *uc;
+    uint32_t status;
+    uint32_t config5 = 1u << 27;
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= MIPS_CP0_STATUS_CU1 | MIPS_CP0_STATUS_FR;
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &config5));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W1, lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W2, rhs));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_W5, equal));
+    OK(uc_reg_read(uc, UC_MIPS_REG_W6, unordered));
+    TEST_CHECK(memcmp(equal, expected_equal, sizeof(expected_equal)) == 0);
+    TEST_CHECK(
+        memcmp(unordered, expected_unordered, sizeof(expected_unordered)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_msa_msacsr_rounding_and_fcsr(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0x40888005), /* mtc0 t0,Config5,5 */
+        LEINT32(0x783e4859), /* ctcmsa $1,t1 */
+        LEINT32(0x7b38089e), /* ftint_s.w w2,w1 */
+        LEINT32(0x787e0a99), /* cfcmsa t2,$1 */
+        LEINT32(0x7b3820de), /* ftint_s.w w3,w4 */
+        LEINT32(0x787e0ad9), /* cfcmsa t3,$1 */
+    };
+    const uint32_t fractional[4] = {
+        0x3fc00000,
+        0xbfc00000,
+        0x3fa00000,
+        0xbfa00000,
+    };
+    const uint32_t exact[4] = {
+        0x3f800000,
+        0xc0000000,
+        0x40400000,
+        0xc0800000,
+    };
+    const uint32_t expected_rounded[4] = {2, UINT32_MAX, 2, UINT32_MAX};
+    const uint32_t expected_exact[4] = {1, UINT32_MAX - 1, 3,
+                                        UINT32_MAX - 3};
+    uint32_t rounded[4] = {0};
+    uint32_t exact_result[4] = {0};
+    uc_engine *uc;
+    uint32_t status;
+    uint32_t config5 = 1u << 27;
+    uint32_t initial_msacsr = MIPS_MSACSR_RM_UP;
+    uint32_t msacsr_after_inexact = 0;
+    uint32_t msacsr_after_exact = 0;
+    uint32_t fcsr = MIPS_FCSR_FS | MIPS_FCSR_RM_DOWN;
+    uint32_t fcsr_before = 0;
+    uint32_t fcsr_after = 0;
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    status |= MIPS_CP0_STATUS_CU1 | MIPS_CP0_STATUS_FR;
+    OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+    OK(uc_reg_write(uc, UC_MIPS_REG_FCSR, &fcsr));
+    OK(uc_reg_read(uc, UC_MIPS_REG_FCSR, &fcsr_before));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T0, &config5));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T1, &initial_msacsr));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W1, fractional));
+    OK(uc_reg_write(uc, UC_MIPS_REG_W4, exact));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_W2, rounded));
+    OK(uc_reg_read(uc, UC_MIPS_REG_W3, exact_result));
+    OK(uc_reg_read(uc, UC_MIPS_REG_T2, &msacsr_after_inexact));
+    OK(uc_reg_read(uc, UC_MIPS_REG_T3, &msacsr_after_exact));
+    OK(uc_reg_read(uc, UC_MIPS_REG_FCSR, &fcsr_after));
+    TEST_CHECK(memcmp(rounded, expected_rounded, sizeof(rounded)) == 0);
+    TEST_CHECK(memcmp(exact_result, expected_exact, sizeof(exact_result)) ==
+               0);
+    TEST_CHECK_(msacsr_after_inexact ==
+                    (MIPS_MSACSR_RM_UP | MIPS_MSACSR_FLAG_INEXACT |
+                     MIPS_MSACSR_CAUSE_INEXACT),
+                "msacsr_after_inexact=0x%08x", msacsr_after_inexact);
+    TEST_CHECK_(msacsr_after_exact ==
+                    (MIPS_MSACSR_RM_UP | MIPS_MSACSR_FLAG_INEXACT),
+                "msacsr_after_exact=0x%08x", msacsr_after_exact);
+    TEST_CHECK((fcsr_before & (MIPS_FCSR_FS | MIPS_FCSR_RM_DOWN)) ==
+               (MIPS_FCSR_FS | MIPS_FCSR_RM_DOWN));
+    TEST_CHECK(fcsr_after == fcsr_before);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_msa_msacsr_flush_to_zero(void)
+{
+    const uint32_t code[] = {
+        LEINT32(0x40888005), /* mtc0 t0,Config5,5 */
+        LEINT32(0x783e4859), /* ctcmsa $1,t1 */
+        LEINT32(0x780208db), /* fadd.w w3,w1,w2 */
+        LEINT32(0x787e0a99), /* cfcmsa t2,$1 */
+    };
+    const uint32_t subnormal[4] = {1, 0x80000001, 2, 0x80000002};
+    const uint32_t zero[4] = {0};
+    const uint32_t expected_result[2][4] = {
+        {1, 0x80000001, 2, 0x80000002},
+        {0, 0, 0, 0},
+    };
+    const uint32_t initial_msacsr[2] = {0, MIPS_MSACSR_FS};
+    const uint32_t expected_msacsr[2] = {
+        0,
+        MIPS_MSACSR_FS | MIPS_MSACSR_CAUSE_INEXACT |
+            MIPS_MSACSR_FLAG_INEXACT,
+    };
+    uint32_t result[4];
+    uc_engine *uc;
+    uint32_t status;
+    uint32_t config5 = 1u << 27;
+    uint32_t msacsr;
+    size_t i;
+
+    for (i = 0; i < 2; i++) {
+        memset(result, 0, sizeof(result));
+        msacsr = 0;
+        OK(uc_open(UC_ARCH_MIPS,
+                   UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN, &uc));
+        OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_P5600));
+        OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+        OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+        OK(uc_reg_read(uc, UC_MIPS_REG_CP0_STATUS, &status));
+        status |= MIPS_CP0_STATUS_CU1 | MIPS_CP0_STATUS_FR;
+        OK(uc_reg_write(uc, UC_MIPS_REG_CP0_STATUS, &status));
+        OK(uc_reg_write(uc, UC_MIPS_REG_T0, &config5));
+        OK(uc_reg_write(uc, UC_MIPS_REG_T1, &initial_msacsr[i]));
+        OK(uc_reg_write(uc, UC_MIPS_REG_W1, subnormal));
+        OK(uc_reg_write(uc, UC_MIPS_REG_W2, zero));
+
+        OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+        OK(uc_reg_read(uc, UC_MIPS_REG_W3, result));
+        OK(uc_reg_read(uc, UC_MIPS_REG_T2, &msacsr));
+        TEST_CHECK_(memcmp(result, expected_result[i], sizeof(result)) == 0,
+                    "case=%u result=%08x:%08x:%08x:%08x",
+                    (unsigned int)i, result[0], result[1], result[2],
+                    result[3]);
+        TEST_CHECK_(msacsr == expected_msacsr[i], "msacsr=0x%08x", msacsr);
+
+        OK(uc_close(uc));
+    }
+}
+
 static void test_mips_dsp_arithmetic_control(void)
 {
     uc_engine *uc;
@@ -571,6 +1146,37 @@ static void test_mips_dsp_accumulator(void)
     OK(uc_reg_read(uc, UC_MIPS_REG_T5, &result_lo));
     TEST_CHECK(result_hi == 2);
     TEST_CHECK(result_lo == 0x15);
+
+    OK(uc_close(uc));
+}
+
+static void test_mips_dsp_compare_pick(void)
+{
+    const uint32_t code[] = {
+        BEINT32(0x7d4b0211), /* cmp.eq.ph t2,t3 */
+        BEINT32(0x7d4b62d1), /* pick.ph t4,t2,t3 */
+        BEINT32(0x7c106cb8), /* rddsp t5,0x10 */
+    };
+    uc_engine *uc;
+    uint32_t lhs = 0x11112222;
+    uint32_t rhs = 0x11113333;
+    uint32_t picked = 0;
+    uint32_t condition = 0;
+
+    OK(uc_open(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_BIG_ENDIAN, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_MIPS32_74KF));
+    enable_mips32_dsp(uc);
+    OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
+    OK(uc_mem_write(uc, code_start, code, sizeof(code)));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T2, &lhs));
+    OK(uc_reg_write(uc, UC_MIPS_REG_T3, &rhs));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_MIPS_REG_T4, &picked));
+    OK(uc_reg_read(uc, UC_MIPS_REG_T5, &condition));
+    TEST_CHECK_(picked == 0x11113333, "picked=0x%08x", picked);
+    TEST_CHECK_(condition == 0x02000000, "condition=0x%08x", condition);
 
     OK(uc_close(uc));
 }
@@ -1319,6 +1925,12 @@ static void test_mips_cp0_count_compare(void)
 TEST_LIST = {
     {"test_mips_stop_at_branch", test_mips_stop_at_branch},
     {"test_mips_stop_at_delay_slot", test_mips_stop_at_delay_slot},
+    {"test_mips_delay_slot_pending_stop",
+     test_mips_delay_slot_pending_stop},
+    {"test_mips_big_endian_delay_slot_callback_smc",
+     test_mips_big_endian_delay_slot_callback_smc},
+    {"test_mips_big_endian_delay_slot_memory_hook_pc",
+     test_mips_big_endian_delay_slot_memory_hook_pc},
     {"test_mips_not_taken_branch_likely_code_hook",
      test_mips_not_taken_branch_likely_code_hook},
     {"test_mips_el_ori", test_mips_el_ori},
@@ -1329,43 +1941,47 @@ TEST_LIST = {
     {"test_mips_micro_mode_li16", test_mips_micro_mode_li16},
     {"test_mips_nanomips_model_move16", test_mips_nanomips_model_move16},
     {"test_mips_mips3_mode_opens", test_mips_mips3_mode_opens},
-     {"test_mips_msa_w_reg_roundtrip", test_mips_msa_w_reg_roundtrip},
-     {"test_mips_msa_addv_b", test_mips_msa_addv_b},
-    {"test_mips_dsp_arithmetic_control",
-     test_mips_dsp_arithmetic_control},
+    {"test_mips_msa_w_reg_roundtrip", test_mips_msa_w_reg_roundtrip},
+    {"test_mips_msa_addv_b", test_mips_msa_addv_b},
+    {"test_mips_msa_branch_delay_slot", test_mips_msa_branch_delay_slot},
+    {"test_mips_msa_saturation", test_mips_msa_saturation},
+    {"test_mips_msa_fp_nan_compare", test_mips_msa_fp_nan_compare},
+    {"test_mips_msa_msacsr_rounding_and_fcsr",
+     test_mips_msa_msacsr_rounding_and_fcsr},
+    {"test_mips_msa_msacsr_flush_to_zero",
+     test_mips_msa_msacsr_flush_to_zero},
+    {"test_mips_dsp_arithmetic_control", test_mips_dsp_arithmetic_control},
     {"test_mips_dsp_accumulator", test_mips_dsp_accumulator},
-    {"test_mips_dsp_requires_dsp_model",
-     test_mips_dsp_requires_dsp_model},
+    {"test_mips_dsp_compare_pick", test_mips_dsp_compare_pick},
+    {"test_mips_dsp_requires_dsp_model", test_mips_dsp_requires_dsp_model},
     {"test_mips_mips_fpr", test_mips_mips_fpr},
     {"test_mips_stop_delay_slot_from_qiling",
      test_mips_stop_delay_slot_from_qiling},
-     {"test_mips_simple_coredump_2134", test_mips_simple_coredump_2134},
-     {"test_mips_simple_coredump_2137", test_mips_simple_coredump_2137},
-     {"test_mips64_loongson2f_status", test_mips64_loongson2f_status},
-     {"test_mips64_loongson3a_dmult", test_mips64_loongson3a_dmult},
-     {"test_mips64_loongson3a_requires_lext",
-      test_mips64_loongson3a_requires_lext},
-     {"test_mips64_loongson3a_load_zero_prefetch",
-      test_mips64_loongson3a_load_zero_prefetch},
-     {"test_mips64_loongson3a_lext_lsdc2_gpr",
-      test_mips64_loongson3a_lext_lsdc2_gpr},
-     {"test_mips64_loongson3a_lext_lsdc2_requires_lext",
-      test_mips64_loongson3a_lext_lsdc2_requires_lext},
-     {"test_mips64_loongson3a_lext_gslsq_gpr",
-      test_mips64_loongson3a_lext_gslsq_gpr},
-     {"test_mips64_loongson3a_lext_gslsq_requires_lext",
-      test_mips64_loongson3a_lext_gslsq_requires_lext},
-     {"test_mips64_loongson3a_lext_lsdc2_fpr",
-      test_mips64_loongson3a_lext_lsdc2_fpr},
-     {"test_mips64_loongson3a_lext_gslsq_fpr",
-      test_mips64_loongson3a_lext_gslsq_fpr},
-     {"test_mips64_loongson3a_lext_shifted_fpr",
-      test_mips64_loongson3a_lext_shifted_fpr},
-     {"test_mips64_loongson3a_pagemask",
-      test_mips64_loongson3a_pagemask},
-     {"test_mips64_octeon_arithmetic", test_mips64_octeon_arithmetic},
-     {"test_mips64_octeon_bbit", test_mips64_octeon_bbit},
-     {"test_mips64_octeon_requires_octeon",
-      test_mips64_octeon_requires_octeon},
-     {"test_mips_cp0_count_compare", test_mips_cp0_count_compare},
+    {"test_mips_simple_coredump_2134", test_mips_simple_coredump_2134},
+    {"test_mips_simple_coredump_2137", test_mips_simple_coredump_2137},
+    {"test_mips64_loongson2f_status", test_mips64_loongson2f_status},
+    {"test_mips64_loongson3a_dmult", test_mips64_loongson3a_dmult},
+    {"test_mips64_loongson3a_requires_lext",
+     test_mips64_loongson3a_requires_lext},
+    {"test_mips64_loongson3a_load_zero_prefetch",
+     test_mips64_loongson3a_load_zero_prefetch},
+    {"test_mips64_loongson3a_lext_lsdc2_gpr",
+     test_mips64_loongson3a_lext_lsdc2_gpr},
+    {"test_mips64_loongson3a_lext_lsdc2_requires_lext",
+     test_mips64_loongson3a_lext_lsdc2_requires_lext},
+    {"test_mips64_loongson3a_lext_gslsq_gpr",
+     test_mips64_loongson3a_lext_gslsq_gpr},
+    {"test_mips64_loongson3a_lext_gslsq_requires_lext",
+     test_mips64_loongson3a_lext_gslsq_requires_lext},
+    {"test_mips64_loongson3a_lext_lsdc2_fpr",
+     test_mips64_loongson3a_lext_lsdc2_fpr},
+    {"test_mips64_loongson3a_lext_gslsq_fpr",
+     test_mips64_loongson3a_lext_gslsq_fpr},
+    {"test_mips64_loongson3a_lext_shifted_fpr",
+     test_mips64_loongson3a_lext_shifted_fpr},
+    {"test_mips64_loongson3a_pagemask", test_mips64_loongson3a_pagemask},
+    {"test_mips64_octeon_arithmetic", test_mips64_octeon_arithmetic},
+    {"test_mips64_octeon_bbit", test_mips64_octeon_bbit},
+    {"test_mips64_octeon_requires_octeon", test_mips64_octeon_requires_octeon},
+    {"test_mips_cp0_count_compare", test_mips_cp0_count_compare},
     {NULL, NULL}};

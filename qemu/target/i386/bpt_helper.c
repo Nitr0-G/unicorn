@@ -163,6 +163,18 @@ void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7)
     env->hflags = (env->hflags & ~HF_IOBPT_MASK) | iobpt;
 }
 
+void cpu_x86_update_debug(CPUX86State *env)
+{
+    CPUState *cs = env_cpu(env);
+    target_ulong dr7 = env->dr[7];
+
+    cpu_breakpoint_remove_all(cs, BP_CPU);
+    cpu_watchpoint_remove_all(cs, BP_CPU);
+    memset(env->cpu_breakpoint, 0, sizeof(env->cpu_breakpoint));
+    env->dr[7] = DR7_FIXED_1;
+    cpu_x86_update_dr7(env, dr7);
+}
+
 static bool check_hw_breakpoints(CPUX86State *env, bool force_dr6_update)
 {
     target_ulong dr6;

@@ -3243,6 +3243,19 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
 #include "emit.c.inc"
 #include "decode-new.c.inc"
 
+static void patch_x86_trace_size(TCGContext *tcg_ctx, TCGOp *prev_op,
+                                 target_ulong size)
+{
+    TCGOp *size_op;
+
+    if (prev_op) {
+        size_op = QTAILQ_NEXT(prev_op, link);
+    } else {
+        size_op = QTAILQ_FIRST(&tcg_ctx->ops);
+    }
+    size_op->args[1] = size;
+}
+
 /* convert one instruction. s->base.is_jmp is set if the translation must
    be stopped. Return the next pc value */
 static bool disas_insn(DisasContext *s, CPUState *cpu)
@@ -3257,10 +3270,22 @@ static bool disas_insn(DisasContext *s, CPUState *cpu)
     CCOp orig_cc_op = s->cc_op;
     target_ulong orig_pc_save = s->pc_save;
     target_ulong pc_start = s->base.pc_next;
-    TCGOp *tcg_op, *prev_op = NULL;
+    TCGOp *prev_op = NULL, *fetch_prev_op = NULL;
     bool insn_hook = false;
+    bool fetch_hook = false;
 
     s->pc = s->base.pc_next;
+    if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_MEM_FETCH, pc_start)) {
+        sync_eflags(s);
+        gen_update_eip_cur(s);
+        fetch_prev_op = tcg_last_op(tcg_ctx);
+        fetch_hook = true;
+        gen_uc_tracefetch(tcg_ctx, UC_TRACE_SIZE_UNKNOWN,
+                          UC_HOOK_MEM_FETCH_IDX, s->uc, pc_start);
+        check_exit_request(tcg_ctx);
+        gen_compute_eflags(s);
+    }
+
     if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, pc_start)) {
         sync_eflags(s);
         gen_update_eip_cur(s);
@@ -3286,6 +3311,9 @@ static bool disas_insn(DisasContext *s, CPUState *cpu)
     case 0:
         break;
     case 1:
+        if (fetch_hook) {
+            patch_x86_trace_size(tcg_ctx, fetch_prev_op, s->pc - pc_start);
+        }
         gen_exception_gpf(s);
         return true;
     case 2:
@@ -7091,18 +7119,22 @@ static bool disas_insn(DisasContext *s, CPUState *cpu)
         goto unknown_op;
     }
     if (insn_hook) {
-        if (prev_op) {
-            tcg_op = QTAILQ_NEXT(prev_op, link);
-        } else {
-            tcg_op = QTAILQ_FIRST(&tcg_ctx->ops);
-        }
-        tcg_op->args[1] = s->pc - pc_start;
+        patch_x86_trace_size(tcg_ctx, prev_op, s->pc - pc_start);
+    }
+    if (fetch_hook) {
+        patch_x86_trace_size(tcg_ctx, fetch_prev_op, s->pc - pc_start);
     }
     return true;
  illegal_op:
+    if (fetch_hook) {
+        patch_x86_trace_size(tcg_ctx, fetch_prev_op, s->pc - pc_start);
+    }
     gen_illegal_opcode(s);
     return true;
  unknown_op:
+    if (fetch_hook) {
+        patch_x86_trace_size(tcg_ctx, fetch_prev_op, s->pc - pc_start);
+    }
     gen_unknown_opcode(env, s);
     return true;
 }

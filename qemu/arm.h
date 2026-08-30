@@ -4,9 +4,15 @@
 #ifndef UNICORN_ARCH_POSTFIX
 #define UNICORN_ARCH_POSTFIX _arm
 #endif
+#define gen_helper_check_counted_entry gen_helper_check_counted_entry_arm
 #define gen_helper_check_exit_request gen_helper_check_exit_request_arm
+#define gen_helper_exit_request gen_helper_exit_request_arm
+#define helper_check_counted_entry helper_check_counted_entry_arm
+#define helper_check_exit_request helper_check_exit_request_arm
+#define helper_exit_request helper_exit_request_arm
 #define helper_uc_tracecode_single helper_uc_tracecode_single_arm
 #define cpu_restore_icount cpu_restore_icount_arm
+#define cpu_tcg_exit_request cpu_tcg_exit_request_arm
 #define unicorn_fill_tlb unicorn_fill_tlb_arm
 #define reg_read reg_read_arm
 #define reg_write reg_write_arm
@@ -58,6 +64,8 @@
 #define address_space_dispatch_compact address_space_dispatch_compact_arm
 #define flatview_translate flatview_translate_arm
 #define flatview_copy flatview_copy_arm
+#define flatview_reserve flatview_reserve_arm
+#define address_space_restore_flatview address_space_restore_flatview_arm
 #define address_space_translate_for_iotlb address_space_translate_for_iotlb_arm
 #define qemu_get_cpu qemu_get_cpu_arm
 #define cpu_address_space_init cpu_address_space_init_arm
@@ -133,6 +141,10 @@
 #define memory_unmap memory_unmap_arm
 #define memory_moveout memory_moveout_arm
 #define memory_movein memory_movein_arm
+#define memory_mapping_restore_topology memory_mapping_restore_topology_arm
+#define memory_mapping_free memory_mapping_free_arm
+#define memory_mapping_prune memory_mapping_prune_arm
+#define memory_mapping_normalize memory_mapping_normalize_arm
 #define memory_free memory_free_arm
 #define flatview_unref flatview_unref_arm
 #define address_space_get_flatview address_space_get_flatview_arm

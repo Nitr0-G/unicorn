@@ -4,32 +4,34 @@
 
 #include "tcg/tcg.h"
 #include "qemu-common.h"
+#include "exec/exec-all.h"
 #include "exec/memory.h"
 #include "exec/cpu_ldst.h"
+#include "accel/tcg/tb-exec-frame.h"
 
-// This header define common patterns/codes that will be included in all arch-sepcific
-// codes for unicorns purposes.
+// This header define common patterns/codes that will be included in all
+// arch-sepcific codes for unicorns purposes.
 
-void vm_start(struct uc_struct*);
+void vm_start(struct uc_struct *);
 void tcg_exec_init(struct uc_struct *uc, uint32_t tb_size);
-bool unicorn_fill_tlb(CPUState *cs, vaddr address, int size,
-                      MMUAccessType rw, int mmu_idx,
-                      bool probe, uintptr_t retaddr);
+bool unicorn_fill_tlb(CPUState *cs, vaddr address, int size, MMUAccessType rw,
+                      int mmu_idx, bool probe, uintptr_t retaddr);
 
 // return true on success, false on failure
 static inline bool cpu_physical_mem_read(AddressSpace *as, hwaddr addr,
-                                            uint8_t *buf, hwaddr len)
+                                         uint8_t *buf, hwaddr len)
 {
     return cpu_physical_memory_rw(as, addr, (void *)buf, len, 0);
 }
 
 static inline bool cpu_physical_mem_write(AddressSpace *as, hwaddr addr,
-                                            const uint8_t *buf, hwaddr len)
+                                          const uint8_t *buf, hwaddr len)
 {
     return cpu_physical_memory_rw(as, addr, (void *)buf, len, 1);
 }
 
-static bool cpu_virtual_mem_read(struct uc_struct *uc, vaddr addr, uint32_t prot, uint8_t *buf, int len)
+static bool cpu_virtual_mem_read(struct uc_struct *uc, vaddr addr,
+                                 uint32_t prot, uint8_t *buf, int len)
 {
     MMUAccessType access_type;
     void *hostptr;
@@ -41,7 +43,7 @@ static bool cpu_virtual_mem_read(struct uc_struct *uc, vaddr addr, uint32_t prot
      */
     assert((addr & TARGET_PAGE_MASK) == ((addr + len - 1) & TARGET_PAGE_MASK));
 
-    switch(prot) {
+    switch (prot) {
     case UC_PROT_READ:
         access_type = MMU_DATA_LOAD;
         break;
@@ -63,13 +65,14 @@ static bool cpu_virtual_mem_read(struct uc_struct *uc, vaddr addr, uint32_t prot
     return true;
 }
 
-static bool cpu_virtual_to_physical(struct uc_struct *uc, vaddr addr, uint32_t prot, uint64_t *paddr)
+static bool cpu_virtual_to_physical(struct uc_struct *uc, vaddr addr,
+                                    uint32_t prot, uint64_t *paddr)
 {
     hwaddr res;
     MMUAccessType access_type;
     int mmu_idx = cpu_mmu_index(uc->cpu->env_ptr, false);
 
-    switch(prot) {
+    switch (prot) {
     case UC_PROT_READ:
         access_type = MMU_DATA_LOAD;
         break;
@@ -83,7 +86,8 @@ static bool cpu_virtual_to_physical(struct uc_struct *uc, vaddr addr, uint32_t p
         return false;
     }
 
-    if (!tlb_vaddr_to_paddr(uc->cpu->env_ptr, addr, access_type, mmu_idx, &res)) {
+    if (!tlb_vaddr_to_paddr(uc->cpu->env_ptr, addr, access_type, mmu_idx,
+                            &res)) {
         return false;
     }
 
@@ -108,7 +112,7 @@ static void release_common(void *t)
     cpu_breakpoint_remove_all(CPU(s->uc->cpu), BP_CPU);
 
     // Clean TCG.
-    TCGOpDef* def = s->tcg_op_defs;
+    TCGOpDef *def = s->tcg_op_defs;
     g_free(def->args_ct);
     g_free(def->sorted_args);
     g_free(s->tcg_op_defs);
@@ -139,13 +143,13 @@ static void release_common(void *t)
     /* qemu/util/qht.c:264: map = qht_map_create(n_buckets); */
     qht_destroy(&s->tb_ctx.htable);
 
-
 #if TCG_TARGET_REG_BITS == 32
-    for(i = 0; i < s->nb_globals; i++) {
+    for (i = 0; i < s->nb_globals; i++) {
         TCGTemp *ts = &s->temps[i];
         if (ts->base_type == TCG_TYPE_I64) {
-            if (ts->name && ((strcmp(ts->name+(strlen(ts->name)-2), "_0") == 0) ||
-                        (strcmp(ts->name+(strlen(ts->name)-2), "_1") == 0))) {
+            if (ts->name &&
+                ((strcmp(ts->name + (strlen(ts->name) - 2), "_0") == 0) ||
+                 (strcmp(ts->name + (strlen(ts->name) - 2), "_1") == 0))) {
                 free((void *)ts->name);
             }
         }
@@ -153,24 +157,25 @@ static void release_common(void *t)
 #endif
 }
 
-static inline void target_page_init(struct uc_struct* uc)
+static inline void target_page_init(struct uc_struct *uc)
 {
     uc->target_page_size = TARGET_PAGE_SIZE;
     uc->target_page_align = TARGET_PAGE_SIZE - 1;
 }
 
-static uc_err uc_set_tlb(struct uc_struct *uc, int mode) {
+static uc_err uc_set_tlb(struct uc_struct *uc, int mode)
+{
     switch (mode) {
-        case UC_TLB_VIRTUAL:
-            uc->cpu->cc->tlb_fill = unicorn_fill_tlb;
-            uc->tlb_mode = UC_TLB_VIRTUAL;
-            return UC_ERR_OK;
-        case UC_TLB_CPU:
-            uc->cpu->cc->tlb_fill = uc->cpu->cc->tlb_fill_cpu;
-            uc->tlb_mode = UC_TLB_CPU;
-            return UC_ERR_OK;
-        default:
-            return UC_ERR_ARG;
+    case UC_TLB_VIRTUAL:
+        uc->cpu->cc->tlb_fill = unicorn_fill_tlb;
+        uc->tlb_mode = UC_TLB_VIRTUAL;
+        return UC_ERR_OK;
+    case UC_TLB_CPU:
+        uc->cpu->cc->tlb_fill = uc->cpu->cc->tlb_fill_cpu;
+        uc->tlb_mode = UC_TLB_CPU;
+        return UC_ERR_OK;
+    default:
+        return UC_ERR_ARG;
     }
 }
 
@@ -178,7 +183,9 @@ MemoryRegion *find_memory_mapping(struct uc_struct *uc, hwaddr address)
 {
     hwaddr xlat = 0;
     hwaddr len = 1;
-    MemoryRegion *mr = address_space_translate(&uc->address_space_memory, address, &xlat, &len, false, MEMTXATTRS_UNSPECIFIED);
+    MemoryRegion *mr =
+        address_space_translate(&uc->address_space_memory, address, &xlat, &len,
+                                false, MEMTXATTRS_UNSPECIFIED);
 
     if (mr == &uc->io_mem_unassigned) {
         return NULL;
@@ -187,7 +194,7 @@ MemoryRegion *find_memory_mapping(struct uc_struct *uc, hwaddr address)
 }
 
 void softfloat_init(void);
-static inline void uc_common_init(struct uc_struct* uc)
+static inline void uc_common_init(struct uc_struct *uc)
 {
     uc->write_mem = cpu_physical_mem_write;
     uc->read_mem = cpu_physical_mem_read;
@@ -201,10 +208,18 @@ static inline void uc_common_init(struct uc_struct* uc)
     uc->memory_unmap = memory_unmap;
     uc->memory_moveout = memory_moveout;
     uc->memory_movein = memory_movein;
+    uc->memory_restore_topology = memory_mapping_restore_topology;
+    uc->memory_mapping_free = memory_mapping_free;
+    uc->memory_mapping_prune = memory_mapping_prune;
+    uc->memory_mapping_normalize = memory_mapping_normalize;
     uc->readonly_mem = memory_region_set_readonly;
+    uc->flatview_reserve = flatview_reserve;
+    uc->address_space_restore_flatview = address_space_restore_flatview;
     uc->target_page = target_page_init;
     uc->softfloat_initialize = softfloat_init;
     uc->tcg_flush_tlb = tcg_flush_softmmu_tlb;
+    uc->tb_exec_frame_resolve = tb_exec_frame_resolve;
+    uc->tb_exec_frame_publish = tb_exec_frame_publish_retaddr;
     uc->memory_map_io = memory_map_io;
     uc->set_tlb = uc_set_tlb;
     uc->memory_mapping = find_memory_mapping;
@@ -216,26 +231,33 @@ static inline void uc_common_init(struct uc_struct* uc)
         uc->release = release_common;
 }
 
-#define CHECK_REG_TYPE(type) do {             \
-    if (unlikely(*size < sizeof(type))) {     \
-        return UC_ERR_OVERFLOW;               \
-    }                                         \
-    *size = sizeof(type);                     \
-    ret = UC_ERR_OK;                          \
-} while(0)
+#define CHECK_REG_TYPE(type)                                                   \
+    do {                                                                       \
+        if (unlikely(*size < sizeof(type))) {                                  \
+            return UC_ERR_OVERFLOW;                                            \
+        }                                                                      \
+        *size = sizeof(type);                                                  \
+        ret = UC_ERR_OK;                                                       \
+    } while (0)
 
-#define CHECK_RET_DEPRECATE(ret, regid) do {                                    \
-    if (ret == UC_ERR_ARG && !getenv("UC_IGNORE_REG_BREAK")) {                  \
-        fprintf(stderr,                                                         \
-        "WARNING: Your register accessing on id %"PRIu32" is deprecated "       \
-        "and will get UC_ERR_ARG in the future release (2.2.0) because "        \
-        "the accessing is either no-op or not defined. If you believe "         \
-        "the register should be implemented or there is a bug, please "         \
-        "submit an issue to https://github.com/unicorn-engine/unicorn. "        \
-        "Set UC_IGNORE_REG_BREAK=1 to ignore this warning.\n",                  \
-        regid);                                                                 \
-        ret = UC_ERR_OK;                                                        \
-    }                                                                           \
-} while (0)
+#define CHECK_RET_DEPRECATE(ret, regid)                                        \
+    do {                                                                       \
+        if (ret == UC_ERR_ARG && !getenv("UC_IGNORE_REG_BREAK")) {             \
+            fprintf(stderr,                                                    \
+                    "WARNING: Your register accessing on id %" PRIu32          \
+                    " is deprecated "                                          \
+                    "and will get UC_ERR_ARG in the future release (2.2.0) "   \
+                    "because "                                                 \
+                    "the accessing is either no-op or not defined. If you "    \
+                    "believe "                                                 \
+                    "the register should be implemented or there is a bug, "   \
+                    "please "                                                  \
+                    "submit an issue to "                                      \
+                    "https://github.com/unicorn-engine/unicorn. "              \
+                    "Set UC_IGNORE_REG_BREAK=1 to ignore this warning.\n",     \
+                    regid);                                                    \
+            ret = UC_ERR_OK;                                                   \
+        }                                                                      \
+    } while (0)
 
 #endif

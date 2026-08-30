@@ -6827,11 +6827,20 @@ static DisasJumpType translate_one(CPUS390XState *env, DisasContext *s)
     /* Update insn_start now that we know the ILEN.  */
     tcg_set_insn_start_param(s->insn_start, 2, s->ilen);
 
+    if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_MEM_FETCH, s->base.pc_next)) {
+        update_psw_addr(s);
+        update_cc_op(s);
+        gen_uc_tracefetch(tcg_ctx, s->ilen, UC_HOOK_MEM_FETCH_IDX, s->uc,
+                          s->base.pc_next);
+        check_exit_request(tcg_ctx);
+    }
+
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, s->base.pc_next)) {
         update_psw_addr(s);
         update_cc_op(s);
-        gen_uc_tracecode(tcg_ctx, s->ilen, UC_HOOK_CODE_IDX, s->uc, s->base.pc_next);
+        gen_uc_tracecode(tcg_ctx, s->ilen, UC_HOOK_CODE_IDX, s->uc,
+                         s->base.pc_next);
         // the callback might want to stop emulation immediately
         check_exit_request(tcg_ctx);
     }

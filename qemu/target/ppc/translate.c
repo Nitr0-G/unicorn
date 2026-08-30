@@ -8492,8 +8492,37 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     prefixed = is_prefix_insn(ctx, ctx->opcode);
     if (prefixed) {
         insn_size = 8;
+        ctx->prefix_opcode = ctx->opcode;
+        ctx->base.pc_next = pc + 4;
+        if ((ctx->base.pc_next & 63) == 0) {
+            if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE, pc)) {
+                gen_update_nip(ctx, pc);
+                gen_uc_tracecode(tcg_ctx, insn_size, UC_HOOK_CODE_IDX, uc,
+                                 pc);
+                check_exit_request(tcg_ctx);
+            }
+            ctx->base.pc_next = pc + 8;
+            gen_exception_err(ctx, POWERPC_EXCP_ALIGN,
+                              POWERPC_EXCP_ALIGN_INSN);
+            ctx->base.is_jmp = DISAS_NORETURN;
+            return;
+        }
+        ctx->opcode = translator_ldl_swap(tcg_ctx, env, ctx->base.pc_next,
+                                          need_byteswap(ctx));
+        ctx->base.pc_next = pc + 8;
+    } else {
+        ctx->base.pc_next = pc + 4;
     }
+#else
+    ctx->base.pc_next = pc + 4;
 #endif
+
+    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_MEM_FETCH, pc)) {
+        gen_update_nip(ctx, pc);
+        gen_uc_tracefetch(tcg_ctx, insn_size, UC_HOOK_MEM_FETCH_IDX, uc, pc);
+        check_exit_request(tcg_ctx);
+    }
+
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE, pc)) {
 
@@ -8507,18 +8536,6 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 
 #if defined(TARGET_PPC64)
     if (prefixed) {
-        ctx->prefix_opcode = ctx->opcode;
-        ctx->base.pc_next = pc + 4;
-        if ((ctx->base.pc_next & 63) == 0) {
-            ctx->base.pc_next = pc + 8;
-            gen_exception_err(ctx, POWERPC_EXCP_ALIGN,
-                              POWERPC_EXCP_ALIGN_INSN);
-            ctx->base.is_jmp = DISAS_NORETURN;
-            return;
-        }
-        ctx->opcode = translator_ldl_swap(tcg_ctx, env, ctx->base.pc_next,
-                                          need_byteswap(ctx));
-        ctx->base.pc_next = pc + 8;
 
         LOG_DISAS("translate prefixed opcode %08x %08x (%s)\n",
                   ctx->prefix_opcode, ctx->opcode,
@@ -8539,8 +8556,6 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
               ctx->opcode, opc1(ctx->opcode), opc2(ctx->opcode),
               opc3(ctx->opcode), opc4(ctx->opcode),
               ctx->le_mode ? "little" : "big");
-
-    ctx->base.pc_next = pc + 4;
 
     if (gen_mma_insn(ctx)) {
         goto translated;

@@ -8,7 +8,7 @@ typedef struct UnmappedState {
 } UnmappedState;
 
 static bool stop_on_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address,
-                             uint32_t size, int64_t value, void *user_data)
+                             int size, int64_t value, void *user_data)
 {
     UnmappedState *state = user_data;
 

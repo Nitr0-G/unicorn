@@ -983,8 +983,9 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     TCGContext *tcg_ctx = uc->tcg_ctx;
     CPURISCVState *env = cpu->env_ptr;
     uint16_t opcode16;
-    TCGOp *tcg_op, *prev_op = NULL;
+    TCGOp *tcg_op, *prev_op = NULL, *fetch_prev_op = NULL;
     bool insn_hook = false;
+    bool fetch_hook = false;
 
     // Unicorn: end address tells us to stop emulation
     if (uc_addr_is_exit(uc, ctx->base.pc_next)) {
@@ -992,6 +993,16 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         dcbase->is_jmp = DISAS_UC_EXIT;
     } else {
         opcode16 = translator_lduw(tcg_ctx, env, ctx->base.pc_next);
+
+        if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_MEM_FETCH,
+                                ctx->base.pc_next)) {
+            tcg_gen_movi_tl(tcg_ctx, tcg_ctx->cpu_pc, ctx->base.pc_next);
+            fetch_prev_op = tcg_last_op(tcg_ctx);
+            fetch_hook = true;
+            gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, uc,
+                              ctx->base.pc_next);
+            check_exit_request(tcg_ctx);
+        }
 
         // Unicorn: trace this instruction on request
         if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE, ctx->base.pc_next)) {
@@ -1002,7 +1013,8 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
             // save the last operand
             prev_op = tcg_last_op(tcg_ctx);
             insn_hook = true;
-            gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, uc, ctx->base.pc_next);
+            gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, uc,
+                             ctx->base.pc_next);
             // the callback might want to stop emulation immediately
             check_exit_request(tcg_ctx);
         }
@@ -1024,6 +1036,15 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
             }
 
             tcg_op->args[1] = ctx->pc_succ_insn - ctx->base.pc_next;
+        }
+
+        if (fetch_hook) {
+            if (fetch_prev_op) {
+                tcg_op = QTAILQ_NEXT(fetch_prev_op, link);
+            } else {
+                tcg_op = QTAILQ_FIRST(&tcg_ctx->ops);
+            }
+            tcg_op->args[1] = extract16(opcode16, 0, 2) == 3 ? 4 : 2;
         }
 
         ctx->base.pc_next = ctx->pc_succ_insn;

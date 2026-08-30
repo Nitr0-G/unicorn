@@ -26,30 +26,34 @@
 #define RAM_ADDR_INVALID (~(ram_addr_t)0)
 
 #define MAX_PHYS_ADDR_SPACE_BITS 62
-#define MAX_PHYS_ADDR            (((hwaddr)1 << MAX_PHYS_ADDR_SPACE_BITS) - 1)
+#define MAX_PHYS_ADDR (((hwaddr)1 << MAX_PHYS_ADDR_SPACE_BITS) - 1)
 
 typedef struct MemoryRegionOps MemoryRegionOps;
+typedef struct UcMapping UcMapping;
 
 typedef struct IOMMUTLBEntry IOMMUTLBEntry;
 
-typedef uint64_t (*uc_cb_mmio_read_t)(struct uc_struct *uc, uint64_t addr, unsigned size, void *user_data);
-typedef void (*uc_cb_mmio_write_t)(struct uc_struct *uc, uint64_t addr, unsigned size, uint64_t data, void *user_data);
+typedef uint64_t (*uc_cb_mmio_read_t)(struct uc_struct *uc, uint64_t addr,
+                                      unsigned size, void *user_data);
+typedef void (*uc_cb_mmio_write_t)(struct uc_struct *uc, uint64_t addr,
+                                   unsigned size, uint64_t data,
+                                   void *user_data);
 
 /* See address_space_translate: bit 0 is read, bit 1 is write.  */
 typedef enum {
     IOMMU_NONE = 0,
-    IOMMU_RO   = 1,
-    IOMMU_WO   = 2,
-    IOMMU_RW   = 3,
+    IOMMU_RO = 1,
+    IOMMU_WO = 2,
+    IOMMU_RW = 3,
 } IOMMUAccessFlags;
 
 #define IOMMU_ACCESS_FLAG(r, w) (((r) ? IOMMU_RO : 0) | ((w) ? IOMMU_WO : 0))
 
 struct IOMMUTLBEntry {
-    AddressSpace    *target_as;
-    hwaddr           iova;
-    hwaddr           translated_addr;
-    hwaddr           addr_mask;  /* 0xfff = 4k translation */
+    AddressSpace *target_as;
+    hwaddr iova;
+    hwaddr translated_addr;
+    hwaddr addr_mask; /* 0xfff = 4k translation */
     IOMMUAccessFlags perm;
 };
 
@@ -83,10 +87,10 @@ struct IOMMUNotifier {
 typedef struct IOMMUNotifier IOMMUNotifier;
 
 /* RAM is pre-allocated and passed into qemu_ram_alloc_from_ptr */
-#define RAM_PREALLOC   (1 << 0)
+#define RAM_PREALLOC (1 << 0)
 
 /* RAM is mmap-ed with MAP_SHARED */
-#define RAM_SHARED     (1 << 1)
+#define RAM_SHARED (1 << 1)
 
 /* Only a portion of RAM (used_length) is actually used, and migrated.
  * This used_length size can change across reboots.
@@ -106,9 +110,8 @@ typedef struct IOMMUNotifier IOMMUNotifier;
 #define RAM_PMEM (1 << 5)
 
 static inline void iommu_notifier_init(IOMMUNotifier *n, IOMMUNotify fn,
-                                       IOMMUNotifierFlag flags,
-                                       hwaddr start, hwaddr end,
-                                       int iommu_idx)
+                                       IOMMUNotifierFlag flags, hwaddr start,
+                                       hwaddr end, int iommu_idx)
 {
     n->notify = fn;
     n->notifier_flags = flags;
@@ -123,28 +126,19 @@ static inline void iommu_notifier_init(IOMMUNotifier *n, IOMMUNotify fn,
 struct MemoryRegionOps {
     /* Read from the memory region. @addr is relative to @mr; @size is
      * in bytes. */
-    uint64_t (*read)(struct uc_struct *uc,
-                     void *opaque,
-                     hwaddr addr,
+    uint64_t (*read)(struct uc_struct *uc, void *opaque, hwaddr addr,
                      unsigned size);
     /* Write to the memory region. @addr is relative to @mr; @size is
      * in bytes. */
-    void (*write)(struct uc_struct *uc,
-                  void *opaque,
-                  hwaddr addr,
-                  uint64_t data,
-                  unsigned size);
+    void (*write)(struct uc_struct *uc, void *opaque, hwaddr addr,
+                  uint64_t data, unsigned size);
 
     MemTxResult (*read_with_attrs)(struct uc_struct *uc, void *opaque,
-                                   hwaddr addr,
-                                   uint64_t *data,
-                                   unsigned size,
+                                   hwaddr addr, uint64_t *data, unsigned size,
                                    MemTxAttrs attrs);
 
     MemTxResult (*write_with_attrs)(struct uc_struct *, void *opaque,
-                                    hwaddr addr,
-                                    uint64_t data,
-                                    unsigned size,
+                                    hwaddr addr, uint64_t data, unsigned size,
                                     MemTxAttrs attrs);
 
     enum device_endian endianness;
@@ -158,15 +152,14 @@ struct MemoryRegionOps {
         /* If true, unaligned accesses are supported.  Otherwise unaligned
          * accesses throw machine checks.
          */
-         bool unaligned;
+        bool unaligned;
         /*
          * If present, and returns #false, the transaction is not accepted
          * by the device (and results in machine dependent behaviour such
          * as a machine check exception).
          */
         bool (*accepts)(struct uc_struct *uc, void *opaque, hwaddr addr,
-                        unsigned size, bool is_write,
-                        MemTxAttrs attrs);
+                        unsigned size, bool is_write, MemTxAttrs attrs);
     } valid;
     /* Internal implementation constraints: */
     struct {
@@ -185,9 +178,7 @@ struct MemoryRegionOps {
     } impl;
 };
 
-enum IOMMUMemoryRegionAttr {
-    IOMMU_ATTR_SPAPR_TCE_FD
-};
+enum IOMMUMemoryRegionAttr { IOMMU_ATTR_SPAPR_TCE_FD };
 
 /**
  * IOMMUMemoryRegionClass:
@@ -323,6 +314,10 @@ struct MemoryRegion {
     struct uc_struct *uc;
     uint32_t perms;
     hwaddr end;
+    UcMapping *uc_mapping;
+    MemoryRegion *mapping_next;
+    hwaddr mapping_offset;
+    uint32_t context_refs;
 };
 
 struct IOMMUMemoryRegion {
@@ -339,7 +334,7 @@ struct IOMMUMemoryRegion {
 #define IOMMU_MEMORY_REGION_CLASS(klass) ((IOMMUMemoryRegionClass *)klass)
 #define IOMMU_MEMORY_REGION_GET_CLASS(obj) (&((IOMMUMemoryRegion *)obj)->cc)
 
-#define IOMMU_NOTIFIER_FOREACH(n, mr) \
+#define IOMMU_NOTIFIER_FOREACH(n, mr)                                          \
     QLIST_FOREACH((n), &(mr)->iommu_notify, node)
 
 /**
@@ -402,8 +397,8 @@ struct MemoryListener {
      * @region_nop:
      *
      * Called during an address space update transaction,
-     * for a section of the address space that is in the same place in the address
-     * space as in the last transaction.
+     * for a section of the address space that is in the same place in the
+     * address space as in the last transaction.
      *
      * @listener: The #MemoryListener.
      * @section: The #MemoryRegionSection.
@@ -452,7 +447,6 @@ static inline FlatView *address_space_to_flatview(AddressSpace *as)
     return as->current_map;
 }
 
-
 /**
  * MemoryRegionSection: describes a fragment of a #MemoryRegion
  *
@@ -476,12 +470,10 @@ struct MemoryRegionSection {
 static inline bool MemoryRegionSection_eq(MemoryRegionSection *a,
                                           MemoryRegionSection *b)
 {
-    return a->mr == b->mr &&
-           a->fv == b->fv &&
+    return a->mr == b->mr && a->fv == b->fv &&
            a->offset_within_region == b->offset_within_region &&
            a->offset_within_address_space == b->offset_within_address_space &&
-           int128_eq(a->size, b->size) &&
-           a->readonly == b->readonly;
+           int128_eq(a->size, b->size) && a->readonly == b->readonly;
 }
 
 /**
@@ -493,9 +485,7 @@ static inline bool MemoryRegionSection_eq(MemoryRegionSection *a,
  * @mr: the #MemoryRegion to be initialized
  * @size: size of the region; any subregions beyond this size will be clipped
  */
-void memory_region_init(struct uc_struct *uc,
-                        MemoryRegion *mr,
-                        uint64_t size);
+void memory_region_init(struct uc_struct *uc, MemoryRegion *mr, uint64_t size);
 
 /**
  * memory_region_ref: Add 1 to a memory region's reference count
@@ -526,10 +516,8 @@ void memory_region_ref(MemoryRegion *mr);
  * @opaque: passed to the read and write callbacks of the @ops structure.
  * @size: size of the region.
  */
-void memory_region_init_io(struct uc_struct *uc,
-                           MemoryRegion *mr,
-                           const MemoryRegionOps *ops,
-                           void *opaque,
+void memory_region_init_io(struct uc_struct *uc, MemoryRegion *mr,
+                           const MemoryRegionOps *ops, void *opaque,
                            uint64_t size);
 
 /**
@@ -544,10 +532,8 @@ void memory_region_init_io(struct uc_struct *uc,
  * Note that this function does not do anything to cause the data in the
  * RAM memory region to be migrated; that is the responsibility of the caller.
  */
-void memory_region_init_ram_ptr(struct uc_struct *uc,
-                                MemoryRegion *mr,
-                                uint64_t size,
-                                void *ptr);
+void memory_region_init_ram_ptr(struct uc_struct *uc, MemoryRegion *mr,
+                                uint64_t size, void *ptr);
 
 /**
  * memory_region_init_ram - Initialize RAM memory region.  Accesses into the
@@ -568,10 +554,8 @@ void memory_region_init_ram_ptr(struct uc_struct *uc,
  * We should lift this restriction and allow arbitrary Objects.
  * If you pass a non-NULL non-device @owner then we will assert.
  */
-void memory_region_init_ram(struct uc_struct *uc,
-                            MemoryRegion *mr,
-                            uint64_t size,
-                            uint32_t perms);
+void memory_region_init_ram(struct uc_struct *uc, MemoryRegion *mr,
+                            uint64_t size, uint32_t perms);
 
 /**
  * memory_region_size: get a memory region's size.
@@ -603,7 +587,7 @@ static inline bool memory_region_is_ram(MemoryRegion *mr)
 static inline IOMMUMemoryRegion *memory_region_get_iommu(MemoryRegion *mr)
 {
     if (mr->is_iommu) {
-        return (IOMMUMemoryRegion *) mr;
+        return (IOMMUMemoryRegion *)mr;
     }
     return NULL;
 }
@@ -617,8 +601,8 @@ static inline IOMMUMemoryRegion *memory_region_get_iommu(MemoryRegion *mr)
  *
  * @iommu_mr: the memory region being queried
  */
-static inline IOMMUMemoryRegionClass *memory_region_get_iommu_class_nocheck(
-        IOMMUMemoryRegion *iommu_mr)
+static inline IOMMUMemoryRegionClass *
+memory_region_get_iommu_class_nocheck(IOMMUMemoryRegion *iommu_mr)
 {
     return &iommu_mr->cc;
 }
@@ -640,7 +624,8 @@ static inline IOMMUMemoryRegionClass *memory_region_get_iommu_class_nocheck(
  * @ptr: the host pointer to be converted
  * @offset: the offset within memory region
  */
-MemoryRegion *memory_region_from_host(struct uc_struct *uc, void *ptr, ram_addr_t *offset);
+MemoryRegion *memory_region_from_host(struct uc_struct *uc, void *ptr,
+                                      ram_addr_t *offset);
 
 /**
  * memory_region_set_readonly: Turn a memory region read-only (or read-write)
@@ -683,8 +668,7 @@ void *memory_region_get_ram_ptr(MemoryRegion *mr);
  * @offset: the offset relative to @mr where @subregion is added.
  * @subregion: the subregion to be added.
  */
-void memory_region_add_subregion(MemoryRegion *mr,
-                                 hwaddr offset,
+void memory_region_add_subregion(MemoryRegion *mr, hwaddr offset,
                                  MemoryRegion *subregion);
 
 /**
@@ -704,10 +688,8 @@ void memory_region_add_subregion(MemoryRegion *mr,
  * @subregion: the subregion to be added.
  * @priority: used for resolving overlaps; highest priority wins.
  */
-void memory_region_add_subregion_overlap(MemoryRegion *mr,
-                                         hwaddr offset,
-                                         MemoryRegion *subregion,
-                                         int priority);
+void memory_region_add_subregion_overlap(MemoryRegion *mr, hwaddr offset,
+                                         MemoryRegion *subregion, int priority);
 
 /**
  * memory_region_filter_subregions: filter subregios by priority.
@@ -732,8 +714,7 @@ ram_addr_t memory_region_get_ram_addr(MemoryRegion *mr);
  * @mr: the container to be updated.
  * @subregion: the region being removed; must be a current subregion of @mr.
  */
-void memory_region_del_subregion(MemoryRegion *mr,
-                                 MemoryRegion *subregion);
+void memory_region_del_subregion(MemoryRegion *mr, MemoryRegion *subregion);
 
 /**
  * memory_region_find: translate an address/size relative to a
@@ -763,8 +744,8 @@ void memory_region_del_subregion(MemoryRegion *mr,
  * @addr: start of the area within @as to be searched
  * @size: size of the area to be searched
  */
-MemoryRegionSection memory_region_find(MemoryRegion *mr,
-                                       hwaddr addr, uint64_t size);
+MemoryRegionSection memory_region_find(MemoryRegion *mr, hwaddr addr,
+                                       uint64_t size);
 
 /**
  * memory_listener_register: register callbacks to be called when memory
@@ -794,9 +775,7 @@ void memory_listener_unregister(MemoryListener *listener);
  * @attrs: memory transaction attributes to use for the access
  */
 MemTxResult memory_region_dispatch_read(struct uc_struct *uc, MemoryRegion *mr,
-                                        hwaddr addr,
-                                        uint64_t *pval,
-                                        MemOp op,
+                                        hwaddr addr, uint64_t *pval, MemOp op,
                                         MemTxAttrs attrs);
 /**
  * memory_region_dispatch_write: perform a write directly to the specified
@@ -809,9 +788,7 @@ MemTxResult memory_region_dispatch_read(struct uc_struct *uc, MemoryRegion *mr,
  * @attrs: memory transaction attributes to use for the access
  */
 MemTxResult memory_region_dispatch_write(struct uc_struct *uc, MemoryRegion *mr,
-                                         hwaddr addr,
-                                         uint64_t data,
-                                         MemOp op,
+                                         hwaddr addr, uint64_t data, MemOp op,
                                          MemTxAttrs attrs);
 
 /**
@@ -820,16 +797,15 @@ MemTxResult memory_region_dispatch_write(struct uc_struct *uc, MemoryRegion *mr,
  * @as: an uninitialized #AddressSpace
  * @root: a #MemoryRegion that routes addresses for the address space
  */
-void address_space_init(struct uc_struct *uc, 
-                        AddressSpace *as,
+void address_space_init(struct uc_struct *uc, AddressSpace *as,
                         MemoryRegion *root);
 
 /**
  * address_space_destroy: destroy an address space
  *
- * Releases all resources associated with an address space.  After an address space
- * is destroyed, its root memory region (given by address_space_init()) may be destroyed
- * as well.
+ * Releases all resources associated with an address space.  After an address
+ * space is destroyed, its root memory region (given by address_space_init())
+ * may be destroyed as well.
  *
  * @as: address space to be destroyed
  */
@@ -859,9 +835,8 @@ void address_space_remove_listeners(AddressSpace *as);
  * @len: the number of bytes to read or write
  * @is_write: indicates the transfer direction
  */
-MemTxResult address_space_rw(AddressSpace *as, hwaddr addr,
-                             MemTxAttrs attrs, void *buf,
-                             hwaddr len, bool is_write);
+MemTxResult address_space_rw(AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
+                             void *buf, hwaddr len, bool is_write);
 
 /**
  * address_space_write: write to address space.
@@ -876,8 +851,7 @@ MemTxResult address_space_rw(AddressSpace *as, hwaddr addr,
  * @buf: buffer with the data transferred
  * @len: the number of bytes to write
  */
-MemTxResult address_space_write(AddressSpace *as, hwaddr addr,
-                                MemTxAttrs attrs,
+MemTxResult address_space_write(AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
                                 const void *buf, hwaddr len);
 
 /**
@@ -903,8 +877,8 @@ MemTxResult address_space_write(AddressSpace *as, hwaddr addr,
  * @len: the number of bytes to write
  */
 MemTxResult address_space_write_rom(AddressSpace *as, hwaddr addr,
-                                    MemTxAttrs attrs,
-                                    const void *buf, hwaddr len);
+                                    MemTxAttrs attrs, const void *buf,
+                                    hwaddr len);
 
 /* address_space_ld*: load from an address space
  * address_space_st*: store to an address space
@@ -928,21 +902,21 @@ MemTxResult address_space_write_rom(AddressSpace *as, hwaddr addr,
  */
 
 #ifdef UNICORN_ARCH_POSTFIX
-#define SUFFIX       UNICORN_ARCH_POSTFIX
+#define SUFFIX UNICORN_ARCH_POSTFIX
 #else
 #define SUFFIX
 #endif
-#define ARG1         as
-#define ARG1_DECL    AddressSpace *as
+#define ARG1 as
+#define ARG1_DECL AddressSpace *as
 #include "exec/memory_ldst.inc.h"
 
 #ifdef UNICORN_ARCH_POSTFIX
-#define SUFFIX       UNICORN_ARCH_POSTFIX
+#define SUFFIX UNICORN_ARCH_POSTFIX
 #else
 #define SUFFIX
 #endif
-#define ARG1         as
-#define ARG1_DECL    AddressSpace *as
+#define ARG1 as
+#define ARG1_DECL AddressSpace *as
 #include "exec/memory_ldst_phys.inc.h"
 
 struct MemoryRegionCache {
@@ -954,8 +928,7 @@ struct MemoryRegionCache {
     bool is_write;
 };
 
-#define MEMORY_REGION_CACHE_INVALID ((MemoryRegionCache) { .mrs.mr = NULL })
-
+#define MEMORY_REGION_CACHE_INVALID ((MemoryRegionCache){.mrs.mr = NULL})
 
 /* address_space_ld*_cached: load from a cached #MemoryRegion
  * address_space_st*_cached: store into a cached #MemoryRegion
@@ -982,28 +955,33 @@ struct MemoryRegionCache {
  */
 
 #ifdef UNICORN_ARCH_POSTFIX
-#define SUFFIX       glue(_cached_slow, UNICORN_ARCH_POSTFIX)
+#define SUFFIX glue(_cached_slow, UNICORN_ARCH_POSTFIX)
 #else
-#define SUFFIX       _cached_slow
+#define SUFFIX _cached_slow
 #endif
-#define ARG1         cache
-#define ARG1_DECL    MemoryRegionCache *cache
+#define ARG1 cache
+#define ARG1_DECL MemoryRegionCache *cache
 #include "exec/memory_ldst.inc.h"
 
 /* Inline fast path for direct RAM access.  */
 #ifdef UNICORN_ARCH_POSTFIX
-static inline uint8_t glue(address_space_ldub_cached, UNICORN_ARCH_POSTFIX)(struct uc_struct *uc, MemoryRegionCache *cache,
+static inline uint8_t glue(address_space_ldub_cached,
+                           UNICORN_ARCH_POSTFIX)(struct uc_struct *uc,
+                                                 MemoryRegionCache *cache,
 #else
-static inline uint8_t address_space_ldub_cached(struct uc_struct *uc, MemoryRegionCache *cache,
+static inline uint8_t address_space_ldub_cached(struct uc_struct *uc,
+                                                MemoryRegionCache *cache,
 #endif
-    hwaddr addr, MemTxAttrs attrs, MemTxResult *result)
+                                                 hwaddr addr, MemTxAttrs attrs,
+                                                 MemTxResult *result)
 {
     assert(addr < cache->len);
     if (likely(cache->ptr)) {
         return ldub_p((char *)cache->ptr + addr);
     } else {
 #ifdef UNICORN_ARCH_POSTFIX
-        return glue(address_space_ldub_cached_slow, UNICORN_ARCH_POSTFIX)(uc, cache, addr, attrs, result);
+        return glue(address_space_ldub_cached_slow,
+                    UNICORN_ARCH_POSTFIX)(uc, cache, addr, attrs, result);
 #else
         return address_space_ldub_cached_slow(uc, cache, addr, attrs, result);
 #endif
@@ -1011,9 +989,11 @@ static inline uint8_t address_space_ldub_cached(struct uc_struct *uc, MemoryRegi
 }
 
 #ifdef UNICORN_ARCH_POSTFIX
-static inline void glue(address_space_stb_cached, UNICORN_ARCH_POSTFIX)(struct uc_struct *uc, MemoryRegionCache *cache,
+static inline void glue(address_space_stb_cached, UNICORN_ARCH_POSTFIX)(
+    struct uc_struct *uc, MemoryRegionCache *cache,
 #else
-static inline void address_space_stb_cached(struct uc_struct *uc, MemoryRegionCache *cache,
+static inline void address_space_stb_cached(
+    struct uc_struct *uc, MemoryRegionCache *cache,
 #endif
     hwaddr addr, uint32_t val, MemTxAttrs attrs, MemTxResult *result)
 {
@@ -1022,26 +1002,27 @@ static inline void address_space_stb_cached(struct uc_struct *uc, MemoryRegionCa
         stb_p((char *)cache->ptr + addr, val);
     } else {
 #ifdef UNICORN_ARCH_POSTFIX
-        glue(address_space_stb_cached_slow, UNICORN_ARCH_POSTFIX)(uc, cache, addr, val, attrs, result);
+        glue(address_space_stb_cached_slow,
+             UNICORN_ARCH_POSTFIX)(uc, cache, addr, val, attrs, result);
 #else
         address_space_stb_cached_slow(uc, cache, addr, val, attrs, result);
 #endif
     }
 }
 
-#define ENDIANNESS   _le
+#define ENDIANNESS _le
 #include "exec/memory_ldst_cached.inc.h"
 
-#define ENDIANNESS   _be
+#define ENDIANNESS _be
 #include "exec/memory_ldst_cached.inc.h"
 
 #ifdef UNICORN_ARCH_POSTFIX
-#define SUFFIX       glue(_cached, UNICORN_ARCH_POSTFIX)
+#define SUFFIX glue(_cached, UNICORN_ARCH_POSTFIX)
 #else
-#define SUFFIX       _cached
+#define SUFFIX _cached
 #endif
-#define ARG1         cache
-#define ARG1_DECL    MemoryRegionCache *cache
+#define ARG1 cache
+#define ARG1_DECL MemoryRegionCache *cache
 #include "exec/memory_ldst_phys.inc.h"
 
 /* address_space_translate: translate an address range into an address space
@@ -1058,17 +1039,16 @@ static inline void address_space_stb_cached(struct uc_struct *uc, MemoryRegionCa
  * @attrs: memory attributes
  */
 MemoryRegion *flatview_translate(struct uc_struct *uc, FlatView *fv,
-                                 hwaddr addr, hwaddr *xlat,
-                                 hwaddr *len, bool is_write,
-                                 MemTxAttrs attrs);
+                                 hwaddr addr, hwaddr *xlat, hwaddr *len,
+                                 bool is_write, MemTxAttrs attrs);
 
 static inline MemoryRegion *address_space_translate(AddressSpace *as,
                                                     hwaddr addr, hwaddr *xlat,
                                                     hwaddr *len, bool is_write,
                                                     MemTxAttrs attrs)
 {
-    return flatview_translate(as->uc, address_space_to_flatview(as),
-                              addr, xlat, len, is_write, attrs);
+    return flatview_translate(as->uc, address_space_to_flatview(as), addr, xlat,
+                              len, is_write, attrs);
 }
 
 /* address_space_access_valid: check for validity of accessing an address
@@ -1104,10 +1084,11 @@ bool address_space_access_valid(AddressSpace *as, hwaddr addr, hwaddr len,
  * @is_write: indicates the transfer direction
  * @attrs: memory attributes
  */
-void *address_space_map(AddressSpace *as, hwaddr addr,
-                        hwaddr *plen, bool is_write, MemTxAttrs attrs);
+void *address_space_map(AddressSpace *as, hwaddr addr, hwaddr *plen,
+                        bool is_write, MemTxAttrs attrs);
 
-/* address_space_unmap: Unmaps a memory region previously mapped by address_space_map()
+/* address_space_unmap: Unmaps a memory region previously mapped by
+ * address_space_map()
  *
  * Will also mark the memory as dirty if @is_write == %true.  @access_len gives
  * the amount of memory that was actually read or written by the caller.
@@ -1121,15 +1102,15 @@ void *address_space_map(AddressSpace *as, hwaddr addr,
 void address_space_unmap(AddressSpace *as, void *buffer, hwaddr len,
                          bool is_write, hwaddr access_len);
 
-
 /* Internal functions, part of the implementation of address_space_read.  */
 MemTxResult address_space_read_full(AddressSpace *as, hwaddr addr,
                                     MemTxAttrs attrs, void *buf, hwaddr len);
-MemTxResult flatview_read_continue(struct uc_struct *, FlatView *fv, hwaddr addr,
-                                   MemTxAttrs attrs, void *buf,
+MemTxResult flatview_read_continue(struct uc_struct *, FlatView *fv,
+                                   hwaddr addr, MemTxAttrs attrs, void *buf,
                                    hwaddr len, hwaddr addr1, hwaddr l,
                                    MemoryRegion *mr);
-void *qemu_map_ram_ptr(struct uc_struct *uc, RAMBlock *ram_block, ram_addr_t addr);
+void *qemu_map_ram_ptr(struct uc_struct *uc, RAMBlock *ram_block,
+                       ram_addr_t addr);
 
 static inline bool memory_access_is_direct(MemoryRegion *mr, bool is_write)
 {
@@ -1158,9 +1139,9 @@ static inline __attribute__((__always_inline__))
 #else
 static inline
 #endif
-MemTxResult address_space_read(AddressSpace *as, hwaddr addr,
-                               MemTxAttrs attrs, void *buf,
-                               hwaddr len)
+MemTxResult
+address_space_read(AddressSpace *as, hwaddr addr, MemTxAttrs attrs, void *buf,
+                   hwaddr len)
 {
     MemTxResult result = MEMTX_OK;
 #ifndef _MSC_VER
@@ -1178,8 +1159,8 @@ MemTxResult address_space_read(AddressSpace *as, hwaddr addr,
                 ptr = qemu_map_ram_ptr(mr->uc, mr->ram_block, addr1);
                 memcpy(buf, ptr, len);
             } else {
-                result = flatview_read_continue(as->uc, fv, addr, attrs, buf, len,
-                                                addr1, l, mr);
+                result = flatview_read_continue(as->uc, fv, addr, attrs, buf,
+                                                len, addr1, l, mr);
             }
         }
     } else {
@@ -1211,15 +1192,32 @@ static inline MemOp devend_memop(enum device_endian end)
 }
 #endif
 
-MemoryRegion *memory_map(struct uc_struct *uc, hwaddr begin, size_t size, uint32_t perms);
-MemoryRegion *memory_map_ptr(struct uc_struct *uc, hwaddr begin, size_t size, uint32_t perms, void *ptr);
- MemoryRegion *memory_map_io(struct uc_struct *uc, ram_addr_t begin, size_t size, uc_cb_mmio_read_t read_cb,
-                             uc_cb_mmio_write_t write_cb, void *user_data_read, void *user_data_write);
-MemoryRegion *memory_cow(struct uc_struct *uc, MemoryRegion *parrent, hwaddr begin, size_t size);
-void memory_unmap(struct uc_struct *uc, MemoryRegion *mr);
-void memory_moveout(struct uc_struct *uc, MemoryRegion *mr);
-void memory_movein(struct uc_struct *uc, MemoryRegion *mr);
+MemoryRegion *memory_map(struct uc_struct *uc, hwaddr begin, size_t size,
+                         uint32_t perms);
+MemoryRegion *memory_map_ptr(struct uc_struct *uc, hwaddr begin, size_t size,
+                             uint32_t perms, void *ptr);
+MemoryRegion *memory_map_io(struct uc_struct *uc, ram_addr_t begin, size_t size,
+                            uc_cb_mmio_read_t read_cb,
+                            uc_cb_mmio_write_t write_cb, void *user_data_read,
+                            void *user_data_write);
+MemoryRegion *memory_cow(struct uc_struct *uc, UcMapping *mapping,
+                         MemoryRegion *current, hwaddr begin, size_t size);
+void memory_unmap(struct uc_struct *uc, UcMapping *mapping);
+void memory_moveout(struct uc_struct *uc, UcMapping *mapping,
+                    bool update_topology);
+void memory_movein(struct uc_struct *uc, UcMapping *mapping,
+                   bool update_topology);
+void memory_mapping_restore_topology(struct uc_struct *uc, UcMapping *mapping,
+                                     MemoryRegion *const *regions,
+                                     uint32_t region_count,
+                                     bool update_topology);
+void memory_mapping_free(UcMapping *mapping);
+void memory_mapping_prune(UcMapping *mapping);
+void memory_mapping_normalize(UcMapping *mapping);
 int memory_free(struct uc_struct *uc);
-bool flatview_copy(struct uc_struct *uc, FlatView *dst, FlatView *src, bool update_dispatcher);
+bool flatview_copy(struct uc_struct *uc, FlatView *dst, FlatView *src,
+                   bool update_dispatcher);
+bool flatview_reserve(FlatView *view, unsigned int count);
+void address_space_restore_flatview(AddressSpace *as, FlatView *view);
 
 #endif

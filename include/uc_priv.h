@@ -75,6 +75,54 @@ typedef struct {
     reg_write_t write;
 } context_reg_rw_t;
 
+typedef struct UcEmuFrame {
+    struct uc_struct *uc;
+    QemuThread timer;
+    int state;
+    int64_t start_time;
+    uint64_t timeout;
+    bool descendant_timed_out;
+    bool timer_started;
+#ifdef _WIN32
+    uintptr_t timer_handle;
+#endif
+} UcEmuFrame;
+
+typedef struct UcTbExecFrame {
+    struct TranslationBlock *tb;
+    bool active;
+    bool exit_requested;
+} UcTbExecFrame;
+
+struct UcMapping {
+    struct uc_struct *owner;
+    uint64_t begin;
+    uint64_t size;
+    uint32_t perms;
+    uint32_t context_refs;
+    int32_t priority;
+    bool active;
+    MemoryRegion *root;
+    MemoryRegion *regions;
+    UcMapping *next;
+};
+
+typedef struct UcContextMapping {
+    UcMapping *mapping;
+    uint32_t first_region;
+    uint32_t region_count;
+} UcContextMapping;
+
+typedef enum UcTestAllocFailSite {
+    UC_TEST_ALLOC_FAIL_NONE,
+    UC_TEST_ALLOC_FAIL_MAPPED_BLOCKS,
+    UC_TEST_ALLOC_FAIL_MAPPING_RECORD,
+    UC_TEST_ALLOC_FAIL_CONTEXT_VIEW,
+    UC_TEST_ALLOC_FAIL_CONTEXT_MAPPINGS,
+    UC_TEST_ALLOC_FAIL_CONTEXT_REGIONS,
+    UC_TEST_ALLOC_FAIL_RESTORE_VIEW,
+} UcTestAllocFailSite;
+
 typedef void (*reg_reset_t)(struct uc_struct *uc);
 
 typedef bool (*uc_write_mem_t)(AddressSpace *as, hwaddr addr,
@@ -87,9 +135,9 @@ typedef bool (*uc_read_mem_virtual_t)(struct uc_struct *uc, vaddr addr,
                                       uint32_t prot, uint8_t *buf, int len);
 
 typedef bool (*uc_virtual_to_physical_t)(struct uc_struct *uc, vaddr addr,
-                                      uint32_t prot, uint64_t *res);
+                                         uint32_t prot, uint64_t *res);
 
-typedef MemoryRegion *(*uc_mem_cow_t)(struct uc_struct *uc,
+typedef MemoryRegion *(*uc_mem_cow_t)(struct uc_struct *uc, UcMapping *mapping,
                                       MemoryRegion *current, hwaddr begin,
                                       size_t size);
 
@@ -111,7 +159,22 @@ typedef MemoryRegion *(*uc_args_uc_ram_size_ptr_t)(struct uc_struct *,
                                                    hwaddr begin, size_t size,
                                                    uint32_t perms, void *ptr);
 
-typedef void (*uc_mem_unmap_t)(struct uc_struct *, MemoryRegion *mr);
+typedef void (*uc_mem_unmap_t)(struct uc_struct *, UcMapping *mapping);
+
+typedef void (*uc_memory_move_t)(struct uc_struct *, UcMapping *mapping,
+                                 bool update_topology);
+
+typedef void (*uc_memory_restore_topology_t)(struct uc_struct *,
+                                             UcMapping *mapping,
+                                             MemoryRegion *const *regions,
+                                             uint32_t region_count,
+                                             bool update_topology);
+
+typedef void (*uc_memory_mapping_free_t)(UcMapping *mapping);
+
+typedef void (*uc_memory_mapping_prune_t)(UcMapping *mapping);
+
+typedef void (*uc_memory_mapping_normalize_t)(UcMapping *mapping);
 
 typedef MemoryRegion *(*uc_memory_mapping_t)(struct uc_struct *, hwaddr addr);
 
@@ -119,6 +182,10 @@ typedef void (*uc_memory_filter_t)(MemoryRegion *, int32_t);
 
 typedef bool (*uc_flatview_copy_t)(struct uc_struct *, FlatView *, FlatView *,
                                    bool);
+
+typedef bool (*uc_flatview_reserve_t)(FlatView *, unsigned int);
+
+typedef void (*uc_address_space_restore_flatview_t)(AddressSpace *, FlatView *);
 
 typedef void (*uc_readonly_mem_t)(MemoryRegion *mr, bool readonly);
 
@@ -148,6 +215,13 @@ typedef void (*uc_softfloat_initialize)(void);
 // tcg flush softmmu tlb
 typedef void (*uc_tcg_flush_tlb)(struct uc_struct *uc);
 
+typedef bool (*uc_tb_exec_frame_resolve_t)(
+    struct uc_struct *uc, const struct TranslationBlock *tb,
+    uint64_t phys_start[2], uint32_t phys_size[2]);
+
+typedef bool (*uc_tb_exec_frame_publish_t)(struct uc_struct *uc,
+                                           uintptr_t retaddr);
+
 // Invalidate the TB at given address
 typedef void (*uc_invalidate_tb_t)(struct uc_struct *uc, uint64_t start,
                                    size_t len);
@@ -161,9 +235,12 @@ typedef uc_tcg_flush_tlb uc_tb_flush_t;
 typedef uc_err (*uc_set_tlb_t)(struct uc_struct *uc, int mode);
 
 // PAuth sign and strip
-typedef uc_err (*uc_pauth_sign_t)(struct uc_struct *uc, uint64_t ptr, int key, uint64_t diversifier, uint64_t *signed_ptr);
-typedef uc_err (*uc_pauth_strip_t)(struct uc_struct *uc, uint64_t ptr, int key, uint64_t *stripped_ptr);
-typedef uc_err (*uc_pauth_auth_t)(struct uc_struct *uc, uint64_t ptr, int key, uint64_t diversifier, bool *valid);
+typedef uc_err (*uc_pauth_sign_t)(struct uc_struct *uc, uint64_t ptr, int key,
+                                  uint64_t diversifier, uint64_t *signed_ptr);
+typedef uc_err (*uc_pauth_strip_t)(struct uc_struct *uc, uint64_t ptr, int key,
+                                   uint64_t *stripped_ptr);
+typedef uc_err (*uc_pauth_auth_t)(struct uc_struct *uc, uint64_t ptr, int key,
+                                  uint64_t diversifier, bool *valid);
 
 struct hook {
     int type;       // UC_HOOK_*
@@ -192,6 +269,10 @@ typedef size_t (*uc_context_size_t)(struct uc_struct *uc);
 
 // Generate a CPU context
 typedef uc_err (*uc_context_save_t)(struct uc_struct *uc, uc_context *context);
+
+// Validate a CPU context before any restore mutation
+typedef uc_err (*uc_context_validate_t)(struct uc_struct *uc,
+                                        const uc_context *context);
 
 // Restore a CPU context
 typedef uc_err (*uc_context_restore_t)(struct uc_struct *uc,
@@ -253,9 +334,8 @@ typedef enum uc_hook_idx {
 
 // if statement to check hook bounds
 #define HOOK_BOUND_CHECK(hh, addr)                                             \
-    (!((hh)->to_delete) &&                                                     \
-     ((hh)->begin > (hh)->end ||                                               \
-      ((addr) >= (hh)->begin && (addr) <= (hh)->end)))
+    (!((hh)->to_delete) && ((hh)->begin > (hh)->end ||                         \
+                            ((addr) >= (hh)->begin && (addr) <= (hh)->end)))
 
 #define HOOK_EXISTS(uc, idx) ((uc)->hook[idx##_IDX].head != NULL)
 #define HOOK_EXISTS_BOUNDED(uc, idx, addr)                                     \
@@ -279,9 +359,8 @@ static inline bool _hook_exists_bounded_range(struct list_item *cur,
     while (cur != NULL) {
         struct hook *hook = (struct hook *)cur->data;
 
-        if (!hook->to_delete &&
-            (hook->begin > hook->end ||
-             (hook->begin <= end && hook->end >= begin))) {
+        if (!hook->to_delete && (hook->begin > hook->end ||
+                                 (hook->begin <= end && hook->end >= begin))) {
             return true;
         }
         cur = cur->next;
@@ -334,14 +413,22 @@ struct uc_struct {
     uc_memory_mapping_t memory_mapping;
     uc_memory_filter_t memory_filter_subregions;
     uc_flatview_copy_t flatview_copy;
+    uc_flatview_reserve_t flatview_reserve;
+    uc_address_space_restore_flatview_t address_space_restore_flatview;
     uc_mem_unmap_t memory_unmap;
-    uc_mem_unmap_t memory_moveout;
-    uc_mem_unmap_t memory_movein;
+    uc_memory_move_t memory_moveout;
+    uc_memory_move_t memory_movein;
+    uc_memory_restore_topology_t memory_restore_topology;
+    uc_memory_mapping_free_t memory_mapping_free;
+    uc_memory_mapping_prune_t memory_mapping_prune;
+    uc_memory_mapping_normalize_t memory_mapping_normalize;
     uc_readonly_mem_t readonly_mem;
     uc_cpus_init cpus_init;
     uc_target_page_init target_page;
     uc_softfloat_initialize softfloat_initialize;
     uc_tcg_flush_tlb tcg_flush_tlb;
+    uc_tb_exec_frame_resolve_t tb_exec_frame_resolve;
+    uc_tb_exec_frame_publish_t tb_exec_frame_publish;
     uc_invalidate_tb_t uc_invalidate_tb;
     uc_gen_tb_t uc_gen_tb;
     uc_tb_flush_t tb_flush;
@@ -354,6 +441,7 @@ struct uc_struct {
 
     uc_context_size_t context_size;
     uc_context_save_t context_save;
+    uc_context_validate_t context_validate;
     uc_context_restore_t context_restore;
 
     /*  only 1 cpu in unicorn,
@@ -402,8 +490,8 @@ struct uc_struct {
     struct list hooks_to_del;
     int hooks_count[UC_HOOK_MAX];
     uintptr_t hook_generation[UC_HOOK_MAX];
-    HookDispatchCacheEntry
-        hook_dispatch_cache[UC_HOOK_MAX][UC_HOOK_DISPATCH_CACHE_SIZE];
+    HookDispatchCacheEntry hook_dispatch_cache[UC_HOOK_MAX]
+                                              [UC_HOOK_DISPATCH_CACHE_SIZE];
 
     // hook to count number of instructions for uc_emu_start()
     uc_hook count_hook;
@@ -419,10 +507,10 @@ struct uc_struct {
     bool quit_request;   // request to quit the current TB, but continue to
                          // emulate - for uc_mem_protect()
     bool emulation_done; // emulation is done by uc_emu_start()
-    bool timed_out;      // emulation timed out, that can retrieve via
-                         // uc_query(UC_QUERY_TIMEOUT)
-    QemuThread timer;    // timer for emulation timeout
+    int timed_out;       // emulation timed out, that can retrieve via
+                         // uc_query(UC_QUERY_TIMEOUT); accessed atomically
     uint64_t timeout;    // timeout for uc_emu_start()
+    UcEmuFrame emu_frames[UC_MAX_NESTED_LEVEL];
 
     uint64_t invalid_addr; // invalid address to be accessed
     int invalid_error;     // invalid memory code: 1 = READ, 2 = WRITE, 3 = CODE
@@ -434,8 +522,12 @@ struct uc_struct {
                       // details.
 
     int thumb; // thumb mode for ARM
-    MemoryRegion **mapped_blocks;
+    UcMapping **mapped_blocks;
     uint32_t mapped_block_count;
+    uint32_t mapped_block_capacity;
+    UcMapping *mapping_records;
+    uc_context *memory_contexts;
+    uint32_t memory_context_count;
     uint32_t mapped_block_cache_index;
     void *qemu_thread_data; // to support cross compile to Windows
                             // (qemu-thread-win32.c)
@@ -457,7 +549,7 @@ struct uc_struct {
     bool init_done;       // Whether the initialization is done.
 
     sigjmp_buf jmp_bufs[UC_MAX_NESTED_JMP_LEVEL];
-    int nested_level;                         // Current nested_level
+    int nested_level; // Current nested_level
 
     uc_tb last_tb;
     bool last_tb_valid;
@@ -468,14 +560,14 @@ struct uc_struct {
 #if defined(WIN32) && defined(WIN32_ENABLE_VEH)
     bool prealloc; // Commit the whole code gen buffer upfront instead of
                    // relying on lazy commit via the vectored exception handler.
-                   // Avoids installing the process-global VEH, which is required
-                   // for safe concurrent use of multiple uc instances. Only
-                   // meaningful when the VEH path is compiled in; without it the
-                   // buffer is always committed upfront.
+                   // Avoids installing the process-global VEH, which is
+                   // required for safe concurrent use of multiple uc instances.
+                   // Only meaningful when the VEH path is compiled in; without
+                   // it the buffer is always committed upfront.
     PVOID seh_handle;
+    PVOID vch_handle;
     void *seh_closure;
 #endif
-    GArray *unmapped_regions;
     int32_t snapshot_level;
     uint64_t nested; // the nested level of all exposed API
     bool thread_executable_entry;
@@ -483,7 +575,9 @@ struct uc_struct {
     bool skip_sync_pc_on_exit;
     bool tb_flush_pending;
     unsigned int tb_exec_depth;
-    bool tb_exec_active[UC_MAX_NESTED_JMP_LEVEL];
+    UcTbExecFrame *active_tb_exec_frame;
+    UcTbExecFrame tb_exec_frames[UC_MAX_NESTED_JMP_LEVEL];
+    UcTestAllocFailSite test_alloc_fail_site;
 };
 
 static inline bool uc_uses_tcg_count(const struct uc_struct *uc)
@@ -504,8 +598,9 @@ static inline void hook_dispatch_cache_invalidate(struct uc_struct *uc,
     }
 }
 
-static inline struct list_item *hook_dispatch_first_match(
-    struct uc_struct *uc, unsigned int index, uint64_t address)
+static inline struct list_item *hook_dispatch_first_match(struct uc_struct *uc,
+                                                          unsigned int index,
+                                                          uint64_t address)
 {
     unsigned int cache_index =
         (address >> 3) & (UC_HOOK_DISPATCH_CACHE_SIZE - 1);
@@ -537,7 +632,14 @@ struct uc_context {
     bool ramblock_freed;  // wheter there was a some ramblock freed
     RAMBlock *last_block; // The last element of the ramblock list
     FlatView *fv;         // The current flatview of the memory
-    char data[0];         // context
+    struct uc_struct *memory_owner;
+    struct uc_context *memory_prev;
+    struct uc_context *memory_next;
+    UcContextMapping *mappings;
+    MemoryRegion **memory_regions;
+    uint32_t mapping_count;
+    uint32_t memory_region_count;
+    char data[0]; // context
 };
 
 // We have to support 32bit system so we can't hold uint64_t on void*
@@ -555,8 +657,7 @@ static inline int uc_addr_is_exit(uc_engine *uc, uint64_t addr)
     if (uc->use_exits) {
         return g_tree_lookup(uc->ctl_exits, (gpointer)(&addr)) == (gpointer)1;
     } else {
-        return uc->nested_level != 0 &&
-               uc->exits[uc->nested_level - 1] == addr;
+        return uc->nested_level != 0 && uc->exits[uc->nested_level - 1] == addr;
     }
 }
 
@@ -612,9 +713,8 @@ static inline void hooked_regions_check_code(struct list_item *cur,
     while (cur != NULL) {
         struct hook *hook = (struct hook *)cur->data;
 
-        if (!hook->to_delete &&
-            (hook->begin > hook->end ||
-             (hook->begin <= end && hook->end >= start))) {
+        if (!hook->to_delete && (hook->begin > hook->end ||
+                                 (hook->begin <= end && hook->end >= start))) {
             hooked_regions_add(hook, start, length);
         }
         cur = cur->next;
@@ -622,8 +722,7 @@ static inline void hooked_regions_check_code(struct list_item *cur,
 }
 
 static inline void hooked_regions_check_block(struct list_item *cur,
-                                              uint64_t start,
-                                              uint64_t length)
+                                              uint64_t start, uint64_t length)
 {
     while (cur != NULL) {
         struct hook *hook = (struct hook *)cur->data;
@@ -639,8 +738,9 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
                                         uint64_t length)
 {
     hooked_regions_check_code(uc->hook[UC_HOOK_CODE_IDX].head, start, length);
-    hooked_regions_check_block(uc->hook[UC_HOOK_BLOCK_IDX].head, start,
-                               length);
+    hooked_regions_check_code(uc->hook[UC_HOOK_MEM_FETCH_IDX].head, start,
+                              length);
+    hooked_regions_check_block(uc->hook[UC_HOOK_BLOCK_IDX].head, start, length);
 }
 
 /*
@@ -678,8 +778,6 @@ static inline void uc_set_stop_request(uc_engine *uc, bool stop)
 static inline void revert_uc_emu_stop(uc_engine *uc)
 {
     uc_set_stop_request(uc, false);
-    qatomic_set(&uc->cpu->exit_request, 0);
-    qatomic_set(&uc->cpu->tcg_exit_req, 0);
     qatomic_set(&uc->cpu->icount_decr_ptr->u16.high, 0);
 }
 

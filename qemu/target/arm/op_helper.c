@@ -301,6 +301,7 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
             continue;
         if (hook->insn == (env->aarch64 ? UC_ARM64_INS_WFI : UC_ARM_INS_WFI)) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;
@@ -999,6 +1000,7 @@ uint32_t HELPER(uc_hooksys64)(CPUARMState *env, uint32_t insn, void *hk)
     }
 
     uint32_t ret;
+    uc->tb_exec_frame_publish(uc, GETPC());
     JIT_CALLBACK_GUARD_VAR(ret, ((uc_cb_insn_sys_t)(hook->callback))(uc, uc_rt, &cp_reg, hook->user_data));
     return ret;
 }

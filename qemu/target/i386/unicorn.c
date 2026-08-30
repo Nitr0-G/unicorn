@@ -2085,6 +2085,20 @@ static bool x86_insn_hook_validate(uint32_t insn_enum)
     return true;
 }
 
+static uc_err x86_context_restore(struct uc_struct *uc, uc_context *context)
+{
+    CPUX86State *env = uc->cpu->env_ptr;
+    size_t pointer_offset = offsetof(CPUX86State, cpu_breakpoint);
+    size_t pointer_end = offsetof(CPUX86State, old_exception);
+    size_t data_size = uc->cpu_context_size;
+
+    memcpy(env, context->data, pointer_offset);
+    memcpy((uint8_t *)env + pointer_end, context->data + pointer_end,
+           data_size - pointer_end);
+    cpu_x86_update_debug(env);
+    return UC_ERR_OK;
+}
+
 static bool x86_opcode_hook_invalidate(uint32_t op, uint32_t flags)
 {
     if (op != UC_TCG_OP_SUB) {
@@ -2134,6 +2148,7 @@ void uc_init(struct uc_struct *uc)
     uc->opcode_hook_invalidate = x86_opcode_hook_invalidate;
     uc->cpus_init = x86_cpus_init;
     uc->cpu_context_size = offsetof(CPUX86State, end_reset_fields);
+    uc->context_restore = x86_context_restore;
     uc_common_init(uc);
 }
 

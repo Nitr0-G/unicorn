@@ -302,7 +302,6 @@ struct CPUState {
     bool stopped;
     bool unplug;
     bool crash_occurred;
-    bool exit_request;
     bool in_exclusive_context;
     uint32_t cflags_next_tb;
     /* updates protected by BQL */
@@ -357,9 +356,11 @@ struct CPUState {
     /* pointer to CPUArchState.cc */
     struct CPUClass *cc;
 
-    // Set to force TCG to stop executing linked TBs for this
-    // CPU and return to its top level loop.
-    volatile sig_atomic_t tcg_exit_req;
+    /*
+     * Set after exit payload state to force TCG back to the CPU loop.
+     * Generated code relies on this being a naturally aligned atomic word.
+     */
+    QEMU_ALIGN(4, uint32_t exit_request_pending);
 };
 
 #define CPU(obj) ((CPUState *)(obj))

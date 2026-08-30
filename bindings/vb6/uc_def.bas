@@ -24,6 +24,7 @@ Option Explicit
 '        uc_mem_regions
 '        uc_mem_map_ptr
 '        uc_context_alloc
+'        uc_context_free
 '        uc_free
 '        uc_context_save
 '        uc_context_restore
@@ -2322,6 +2323,9 @@ Public Declare Function ucs_context_alloc Lib "ucvbshim.dll" (ByVal hEngine As L
 '   for detailed error).
 '*/
 'UNICORN_EXPORT
+'uc_err uc_context_free(uc_context *context);
+Public Declare Function ucs_context_free Lib "ucvbshim.dll" (ByVal context As Long) As uc_err
+
 'uc_err uc_free(void* mem);
 Public Declare Function ucs_free Lib "ucvbshim.dll" (ByVal mem As Long) As uc_err
 

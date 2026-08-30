@@ -127,6 +127,7 @@ void helper_cpuid(CPUX86State *env)
         // true -> skip the cpuid instruction
         if (hook->insn == UC_X86_INS_CPUID) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;
@@ -254,6 +255,7 @@ void helper_rdtsc(CPUX86State *env)
         // true -> skip the rdtsc instruction
         if (hook->insn == UC_X86_INS_RDTSC) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;
@@ -301,6 +303,7 @@ void helper_rdtscp(CPUX86State *env)
         // true -> skip the rdtscp instruction
         if (hook->insn == UC_X86_INS_RDTSCP) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;
@@ -357,6 +360,7 @@ void helper_wrmsr(CPUX86State *env)
             continue;
         if (hook->insn == UC_X86_INS_WRMSR) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;
@@ -597,6 +601,7 @@ void helper_rdmsr(CPUX86State *env)
             continue;
         if (hook->insn == UC_X86_INS_RDMSR) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;

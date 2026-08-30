@@ -738,3 +738,27 @@ void riscv_trigger_init(CPURISCVState *env)
         env->cpu_watchpoint[i] = NULL;
     }
 }
+
+void riscv_trigger_update_all(CPURISCVState *env)
+{
+    CPUState *cs = env_cpu(env);
+    int i;
+
+    cpu_breakpoint_remove_all(cs, BP_CPU);
+    cpu_watchpoint_remove_all(cs, BP_CPU);
+    memset(env->cpu_breakpoint, 0, sizeof(env->cpu_breakpoint));
+    memset(env->cpu_watchpoint, 0, sizeof(env->cpu_watchpoint));
+
+    for (i = 0; i < RV_MAX_TRIGGERS; i++) {
+        switch (get_trigger_type(env, i)) {
+        case TRIGGER_TYPE_AD_MATCH:
+            type2_breakpoint_insert(env, i);
+            break;
+        case TRIGGER_TYPE_AD_MATCH6:
+            type6_breakpoint_insert(env, i);
+            break;
+        default:
+            break;
+        }
+    }
+}

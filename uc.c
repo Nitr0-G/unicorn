@@ -13,6 +13,9 @@
 
 #include <time.h> // nanosleep
 #include <string.h>
+#ifdef _WIN32
+#include <process.h>
+#endif
 
 #include "uc_priv.h"
 
@@ -33,9 +36,38 @@
 
 static void clear_deleted_hooks(uc_engine *uc);
 static uc_err uc_snapshot(uc_engine *uc);
-static uc_err uc_restore_latest_snapshot(uc_engine *uc);
+static uc_err uc_restore_snapshot_preflight(uc_engine *uc,
+                                            const uc_context *context,
+                                            FlatView *restore_view);
+static UcMapping *mapped_block_at(const uc_engine *uc, uint64_t address);
+static void context_memory_clear(uc_context *context, bool reclaim,
+                                 bool normalize);
 
-#define UC_HOOK_MEM_FAST_PATH                                               \
+typedef struct UcContextAllocation {
+    size_t capacity;
+    uc_context *context;
+    struct UcContextAllocation *next;
+} UcContextAllocation;
+
+static int context_allocations_lock;
+static UcContextAllocation *context_allocations;
+
+#ifdef UNICORN_TEST_ALLOC_FAILURE
+static bool test_alloc_should_fail(uc_engine *uc,
+                                   UcTestAllocFailSite site)
+{
+    if (uc->test_alloc_fail_site != site) {
+        return false;
+    }
+
+    uc->test_alloc_fail_site = UC_TEST_ALLOC_FAIL_NONE;
+    return true;
+}
+#else
+#define test_alloc_should_fail(uc, site) false
+#endif
+
+#define UC_HOOK_MEM_FAST_PATH                                                  \
     (UC_HOOK_MEM_READ | UC_HOOK_MEM_READ_AFTER | UC_HOOK_MEM_WRITE)
 
 #define UC_MTE_TAG_STORAGE_GRANULE 32
@@ -114,8 +146,7 @@ static void request_tb_flush(uc_engine *uc)
     }
 }
 
-static void hook_invalidate_range(uc_engine *uc, uint64_t begin,
-                                  uint64_t end)
+static void hook_invalidate_range(uc_engine *uc, uint64_t begin, uint64_t end)
 {
     uint64_t span;
 
@@ -226,9 +257,11 @@ const char *uc_strerror(uc_err code)
     case UC_ERR_MMU_READ:
         return "The tlb_fill hook returned false for a read (UC_ERR_MMU_READ)";
     case UC_ERR_MMU_WRITE:
-        return "The tlb_fill hook returned false for a write (UC_ERR_MMU_WRITE)";
+        return "The tlb_fill hook returned false for a write "
+               "(UC_ERR_MMU_WRITE)";
     case UC_ERR_MMU_FETCH:
-        return "The tlb_fill hook returned false for a fetch (UC_ERR_MMU_FETCH)";
+        return "The tlb_fill hook returned false for a fetch "
+               "(UC_ERR_MMU_FETCH)";
     }
 }
 
@@ -337,8 +370,6 @@ static uc_err uc_init_engine(uc_engine *uc)
     }
 
     uc->context_content = UC_CTL_CONTEXT_CPU;
-
-    uc->unmapped_regions = g_array_new(false, false, sizeof(MemoryRegion *));
 
     uc->init_done = true;
 
@@ -543,6 +574,7 @@ uc_err uc_close(uc_engine *uc)
 {
     int i;
     MemoryRegion *mr;
+    UcMapping *mapping, *next_mapping;
 
     if (!uc->init_done) {
         free(uc);
@@ -551,6 +583,17 @@ uc_err uc_close(uc_engine *uc)
 
     // Flush all translation buffers or we leak memory allocated by MMU
     uc->tb_flush(uc);
+
+    for (mapping = uc->mapping_records; mapping; mapping = mapping->next) {
+        if (mapping->active) {
+            uc->memory_moveout(uc, mapping, true);
+            mapping->active = false;
+        }
+    }
+
+    while (uc->memory_contexts) {
+        context_memory_clear(uc->memory_contexts, false, false);
+    }
 
     // Cleanup internally.
     if (uc->release) {
@@ -579,12 +622,11 @@ uc_err uc_close(uc_engine *uc)
     mr->destructor(mr);
     g_free(uc->system_memory);
     g_free(uc->system_io);
-    for (size_t i = 0; i < uc->unmapped_regions->len; i++) {
-        mr = g_array_index(uc->unmapped_regions, MemoryRegion *, i);
-        mr->destructor(mr);
-        g_free(mr);
+    for (mapping = uc->mapping_records; mapping; mapping = next_mapping) {
+        next_mapping = mapping->next;
+        uc->memory_mapping_free(mapping);
+        g_free(mapping);
     }
-    g_array_free(uc->unmapped_regions, true);
 
     // Thread relateds.
     if (uc->qemu_thread_data) {
@@ -608,7 +650,7 @@ uc_err uc_close(uc_engine *uc)
         list_clear(&uc->hook[i]);
     }
 
-    free(uc->mapped_blocks);
+    g_free(uc->mapped_blocks);
 
     g_tree_destroy(uc->ctl_exits);
 
@@ -837,7 +879,7 @@ static bool check_mem_area(uc_engine *uc, uint64_t address, size_t size,
 }
 
 uc_err uc_vmem_translate(uc_engine *uc, uint64_t address, uc_prot prot,
-                              uint64_t *paddress)
+                         uint64_t *paddress)
 {
     UC_INIT(uc);
 
@@ -848,7 +890,8 @@ uc_err uc_vmem_translate(uc_engine *uc, uint64_t address, uc_prot prot,
     }
 
     // The sparc mmu doesn't support probe mode
-    if (uc->arch == UC_ARCH_SPARC && uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
+    if (uc->arch == UC_ARCH_SPARC &&
+        uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
         restore_jit_state(uc);
         return UC_ERR_ARG;
     }
@@ -872,8 +915,8 @@ uc_err uc_vmem_translate(uc_engine *uc, uint64_t address, uc_prot prot,
 }
 
 UNICORN_EXPORT
-uc_err uc_vmem_read(uc_engine *uc, uint64_t address, uc_prot prot,
-                           void *_bytes, size_t size)
+uc_err uc_vmem_read(uc_engine *uc, uint64_t address, uc_prot prot, void *_bytes,
+                    size_t size)
 {
     size_t count = 0, len;
     uint8_t *bytes = _bytes;
@@ -889,7 +932,8 @@ uc_err uc_vmem_read(uc_engine *uc, uint64_t address, uc_prot prot,
     }
 
     // The sparc mmu doesn't support probe mode
-    if (uc->arch == UC_ARCH_SPARC && uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
+    if (uc->arch == UC_ARCH_SPARC &&
+        uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
         restore_jit_state(uc);
         return UC_ERR_ARG;
     }
@@ -919,7 +963,7 @@ uc_err uc_vmem_read(uc_engine *uc, uint64_t address, uc_prot prot,
 
 UNICORN_EXPORT
 uc_err uc_vmem_write(uc_engine *uc, uint64_t address, uc_prot prot,
-                           const void *_bytes, size_t size)
+                     const void *_bytes, size_t size)
 {
     size_t count = 0, len;
     const uint8_t *bytes = _bytes;
@@ -936,7 +980,8 @@ uc_err uc_vmem_write(uc_engine *uc, uint64_t address, uc_prot prot,
     }
 
     // The sparc mmu doesn't support probe mode
-    if (uc->arch == UC_ARCH_SPARC && uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
+    if (uc->arch == UC_ARCH_SPARC &&
+        uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
         restore_jit_state(uc);
         return UC_ERR_ARG;
     }
@@ -951,10 +996,10 @@ uc_err uc_vmem_write(uc_engine *uc, uint64_t address, uc_prot prot,
         align = uc->target_page_align;
         pagesize = uc->target_page_size;
         len = MIN(size - count, (address & ~align) + pagesize - address);
-	if (uc_vmem_translate(uc, address, prot, &paddr) != UC_ERR_OK) {
+        if (uc_vmem_translate(uc, address, prot, &paddr) != UC_ERR_OK) {
             restore_jit_state(uc);
             return UC_ERR_WRITE_PROT;
-	}
+        }
         if (uc_mem_write(uc, paddr, bytes, len) != UC_ERR_OK) {
             restore_jit_state(uc);
             return UC_ERR_WRITE_PROT;
@@ -1009,33 +1054,112 @@ uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *_bytes, uint64_t size)
     }
 }
 
-static bool mem_write_may_touch_current_tb(uc_engine *uc, uint64_t address,
-                                           uint64_t size)
+static bool ranges_overlap(uint64_t first_start, uint64_t first_size,
+                           uint64_t second_start, uint64_t second_size)
 {
-    uint64_t current_page;
-    uint64_t next_page;
-    uint64_t start_page;
-    uint64_t end_page;
-    uint64_t pc;
-
-    if (size == 0 || uc->tb_exec_depth == 0) {
+    if (first_size == 0 || second_size == 0) {
         return false;
     }
-    if (uc->tlb_mode == UC_TLB_VIRTUAL) {
-        return true;
+    if (first_start <= second_start) {
+        return second_start - first_start < first_size;
+    }
+    return first_start - second_start < second_size;
+}
+
+static uint64_t mem_write_active_tb_mask(uc_engine *uc, MemoryRegion *mr,
+                                         uint64_t address, uint64_t size)
+{
+    uint64_t active_mask = 0;
+    unsigned int i;
+
+    if (size == 0 || uc->tb_exec_depth == 0) {
+        return 0;
     }
 
-    pc = uc->get_pc(uc);
-    current_page = pc & ~uc->target_page_align;
-    next_page = current_page + uc->target_page_size;
-    start_page = address & ~uc->target_page_align;
-    end_page = (address + size - 1) & ~uc->target_page_align;
+    if (mr->ram && mr->ram_block != NULL) {
+        MemoryRegion *container = mr;
+        uint64_t region_address = mr->addr;
+        ram_addr_t ram_address;
 
-    if (current_page >= start_page && current_page <= end_page) {
-        return true;
+        while (container->container != uc->system_memory) {
+            container = container->container;
+            region_address += container->addr;
+        }
+        ram_address = mr->ram_block->offset + (address - region_address);
+        for (i = 0; i < UC_MAX_NESTED_LEVEL; i++) {
+            UcTbExecFrame *frame = &uc->tb_exec_frames[i];
+            uint64_t phys_start[2];
+            uint32_t phys_size[2];
+            unsigned int page;
+
+            if (!frame->active) {
+                continue;
+            }
+            if (frame->tb == NULL) {
+                active_mask |= 1ULL << i;
+                continue;
+            }
+            if (!uc->tb_exec_frame_resolve(uc, frame->tb, phys_start,
+                                           phys_size)) {
+                continue;
+            }
+            for (page = 0; page < 2; page++) {
+                if (ranges_overlap(ram_address, size, phys_start[page],
+                                   phys_size[page])) {
+                    active_mask |= 1ULL << i;
+                    break;
+                }
+            }
+        }
     }
-    return next_page > current_page && next_page >= start_page &&
-           next_page <= end_page;
+
+    return active_mask;
+}
+
+static uint64_t all_active_tb_mask(uc_engine *uc)
+{
+    uint64_t active_mask = 0;
+    unsigned int i;
+
+    for (i = 0; i < UC_MAX_NESTED_LEVEL; i++) {
+        if (uc->tb_exec_frames[i].active) {
+            active_mask |= 1ULL << i;
+        }
+    }
+    return active_mask;
+}
+
+static void mark_active_tbs_for_exit(uc_engine *uc, uint64_t active_tb_mask)
+{
+    unsigned int i;
+
+    for (i = 0; i < UC_MAX_NESTED_LEVEL; i++) {
+        if ((active_tb_mask & (1ULL << i)) != 0) {
+            uc->tb_exec_frames[i].exit_requested = true;
+        }
+    }
+}
+
+static void mem_write_finalize_active_tbs(uc_engine *uc,
+                                          uint64_t active_tb_mask)
+{
+    unsigned int current_level;
+
+    if (active_tb_mask == 0) {
+        return;
+    }
+    mark_active_tbs_for_exit(uc, active_tb_mask);
+    request_tb_flush(uc);
+
+    if (uc->nested_level == 0) {
+        return;
+    }
+    current_level = uc->nested_level - 1;
+    if ((active_tb_mask & (1ULL << current_level)) == 0) {
+        return;
+    }
+    uc->quit_request = true;
+    break_translation_loop(uc);
 }
 
 UNICORN_EXPORT
@@ -1045,8 +1169,7 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
     uint64_t count = 0, len;
     const uint8_t *bytes = _bytes;
     MemoryRegion *first_mr;
-    bool wrote_executable = false;
-    uint64_t write_address = address;
+    uint64_t active_tb_mask = 0;
 
     UC_INIT(uc);
 
@@ -1060,6 +1183,10 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
         MemoryRegion *mr =
             count == 0 ? first_mr : uc->memory_mapping(uc, address);
         if (mr) {
+            UcMapping *mapping = mapped_block_at(uc, address);
+            MemoryRegion *original_mr = mr;
+            uint64_t chunk_active_tb_mask = 0;
+            uint64_t cow_active_tb_mask = 0;
             uint32_t operms = mr->perms;
             uint64_t align = uc->target_page_align;
             if (!(operms & UC_PROT_WRITE)) { // write protected
@@ -1069,18 +1196,32 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
             }
 
             len = memory_region_len(uc, mr, address, size - count);
-            if (uc->snapshot_level && uc->snapshot_level > mr->priority) {
-                mr = uc->memory_cow(uc, mr, address & ~align,
-                                    (len + (address & align) + align) & ~align);
+            chunk_active_tb_mask =
+                mem_write_active_tb_mask(uc, mr, address, len);
+            if (mr->ram && uc->memory_context_count != 0 &&
+                uc->snapshot_level > mr->priority) {
+                uint64_t cow_address = address & ~align;
+                uint64_t cow_size = (len + (address & align) + align) & ~align;
+
+                cow_active_tb_mask =
+                    mem_write_active_tb_mask(uc, mr, cow_address, cow_size);
+                assert(mapping != NULL);
+                mr = uc->memory_cow(uc, mapping, mr, cow_address, cow_size);
                 if (!mr) {
+                    if (!(operms & UC_PROT_WRITE)) {
+                        uc->readonly_mem(original_mr, true);
+                    }
+                    mem_write_finalize_active_tbs(uc, active_tb_mask);
+                    restore_jit_state(uc);
                     return UC_ERR_NOMEM;
                 }
+                active_tb_mask |= cow_active_tb_mask;
             }
             if (uc->write_mem(&uc->address_space_memory, address, bytes, len) ==
                 false) {
                 break;
             }
-            wrote_executable |= (operms & UC_PROT_EXEC) != 0;
+            active_tb_mask |= chunk_active_tb_mask;
 
             if (!(operms & UC_PROT_WRITE)) { // write protected
                 // now write protect it again
@@ -1095,12 +1236,7 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
         }
     }
 
-    if (wrote_executable &&
-        mem_write_may_touch_current_tb(uc, write_address, size)) {
-        request_tb_flush(uc);
-        uc->quit_request = true;
-        break_translation_loop(uc);
-    }
+    mem_write_finalize_active_tbs(uc, active_tb_mask);
 
     if (count == size) {
         restore_jit_state(uc);
@@ -1112,38 +1248,127 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
 }
 
 #define TIMEOUT_STEP 2 // microseconds
+typedef enum UcEmuFrameState {
+    UC_EMU_FRAME_INACTIVE,
+    UC_EMU_FRAME_PREPARED,
+    UC_EMU_FRAME_ACTIVE,
+    UC_EMU_FRAME_DONE,
+    UC_EMU_FRAME_TIMED_OUT,
+} UcEmuFrameState;
+
+static int emu_atomic_read(int *value)
+{
+#ifdef _MSC_VER
+    return InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+#else
+    return qatomic_cmpxchg(value, 0, 0);
+#endif
+}
+
+static void emu_atomic_set(int *value, int new_value)
+{
+#ifdef _MSC_VER
+    InterlockedExchange((volatile LONG *)value, new_value);
+#else
+    qatomic_xchg(value, new_value);
+#endif
+}
+
+static int emu_atomic_cmpxchg(int *value, int old_value, int new_value)
+{
+#ifdef _MSC_VER
+    return InterlockedCompareExchange((volatile LONG *)value, new_value,
+                                      old_value);
+#else
+    return qatomic_cmpxchg(value, old_value, new_value);
+#endif
+}
+
+static bool emu_ancestor_timed_out(uc_engine *uc, int level)
+{
+    int i;
+
+    for (i = 0; i < level; i++) {
+        if (emu_atomic_read(&uc->emu_frames[i].state) ==
+            UC_EMU_FRAME_TIMED_OUT) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void *_timeout_fn(void *arg)
 {
-    struct uc_struct *uc = arg;
-    int64_t current_time = get_clock();
+    UcEmuFrame *frame = (UcEmuFrame *)arg;
+    struct uc_struct *uc = frame->uc;
 
-    do {
+    while (emu_atomic_read(&frame->state) == UC_EMU_FRAME_PREPARED) {
         usleep(TIMEOUT_STEP);
-        // perhaps emulation is even done before timeout?
-        if (uc->emulation_done) {
+    }
+    while (emu_atomic_read(&frame->state) == UC_EMU_FRAME_ACTIVE) {
+        int64_t current_time = get_clock();
+
+        if ((uint64_t)(current_time - frame->start_time) >= frame->timeout &&
+            emu_atomic_cmpxchg(&frame->state, UC_EMU_FRAME_ACTIVE,
+                               UC_EMU_FRAME_TIMED_OUT) == UC_EMU_FRAME_ACTIVE) {
+            emu_atomic_set(&uc->timed_out, true);
+            uc_set_stop_request(uc, true);
+            if (uc->cpu) {
+                cpu_exit(uc->cpu);
+            }
             break;
         }
-    } while ((uint64_t)(get_clock() - current_time) < uc->timeout);
-
-    // timeout before emulation is done?
-    if (!uc->emulation_done) {
-        uc->timed_out = true;
-        // force emulation to stop
-        uc_emu_stop(uc);
+        if (emu_atomic_read(&frame->state) == UC_EMU_FRAME_ACTIVE) {
+            usleep(TIMEOUT_STEP);
+        }
     }
 
     return NULL;
 }
 
-static void enable_emu_timer(uc_engine *uc, uint64_t timeout)
+#ifdef _WIN32
+static unsigned __stdcall timeout_fn_win32(void *arg)
 {
-    uc->timeout = timeout;
-    qemu_thread_create(uc, &uc->timer, "timeout", _timeout_fn, uc,
-                       QEMU_THREAD_JOINABLE);
+    _timeout_fn(arg);
+    return 0;
+}
+#endif
+
+static uc_err enable_emu_timer(UcEmuFrame *frame)
+{
+#ifdef _WIN32
+    frame->timer_handle =
+        _beginthreadex(NULL, 0, timeout_fn_win32, frame, 0, NULL);
+    if (frame->timer_handle == 0) {
+        return UC_ERR_RESOURCE;
+    }
+#else
+    if (qemu_thread_create(frame->uc, &frame->timer, "timeout", _timeout_fn,
+                           frame, QEMU_THREAD_JOINABLE) != 0) {
+        return UC_ERR_RESOURCE;
+    }
+#endif
+    frame->timer_started = true;
+    return UC_ERR_OK;
 }
 
-static void hook_count_cb(struct uc_struct *uc, uint64_t address,
-                          uint32_t size, void *user_data)
+static void join_emu_timer(UcEmuFrame *frame)
+{
+    if (!frame->timer_started) {
+        return;
+    }
+#ifdef _WIN32
+    WaitForSingleObject((HANDLE)frame->timer_handle, INFINITE);
+    CloseHandle((HANDLE)frame->timer_handle);
+    frame->timer_handle = 0;
+#else
+    qemu_thread_join(&frame->timer);
+#endif
+    frame->timer_started = false;
+}
+
+static void hook_count_cb(struct uc_struct *uc, uint64_t address, uint32_t size,
+                          void *user_data)
 {
     uc->emu_counter++;
     if (uc->emu_counter > uc->emu_count) {
@@ -1174,16 +1399,23 @@ UNICORN_EXPORT
 uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
                     uint64_t timeout, size_t count)
 {
-    uc_err err;
+    uc_err err = UC_ERR_OK;
     bool nested_start;
     size_t saved_emu_count = 0;
     size_t saved_emu_counter = 0;
-    IcountDecr saved_icount_decr = { 0 };
+    IcountDecr saved_icount_decr = {0};
     uint32_t saved_cflags_next_tb = 0;
-    uc_tb saved_last_tb = { 0 };
+    uc_tb saved_last_tb = {0};
     bool saved_last_tb_valid = false;
     bool saved_stop_request = false;
     bool saved_quit_request = false;
+    bool parent_tb_exit_requested = false;
+    bool ancestor_timeout_expired = false;
+    bool frame_timed_out;
+    uint64_t saved_timeout = uc->timeout;
+    UcEmuFrame *frame;
+    int frame_state;
+    int frame_level;
 
     // Reject before changing lifecycle state owned by the active frame.
     if (uc->nested_level >= UC_MAX_NESTED_LEVEL) {
@@ -1199,6 +1431,32 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
         saved_last_tb_valid = uc->last_tb_valid;
         saved_stop_request = uc_stop_requested(uc);
         saved_quit_request = uc->quit_request;
+    }
+
+    // Avoid nested uc_emu_start saves wrong jit states.
+    if (uc->nested_level == 0) {
+        UC_INIT(uc);
+    }
+
+    frame_level = uc->nested_level;
+    frame = &uc->emu_frames[frame_level];
+    frame->uc = uc;
+    frame->timeout = timeout * 1000; // microseconds -> nanoseconds
+    frame->descendant_timed_out = false;
+    frame->timer_started = false;
+    emu_atomic_set(&frame->state, UC_EMU_FRAME_PREPARED);
+    if (timeout) {
+        err = enable_emu_timer(frame);
+        if (err != UC_ERR_OK) {
+            emu_atomic_set(&frame->state, UC_EMU_FRAME_DONE);
+            if (!nested_start) {
+                restore_jit_state(uc);
+            }
+            return err;
+        }
+    }
+
+    if (nested_start) {
         uc->last_tb_valid = false;
     }
 
@@ -1207,13 +1465,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
     uc->invalid_error = UC_ERR_OK;
     uc->emulation_done = false;
     uc->size_recur_mem = 0;
-    uc->timed_out = false;
+    emu_atomic_set(&uc->timed_out, false);
     uc->first_tb = true;
-
-    // Avoid nested uc_emu_start saves wrong jit states.
-    if (uc->nested_level == 0) {
-        UC_INIT(uc);
-    }
 
     // Advance the nested levels. We must decrease the level count by one when
     // we return from uc_emu_start.
@@ -1323,15 +1576,15 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
         uc_hook_del(uc, uc->count_hook);
         uc->count_hook = 0;
         uc->tb_flush(uc);
-    } else if (count != 0 && !uc_uses_tcg_count(uc) &&
-               uc->count_hook == 0) {
+    } else if (count != 0 && !uc_uses_tcg_count(uc) && uc->count_hook == 0) {
         uc->hook_insert = 1;
         err = uc_hook_add(uc, &uc->count_hook, UC_HOOK_CODE, hook_count_cb,
                           NULL, 1, 0);
         uc->hook_insert = 0;
         if (err != UC_ERR_OK) {
-            uc->nested_level--;
-            return err;
+            frame_state = emu_atomic_cmpxchg(
+                &frame->state, UC_EMU_FRAME_PREPARED, UC_EMU_FRAME_DONE);
+            goto frame_done;
         }
     }
 
@@ -1341,26 +1594,55 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
         uc->exits[uc->nested_level - 1] = until;
     }
 
-    if (timeout) {
-        enable_emu_timer(uc, timeout * 1000); // microseconds -> nanoseconds
+    frame->start_time = get_clock();
+    uc->timeout = frame->timeout;
+    emu_atomic_set(&frame->state, UC_EMU_FRAME_ACTIVE);
+    if (emu_ancestor_timed_out(uc, frame_level)) {
+        emu_atomic_set(&uc->timed_out, true);
+        uc_set_stop_request(uc, true);
+        break_translation_loop(uc);
     }
 
     uc->vm_start(uc);
 
+    frame_state = emu_atomic_cmpxchg(&frame->state, UC_EMU_FRAME_ACTIVE,
+                                     UC_EMU_FRAME_DONE);
+frame_done:
+    join_emu_timer(frame);
+
+    ancestor_timeout_expired = emu_ancestor_timed_out(uc, frame_level);
+    frame_timed_out = frame->descendant_timed_out || ancestor_timeout_expired ||
+                      frame_state == UC_EMU_FRAME_TIMED_OUT;
+    emu_atomic_set(&uc->timed_out, frame_timed_out);
+
     uc->nested_level--;
     if (nested_start) {
+        UcEmuFrame *parent = &uc->emu_frames[frame_level - 1];
+
+        /* A nested write may have invalidated the suspended parent TB. */
+        parent_tb_exit_requested =
+            uc->tb_exec_frames[frame_level - 1].exit_requested;
+        parent->descendant_timed_out |= frame_timed_out;
         revert_uc_emu_stop(uc);
-        uc->quit_request = saved_quit_request;
+        ancestor_timeout_expired |= emu_ancestor_timed_out(uc, frame_level);
+        if (ancestor_timeout_expired) {
+            frame_timed_out = true;
+            parent->descendant_timed_out = true;
+            emu_atomic_set(&uc->timed_out, true);
+        }
+        uc->quit_request = saved_quit_request || parent_tb_exit_requested;
+        uc->timeout = saved_timeout;
         uc->emu_count = saved_emu_count;
         uc->emu_counter = saved_emu_counter;
         *uc->cpu->icount_decr_ptr = saved_icount_decr;
         uc->cpu->cflags_next_tb = saved_cflags_next_tb;
         uc->last_tb = saved_last_tb;
         uc->last_tb_valid = saved_last_tb_valid;
-        if (saved_stop_request) {
+        if (saved_stop_request || ancestor_timeout_expired) {
             uc_set_stop_request(uc, true);
         }
-        if (saved_stop_request || saved_quit_request) {
+        if (saved_stop_request || saved_quit_request ||
+            ancestor_timeout_expired || parent_tb_exit_requested) {
             break_translation_loop(uc);
         }
     } else {
@@ -1386,14 +1668,11 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
         restore_jit_state(uc);
     }
 
-    if (timeout) {
-        // wait for the timer to finish
-        qemu_thread_join(&uc->timer);
-    }
-
     // We may be in a nested uc_emu_start and thus clear invalid_error
     // once we are done.
-    err = uc->invalid_error;
+    if (err == UC_ERR_OK) {
+        err = uc->invalid_error;
+    }
     uc->invalid_error = 0;
     return err;
 }
@@ -1419,7 +1698,7 @@ uc_err uc_emu_stop(uc_engine *uc)
 static int bsearch_mapped_blocks(const uc_engine *uc, uint64_t address)
 {
     int left, right, mid;
-    MemoryRegion *mapping;
+    UcMapping *mapping;
 
     left = 0;
     right = uc->mapped_block_count;
@@ -1429,10 +1708,10 @@ static int bsearch_mapped_blocks(const uc_engine *uc, uint64_t address)
 
         mapping = uc->mapped_blocks[mid];
 
-        if (mapping->end - 1 < address) {
-            left = mid + 1;
-        } else if (mapping->addr > address) {
+        if (address < mapping->begin) {
             right = mid;
+        } else if (address - mapping->begin >= mapping->size) {
+            left = mid + 1;
         } else {
             return mid;
         }
@@ -1441,58 +1720,184 @@ static int bsearch_mapped_blocks(const uc_engine *uc, uint64_t address)
     return left;
 }
 
+static UcMapping *mapped_block_at(const uc_engine *uc, uint64_t address)
+{
+    int index = bsearch_mapped_blocks(uc, address);
+
+    if (index >= 0 && (uint32_t)index < uc->mapped_block_count) {
+        UcMapping *mapping = uc->mapped_blocks[index];
+
+        if (mapping->begin <= address &&
+            address - mapping->begin < mapping->size) {
+            return mapping;
+        }
+    }
+    return NULL;
+}
+
 // find if a memory range overlaps with existing mapped regions
-static bool memory_overlap(struct uc_struct *uc, uint64_t begin, size_t size)
+static bool memory_overlap(struct uc_struct *uc, uint64_t begin, uint64_t size)
 {
     unsigned int i;
-    uint64_t end = begin + size - 1;
 
     i = bsearch_mapped_blocks(uc, begin);
 
     // is this the highest region with no possible overlap?
-    if (i >= uc->mapped_block_count)
+    if (i >= uc->mapped_block_count) {
         return false;
+    }
 
-    // end address overlaps this region?
-    if (end >= uc->mapped_blocks[i]->addr)
-        return true;
-
-    // not found
-
-    return false;
+    return ranges_overlap(begin, size, uc->mapped_blocks[i]->begin,
+                          uc->mapped_blocks[i]->size);
 }
 
-// common setup/error checking shared between uc_mem_map and uc_mem_map_ptr
-static uc_err mem_map(uc_engine *uc, MemoryRegion *block)
+static bool mem_map_reserve(uc_engine *uc, uint32_t count)
 {
+    UcMapping **mappings;
+    uint32_t capacity;
 
-    MemoryRegion **regions;
+    if (count <= uc->mapped_block_capacity) {
+        return true;
+    }
+    if (count > UINT32_MAX - (MEM_BLOCK_INCR - 1)) {
+        return false;
+    }
+
+    capacity = (count + MEM_BLOCK_INCR - 1) & ~(MEM_BLOCK_INCR - 1);
+    if (test_alloc_should_fail(uc, UC_TEST_ALLOC_FAIL_MAPPED_BLOCKS)) {
+        return false;
+    }
+    mappings = g_try_new(UcMapping *, capacity);
+    if (!mappings) {
+        return false;
+    }
+    if (uc->mapped_block_count != 0) {
+        memcpy(mappings, uc->mapped_blocks,
+               sizeof(*mappings) * uc->mapped_block_count);
+    }
+    g_free(uc->mapped_blocks);
+    uc->mapped_blocks = mappings;
+    uc->mapped_block_capacity = capacity;
+    return true;
+}
+
+static UcMapping *mem_map_prepare(uc_engine *uc, uint64_t begin, uint64_t size)
+{
+    UcMapping *mapping;
+
+    if (!mem_map_reserve(uc, uc->mapped_block_count + 1)) {
+        return NULL;
+    }
+    if (test_alloc_should_fail(uc, UC_TEST_ALLOC_FAIL_MAPPING_RECORD)) {
+        return NULL;
+    }
+    mapping = g_try_malloc0(sizeof(*mapping));
+    if (!mapping) {
+        return NULL;
+    }
+    mapping->owner = uc;
+    mapping->begin = begin;
+    mapping->size = size;
+    mapping->priority = uc->snapshot_level;
+    return mapping;
+}
+
+static void mem_map_activate(uc_engine *uc, UcMapping *mapping)
+{
     int pos;
 
-    if (block == NULL) {
-        return UC_ERR_NOMEM;
-    }
+    assert(mapping->owner == uc);
+    assert(!mapping->active);
+    assert(uc->mapped_block_count < uc->mapped_block_capacity);
 
-    if ((uc->mapped_block_count & (MEM_BLOCK_INCR - 1)) == 0) { // time to grow
-        regions = (MemoryRegion **)g_realloc(
-            uc->mapped_blocks,
-            sizeof(MemoryRegion *) * (uc->mapped_block_count + MEM_BLOCK_INCR));
-        if (regions == NULL) {
-            return UC_ERR_NOMEM;
-        }
-        uc->mapped_blocks = regions;
-    }
+    pos = bsearch_mapped_blocks(uc, mapping->begin);
 
-    pos = bsearch_mapped_blocks(uc, block->addr);
-
-    // shift the array right to give space for the new pointer
     memmove(&uc->mapped_blocks[pos + 1], &uc->mapped_blocks[pos],
-            sizeof(MemoryRegion *) * (uc->mapped_block_count - pos));
+            sizeof(*uc->mapped_blocks) * (uc->mapped_block_count - pos));
 
-    uc->mapped_blocks[pos] = block;
+    uc->mapped_blocks[pos] = mapping;
     uc->mapped_block_count++;
+    mapping->active = true;
+}
 
-    return UC_ERR_OK;
+static void mem_map_insert(uc_engine *uc, UcMapping *mapping,
+                           MemoryRegion *root)
+{
+    assert(root != NULL);
+    mapping->root = root;
+    mapping->regions = root;
+    mapping->perms = root->perms;
+    mapping->next = uc->mapping_records;
+    uc->mapping_records = mapping;
+    root->uc_mapping = mapping;
+    root->mapping_offset = 0;
+    mem_map_activate(uc, mapping);
+}
+
+static void mem_map_remove(uc_engine *uc, UcMapping *mapping)
+{
+    int pos = bsearch_mapped_blocks(uc, mapping->begin);
+
+    assert(pos >= 0 && (uint32_t)pos < uc->mapped_block_count);
+    assert(uc->mapped_blocks[pos] == mapping);
+    uc->mapped_block_count--;
+    memmove(&uc->mapped_blocks[pos], &uc->mapped_blocks[pos + 1],
+            sizeof(*uc->mapped_blocks) * (uc->mapped_block_count - pos));
+    mapping->active = false;
+}
+
+static void mapping_record_remove(uc_engine *uc, UcMapping *mapping)
+{
+    UcMapping **link = &uc->mapping_records;
+
+    while (*link && *link != mapping) {
+        link = &(*link)->next;
+    }
+    assert(*link == mapping);
+    *link = mapping->next;
+    mapping->next = NULL;
+}
+
+static void mapping_reclaim(uc_engine *uc, UcMapping *mapping)
+{
+    if (mapping->active) {
+        return;
+    }
+
+    uc->memory_mapping_prune(mapping);
+    if (mapping->context_refs != 0) {
+        return;
+    }
+    mapping_record_remove(uc, mapping);
+    uc->memory_mapping_free(mapping);
+    g_free(mapping);
+}
+
+static void mapping_reclaim_inactive(uc_engine *uc)
+{
+    UcMapping *mapping = uc->mapping_records;
+
+    while (mapping) {
+        UcMapping *next = mapping->next;
+
+        if (!mapping->active && mapping->context_refs == 0) {
+            mapping_reclaim(uc, mapping);
+        } else {
+            uc->memory_mapping_prune(mapping);
+        }
+        mapping = next;
+    }
+}
+
+static void mapping_normalize_active(uc_engine *uc)
+{
+    UcMapping *mapping;
+
+    for (mapping = uc->mapping_records; mapping; mapping = mapping->next) {
+        if (mapping->active) {
+            uc->memory_mapping_normalize(mapping);
+        }
+    }
 }
 
 static uc_err mem_map_check(uc_engine *uc, uint64_t address, uint64_t size,
@@ -1535,6 +1940,8 @@ UNICORN_EXPORT
 uc_err uc_mem_map(uc_engine *uc, uint64_t address, uint64_t size,
                   uint32_t perms)
 {
+    MemoryRegion *root;
+    UcMapping *mapping;
     uc_err res;
 
     UC_INIT(uc);
@@ -1545,15 +1952,28 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, uint64_t size,
         return res;
     }
 
-    res = mem_map(uc, uc->memory_map(uc, address, size, perms));
+    mapping = mem_map_prepare(uc, address, size);
+    if (!mapping) {
+        restore_jit_state(uc);
+        return UC_ERR_NOMEM;
+    }
+    root = uc->memory_map(uc, address, size, perms);
+    if (!root) {
+        g_free(mapping);
+        restore_jit_state(uc);
+        return UC_ERR_NOMEM;
+    }
+    mem_map_insert(uc, mapping, root);
     restore_jit_state(uc);
-    return res;
+    return UC_ERR_OK;
 }
 
 UNICORN_EXPORT
 uc_err uc_mem_map_ptr(uc_engine *uc, uint64_t address, uint64_t size,
                       uint32_t perms, void *ptr)
 {
+    MemoryRegion *root;
+    UcMapping *mapping;
     uc_err res;
 
     UC_INIT(uc);
@@ -1569,9 +1989,20 @@ uc_err uc_mem_map_ptr(uc_engine *uc, uint64_t address, uint64_t size,
         return res;
     }
 
-    res = mem_map(uc, uc->memory_map_ptr(uc, address, size, perms, ptr));
+    mapping = mem_map_prepare(uc, address, size);
+    if (!mapping) {
+        restore_jit_state(uc);
+        return UC_ERR_NOMEM;
+    }
+    root = uc->memory_map_ptr(uc, address, size, perms, ptr);
+    if (!root) {
+        g_free(mapping);
+        restore_jit_state(uc);
+        return UC_ERR_NOMEM;
+    }
+    mem_map_insert(uc, mapping, root);
     restore_jit_state(uc);
-    return res;
+    return UC_ERR_OK;
 }
 
 UNICORN_EXPORT
@@ -1579,6 +2010,8 @@ uc_err uc_mmio_map(uc_engine *uc, uint64_t address, uint64_t size,
                    uc_cb_mmio_read_t read_cb, void *user_data_read,
                    uc_cb_mmio_write_t write_cb, void *user_data_write)
 {
+    MemoryRegion *root;
+    UcMapping *mapping;
     uc_err res;
 
     UC_INIT(uc);
@@ -1589,12 +2022,23 @@ uc_err uc_mmio_map(uc_engine *uc, uint64_t address, uint64_t size,
         return res;
     }
 
-    // The callbacks do not need to be checked for NULL here, as their presence
-    // (or lack thereof) will determine the permissions used.
-    res = mem_map(uc, uc->memory_map_io(uc, address, size, read_cb, write_cb,
-                                        user_data_read, user_data_write));
+    mapping = mem_map_prepare(uc, address, size);
+    if (!mapping) {
+        restore_jit_state(uc);
+        return UC_ERR_NOMEM;
+    }
+
+    /* Callback presence determines the installed MMIO permissions. */
+    root = uc->memory_map_io(uc, address, size, read_cb, write_cb,
+                             user_data_read, user_data_write);
+    if (!root) {
+        g_free(mapping);
+        restore_jit_state(uc);
+        return UC_ERR_NOMEM;
+    }
+    mem_map_insert(uc, mapping, root);
     restore_jit_state(uc);
-    return res;
+    return UC_ERR_OK;
 }
 
 // Create a backup copy of the indicated MemoryRegion.
@@ -1614,8 +2058,7 @@ static uint8_t *copy_region(struct uc_struct *uc, MemoryRegion *mr)
     return block;
 }
 
-static bool copy_mte_tags(RAMBlock *block, uint8_t **tags,
-                          ram_addr_t *tag_size)
+static bool copy_mte_tags(RAMBlock *block, uint8_t **tags, ram_addr_t *tag_size)
 {
     *tags = NULL;
     *tag_size = 0;
@@ -1668,11 +2111,39 @@ static bool restore_mte_tags(struct uc_struct *uc, uint64_t address,
         }
     }
 
-    copy_size = (size + UC_MTE_TAG_STORAGE_GRANULE - 1) /
-                UC_MTE_TAG_STORAGE_GRANULE;
+    copy_size =
+        (size + UC_MTE_TAG_STORAGE_GRANULE - 1) / UC_MTE_TAG_STORAGE_GRANULE;
     copy_size = MIN(copy_size, tag_size - source_tag_offset);
     copy_size = MIN(copy_size, block->mte_tags_size);
     memcpy(block->mte_tags, tags + source_tag_offset, copy_size);
+    return true;
+}
+
+static bool split_region_layout(uint64_t begin, uint64_t region_size,
+                                uint64_t address, uint64_t size,
+                                uint64_t *left_size, uint64_t *middle_size,
+                                uint64_t *right_size)
+{
+    uint64_t offset;
+
+    /* Do not form an exclusive end: terminal mappings wrap it to zero. */
+    if (address < begin) {
+        offset = begin - address;
+        if (size <= offset) {
+            return false;
+        }
+        size -= offset;
+        offset = 0;
+    } else {
+        offset = address - begin;
+        if (offset >= region_size) {
+            return false;
+        }
+    }
+
+    *left_size = offset;
+    *middle_size = MIN(size, region_size - offset);
+    *right_size = region_size - offset - *middle_size;
     return true;
 }
 
@@ -1684,23 +2155,28 @@ static bool restore_mte_tags(struct uc_struct *uc, uint64_t address,
 static bool split_mmio_region(struct uc_struct *uc, MemoryRegion *mr,
                               uint64_t address, uint64_t size, bool do_delete)
 {
-    uint64_t begin, end, chunk_end;
+    uint64_t begin, middle_begin;
+    uint64_t region_size;
     uint64_t l_size, r_size, m_size;
     mmio_cbs backup;
-
-    chunk_end = address + size;
-
-    // This branch also break recursion.
-    if (address <= mr->addr && chunk_end >= mr->end) {
-        return true;
-    }
 
     if (size == 0) {
         return false;
     }
 
     begin = mr->addr;
-    end = mr->end;
+    region_size = (uint64_t)int128_get64(mr->size);
+    if (!split_region_layout(begin, region_size, address, size, &l_size,
+                             &m_size, &r_size)) {
+        return false;
+    }
+
+    // This branch also breaks recursion.
+    if (l_size == 0 && r_size == 0) {
+        return true;
+    }
+
+    middle_begin = begin + l_size;
 
     memcpy(&backup, mr->opaque, sizeof(mmio_cbs));
 
@@ -1717,19 +2193,6 @@ static bool split_mmio_region(struct uc_struct *uc, MemoryRegion *mr,
         return false;
     }
 
-    // adjust some things
-    if (address < begin) {
-        address = begin;
-    }
-    if (chunk_end > end) {
-        chunk_end = end;
-    }
-
-    // compute sub region sizes
-    l_size = (uint64_t)(address - begin);
-    r_size = (uint64_t)(end - chunk_end);
-    m_size = (uint64_t)(chunk_end - address);
-
     if (l_size > 0) {
         if (uc_mmio_map(uc, begin, l_size, backup.read, backup.user_data_read,
                         backup.write, backup.user_data_write) != UC_ERR_OK) {
@@ -1738,14 +2201,17 @@ static bool split_mmio_region(struct uc_struct *uc, MemoryRegion *mr,
     }
 
     if (m_size > 0 && !do_delete) {
-        if (uc_mmio_map(uc, address, m_size, backup.read, backup.user_data_read,
-                        backup.write, backup.user_data_write) != UC_ERR_OK) {
+        if (uc_mmio_map(uc, middle_begin, m_size, backup.read,
+                        backup.user_data_read, backup.write,
+                        backup.user_data_write) != UC_ERR_OK) {
             return false;
         }
     }
 
     if (r_size > 0) {
-        if (uc_mmio_map(uc, chunk_end, r_size, backup.read,
+        uint64_t right_begin = middle_begin + m_size;
+
+        if (uc_mmio_map(uc, right_begin, r_size, backup.read,
                         backup.user_data_read, backup.write,
                         backup.user_data_write) != UC_ERR_OK) {
             return false;
@@ -1775,30 +2241,32 @@ static bool split_region(struct uc_struct *uc, MemoryRegion *mr,
 {
     uint8_t *backup;
     uint32_t perms;
-    uint64_t begin, end, chunk_end;
+    uint64_t begin, middle_begin;
+    uint64_t region_size;
     uint64_t l_size, m_size, r_size;
     RAMBlock *block = NULL;
     bool prealloc = false;
     uint8_t *tag_backup = NULL;
     ram_addr_t tag_backup_size = 0;
 
-    chunk_end = address + size;
-
-    // if this region belongs to area [address, address+size],
-    // then there is no work to do.
-    if (address <= mr->addr && chunk_end >= mr->end) {
-        return true;
-    }
-
     if (size == 0) {
         // trivial case
         return true;
     }
 
-    if (address >= mr->end || chunk_end <= mr->addr) {
-        // impossible case
+    begin = mr->addr;
+    region_size = (uint64_t)int128_get64(mr->size);
+    if (!split_region_layout(begin, region_size, address, size, &l_size,
+                             &m_size, &r_size)) {
         return false;
     }
+
+    // if this region belongs to the requested area, there is no work to do.
+    if (l_size == 0 && r_size == 0) {
+        return true;
+    }
+
+    middle_begin = begin + l_size;
 
     // Find the correct and large enough (which contains our target mr)
     // to create the content backup.
@@ -1827,8 +2295,6 @@ static bool split_region(struct uc_struct *uc, MemoryRegion *mr,
     // save the essential information required for the split before mr gets
     // deleted
     perms = mr->perms;
-    begin = mr->addr;
-    end = mr->end;
 
     // unmap this region first, then do split it later
     if (uc_mem_unmap(uc, mr->addr, (uint64_t)int128_get64(mr->size)) !=
@@ -1842,19 +2308,6 @@ static bool split_region(struct uc_struct *uc, MemoryRegion *mr,
      * case 2           |--size--|
      * case 3                  |---size--|
      */
-
-    // adjust some things
-    if (address < begin) {
-        address = begin;
-    }
-    if (chunk_end > end) {
-        chunk_end = end;
-    }
-
-    // compute sub region sizes
-    l_size = (uint64_t)(address - begin);
-    r_size = (uint64_t)(end - chunk_end);
-    m_size = (uint64_t)(chunk_end - address);
 
     // If there are error in any of the below operations, things are too far
     // gone at that point to recover. Could try to remap orignal region, but
@@ -1881,41 +2334,43 @@ static bool split_region(struct uc_struct *uc, MemoryRegion *mr,
 
     if (m_size > 0 && !do_delete) {
         if (!prealloc) {
-            if (uc_mem_map(uc, address, m_size, perms) != UC_ERR_OK) {
+            if (uc_mem_map(uc, middle_begin, m_size, perms) != UC_ERR_OK) {
                 goto error;
             }
-            if (uc_mem_write(uc, address, backup + l_size, m_size) !=
+            if (uc_mem_write(uc, middle_begin, backup + l_size, m_size) !=
                 UC_ERR_OK) {
                 goto error;
             }
         } else {
-            if (uc_mem_map_ptr(uc, address, m_size, perms, backup + l_size) !=
-                UC_ERR_OK) {
+            if (uc_mem_map_ptr(uc, middle_begin, m_size, perms,
+                               backup + l_size) != UC_ERR_OK) {
                 goto error;
             }
         }
-        if (!restore_mte_tags(uc, address, m_size, l_size, tag_backup,
+        if (!restore_mte_tags(uc, middle_begin, m_size, l_size, tag_backup,
                               tag_backup_size)) {
             goto error;
         }
     }
 
     if (r_size > 0) {
+        uint64_t right_begin = middle_begin + m_size;
+
         if (!prealloc) {
-            if (uc_mem_map(uc, chunk_end, r_size, perms) != UC_ERR_OK) {
+            if (uc_mem_map(uc, right_begin, r_size, perms) != UC_ERR_OK) {
                 goto error;
             }
-            if (uc_mem_write(uc, chunk_end, backup + l_size + m_size, r_size) !=
-                UC_ERR_OK) {
+            if (uc_mem_write(uc, right_begin, backup + l_size + m_size,
+                             r_size) != UC_ERR_OK) {
                 goto error;
             }
         } else {
-            if (uc_mem_map_ptr(uc, chunk_end, r_size, perms,
+            if (uc_mem_map_ptr(uc, right_begin, r_size, perms,
                                backup + l_size + m_size) != UC_ERR_OK) {
                 goto error;
             }
         }
-        if (!restore_mte_tags(uc, chunk_end, r_size, l_size + m_size,
+        if (!restore_mte_tags(uc, right_begin, r_size, l_size + m_size,
                               tag_backup, tag_backup_size)) {
             goto error;
         }
@@ -1948,7 +2403,7 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
     UC_INIT(uc);
 
     // snapshot and protection can't be mixed
-    if (uc->snapshot_level > 0) {
+    if (uc->memory_context_count != 0) {
         restore_jit_state(uc);
         return UC_ERR_ARG;
     }
@@ -2005,6 +2460,7 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
                 remove_exec = true;
             }
             mr->perms = perms;
+            mr->uc_mapping->perms = perms;
             uc->readonly_mem(mr, (perms & UC_PROT_WRITE) == 0);
 
         } else {
@@ -2015,6 +2471,7 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
 
             mr = uc->memory_mapping(uc, addr);
             mr->perms = perms;
+            mr->uc_mapping->perms = perms;
         }
 
         count += len;
@@ -2036,24 +2493,18 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
 }
 
 static uc_err uc_mem_unmap_snapshot(struct uc_struct *uc, uint64_t address,
-                                    uint64_t size, MemoryRegion **ret)
+                                    uint64_t size)
 {
-    MemoryRegion *mr;
+    UcMapping *mapping;
 
-    mr = uc->memory_mapping(uc, address);
-    while (mr->container != uc->system_memory) {
-        mr = mr->container;
-    }
-
-    if (mr->addr != address || int128_get64(mr->size) != size) {
+    mapping = mapped_block_at(uc, address);
+    if (!mapping || mapping->begin != address || mapping->size != size) {
         return UC_ERR_ARG;
     }
 
-    if (ret) {
-        *ret = mr;
-    }
-
-    uc->memory_moveout(uc, mr);
+    uc->memory_unmap(uc, mapping);
+    mem_map_remove(uc, mapping);
+    mapping_reclaim(uc, mapping);
 
     return UC_ERR_OK;
 }
@@ -2092,8 +2543,8 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
         return UC_ERR_NOMEM;
     }
 
-    if (uc->snapshot_level > 0) {
-        uc_err res = uc_mem_unmap_snapshot(uc, address, size, NULL);
+    if (uc->memory_context_count != 0) {
+        uc_err res = uc_mem_unmap_snapshot(uc, address, size);
         restore_jit_state(uc);
         return res;
     }
@@ -2121,9 +2572,14 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
 
         // if we can retrieve the mapping, then no splitting took place
         // so unmap here
-        mr = uc->memory_mapping(uc, addr);
-        if (mr != NULL) {
-            uc->memory_unmap(uc, mr);
+        {
+            UcMapping *mapping = mapped_block_at(uc, addr);
+
+            if (mapping != NULL) {
+                uc->memory_unmap(uc, mapping);
+                mem_map_remove(uc, mapping);
+                mapping_reclaim(uc, mapping);
+            }
         }
         count += len;
         addr += len;
@@ -2142,10 +2598,16 @@ UNICORN_EXPORT
 uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
                    void *user_data, uint64_t begin, uint64_t end, ...)
 {
+    const unsigned int valid_types = (1U << UC_HOOK_MAX) - 1;
     int ret = UC_ERR_OK;
     int i = 0;
 
     UC_INIT(uc);
+
+    if (type == 0 || ((unsigned int)type & ~valid_types) != 0) {
+        restore_jit_state(uc);
+        return UC_ERR_HOOK;
+    }
 
     struct hook *hook = calloc(1, sizeof(struct hook));
     if (hook == NULL) {
@@ -2242,7 +2704,7 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
         return UC_ERR_OK;
     }
 
-    if (type & UC_HOOK_CODE || type & UC_HOOK_BLOCK) {
+    if (type & (UC_HOOK_CODE | UC_HOOK_BLOCK | UC_HOOK_MEM_FETCH)) {
         hook_invalidate_range(uc, begin, end);
         if (uc->nested_level) {
             uc->quit_request = true;
@@ -2315,7 +2777,8 @@ uc_err uc_hook_del(uc_engine *uc, uc_hook hh)
             if (i == UC_HOOK_INSN_IDX && uc->arch == UC_ARCH_ARM64) {
                 flush_tb = true;
             }
-            if (hook->type & UC_HOOK_CODE || hook->type & UC_HOOK_BLOCK) {
+            if (hook->type &
+                (UC_HOOK_CODE | UC_HOOK_BLOCK | UC_HOOK_MEM_FETCH)) {
                 g_hash_table_foreach(hook->hooked_regions,
                                      hook_invalidate_region, uc);
                 if ((i == UC_HOOK_CODE_IDX || i == UC_HOOK_BLOCK_IDX) &&
@@ -2358,7 +2821,7 @@ UNICORN_EXPORT
 uc_err uc_hook_set_user_data(uc_engine *uc, uc_hook hh, void *user_data)
 {
     struct hook *hook = (struct hook *)hh;
-    if (hook->type == UC_HOOK_BLOCK || hook->type == UC_HOOK_CODE) {
+    if (hook->type & (UC_HOOK_BLOCK | UC_HOOK_CODE | UC_HOOK_MEM_FETCH)) {
         if (uc->nested_level) {
             return UC_ERR_ARG;
         }
@@ -2435,6 +2898,26 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
         revert_uc_emu_stop(uc);
     }
 
+    if (index == UC_HOOK_MEM_FETCH_IDX) {
+        for (cur = uc->hook[index].head;
+             cur != NULL && (hook = (struct hook *)cur->data);
+             cur = cur->next) {
+            if (hook->to_delete) {
+                continue;
+            }
+            if (HOOK_BOUND_CHECK(hook, (uint64_t)address)) {
+                JIT_CALLBACK_GUARD(((uc_cb_hookmem_t)hook->callback)(
+                    uc, UC_MEM_FETCH, address, size, 0, hook->user_data));
+            }
+            if (not_allow_stop && uc_stop_requested(uc)) {
+                revert_uc_emu_stop(uc);
+            } else if (!not_allow_stop && uc_stop_requested(uc)) {
+                return;
+            }
+        }
+        return;
+    }
+
     for (cur = uc->hook[index].head;
          cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
         if (hook->to_delete) {
@@ -2492,8 +2975,9 @@ uc_err uc_mem_regions(uc_engine *uc, uc_mem_region **regions, uint32_t *count)
     }
 
     for (i = 0; i < *count; i++) {
-        r[i].begin = uc->mapped_blocks[i]->addr;
-        r[i].end = uc->mapped_blocks[i]->end - 1;
+        r[i].begin = uc->mapped_blocks[i]->begin;
+        r[i].end =
+            uc->mapped_blocks[i]->begin + uc->mapped_blocks[i]->size - 1;
         r[i].perms = uc->mapped_blocks[i]->perms;
     }
 
@@ -2534,7 +3018,7 @@ uc_err uc_query(uc_engine *uc, uc_query_type type, size_t *result)
         break;
 
     case UC_QUERY_TIMEOUT:
-        *result = uc->timed_out;
+        *result = emu_atomic_read(&uc->timed_out);
         break;
     }
 
@@ -2545,17 +3029,32 @@ uc_err uc_query(uc_engine *uc, uc_query_type type, size_t *result)
 UNICORN_EXPORT
 uc_err uc_context_alloc(uc_engine *uc, uc_context **context)
 {
+    /* QEMU target CPU states containing vector registers require alignment. */
+    const size_t alignment = 16;
     struct uc_context **_context = context;
     size_t size = uc_context_size(uc);
+    UcContextAllocation *allocation;
+    uintptr_t data_address;
 
     UC_INIT(uc);
 
-    *_context = g_malloc(size);
-    if (*_context) {
+    allocation = g_malloc(sizeof(*allocation) + size + alignment - 1);
+    if (allocation) {
+        data_address = ((uintptr_t)(allocation + 1) +
+                        sizeof(uc_context) + alignment - 1) &
+                       ~(uintptr_t)(alignment - 1);
+        *_context = (uc_context *)(data_address - sizeof(uc_context));
+        memset(*_context, 0, size);
         (*_context)->context_size = size - sizeof(uc_context);
         (*_context)->arch = uc->arch;
         (*_context)->mode = uc->mode;
-        (*_context)->fv = NULL;
+        allocation->capacity = (*_context)->context_size;
+        allocation->context = *_context;
+        while (emu_atomic_cmpxchg(&context_allocations_lock, 0, 1) != 0) {
+        }
+        allocation->next = context_allocations;
+        context_allocations = allocation;
+        emu_atomic_set(&context_allocations_lock, 0);
         restore_jit_state(uc);
         return UC_ERR_OK;
     } else {
@@ -2571,18 +3070,238 @@ uc_err uc_free(void *mem)
     return UC_ERR_OK;
 }
 
+static size_t context_data_size(uc_engine *uc)
+{
+    if (!uc->context_size) {
+        return uc->cpu_context_size;
+    }
+    return uc->context_size(uc);
+}
+
+static bool context_matches_arch_mode(uc_engine *uc,
+                                      const uc_context *context)
+{
+    return context && context->arch == uc->arch && context->mode == uc->mode;
+}
+
+static bool context_allocation_capacity(const uc_context *context,
+                                        size_t *capacity)
+{
+    UcContextAllocation *allocation = NULL;
+
+    while (emu_atomic_cmpxchg(&context_allocations_lock, 0, 1) != 0) {
+    }
+    for (allocation = context_allocations; allocation;
+         allocation = allocation->next) {
+        if (allocation->context == context) {
+            *capacity = allocation->capacity;
+            break;
+        }
+    }
+    emu_atomic_set(&context_allocations_lock, 0);
+    return allocation != NULL;
+}
+
 UNICORN_EXPORT
 size_t uc_context_size(uc_engine *uc)
 {
+    size_t size;
+
     UC_INIT(uc);
 
+    size = sizeof(uc_context) + context_data_size(uc);
     restore_jit_state(uc);
-    if (!uc->context_size) {
-        // return the total size of struct uc_context
-        return sizeof(uc_context) + uc->cpu_context_size;
-    } else {
-        return sizeof(uc_context) + uc->context_size(uc);
+    return size;
+}
+
+static void context_memory_register(uc_engine *uc, uc_context *context)
+{
+    assert(!context->memory_owner);
+    assert(!context->memory_prev);
+    assert(!context->memory_next);
+
+    context->memory_owner = uc;
+    context->memory_next = uc->memory_contexts;
+    if (context->memory_next) {
+        context->memory_next->memory_prev = context;
     }
+    uc->memory_contexts = context;
+    uc->memory_context_count++;
+}
+
+static void context_memory_unregister(uc_context *context)
+{
+    uc_engine *uc = context->memory_owner;
+
+    assert(uc);
+    assert(uc->memory_context_count != 0);
+    if (context->memory_prev) {
+        context->memory_prev->memory_next = context->memory_next;
+    } else {
+        assert(uc->memory_contexts == context);
+        uc->memory_contexts = context->memory_next;
+    }
+    if (context->memory_next) {
+        context->memory_next->memory_prev = context->memory_prev;
+    }
+    context->memory_owner = NULL;
+    context->memory_prev = NULL;
+    context->memory_next = NULL;
+    uc->memory_context_count--;
+}
+
+static void context_memory_clear(uc_context *context, bool reclaim,
+                                 bool normalize)
+{
+    uc_engine *uc = context->memory_owner;
+    uint32_t i;
+
+    if (uc) {
+        context_memory_unregister(context);
+    }
+    if (context->fv) {
+        g_free(context->fv->ranges);
+        g_free(context->fv);
+    }
+
+    if (uc) {
+        for (i = 0; i < context->memory_region_count; i++) {
+            MemoryRegion *region = context->memory_regions[i];
+
+            assert(region->context_refs != 0);
+            region->context_refs--;
+        }
+        for (i = 0; i < context->mapping_count; i++) {
+            UcMapping *mapping = context->mappings[i].mapping;
+
+            assert(mapping->context_refs != 0);
+            mapping->context_refs--;
+        }
+        if (reclaim) {
+            if (normalize && uc->memory_context_count == 0) {
+                mapping_normalize_active(uc);
+            }
+            mapping_reclaim_inactive(uc);
+            if (uc->memory_context_count == 0) {
+                uc->tcg_flush_tlb(uc);
+            }
+        }
+    }
+
+    g_free(context->mappings);
+    g_free(context->memory_regions);
+    context->fv = NULL;
+    context->mappings = NULL;
+    context->memory_regions = NULL;
+    context->mapping_count = 0;
+    context->memory_region_count = 0;
+}
+
+static bool context_mapping_refs_available(uc_engine *uc)
+{
+    uint32_t mapping_index;
+
+    for (mapping_index = 0; mapping_index < uc->mapped_block_count;
+         mapping_index++) {
+        UcMapping *mapping = uc->mapped_blocks[mapping_index];
+        MemoryRegion *region;
+
+        if (mapping->context_refs == UINT32_MAX) {
+            return false;
+        }
+        if (mapping->root->terminates) {
+            if (mapping->root->context_refs == UINT32_MAX) {
+                return false;
+            }
+        } else {
+            QTAILQ_FOREACH(region, &mapping->root->subregions, subregions_link)
+            {
+                if (region->context_refs == UINT32_MAX) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool context_capture_mappings(uc_engine *uc,
+                                     UcContextMapping **mappings_out,
+                                     MemoryRegion ***regions_out,
+                                     uint32_t *region_count_out)
+{
+    UcContextMapping *mappings = NULL;
+    MemoryRegion **regions = NULL;
+    uint64_t region_count = 0;
+    uint32_t mapping_index;
+    uint32_t region_index = 0;
+
+    for (mapping_index = 0; mapping_index < uc->mapped_block_count;
+         mapping_index++) {
+        UcMapping *mapping = uc->mapped_blocks[mapping_index];
+        MemoryRegion *region;
+
+        if (mapping->root->terminates) {
+            region_count++;
+        } else {
+            QTAILQ_FOREACH(region, &mapping->root->subregions, subregions_link)
+            {
+                region_count++;
+            }
+        }
+        if (region_count > UINT32_MAX) {
+            return false;
+        }
+    }
+
+    if (uc->mapped_block_count != 0) {
+        if (test_alloc_should_fail(uc,
+                                   UC_TEST_ALLOC_FAIL_CONTEXT_MAPPINGS)) {
+            return false;
+        }
+        mappings = g_try_new(UcContextMapping, uc->mapped_block_count);
+        if (!mappings) {
+            return false;
+        }
+    }
+    if (region_count != 0) {
+        if (test_alloc_should_fail(uc,
+                                   UC_TEST_ALLOC_FAIL_CONTEXT_REGIONS)) {
+            g_free(mappings);
+            return false;
+        }
+        regions = g_try_new(MemoryRegion *, (uint32_t)region_count);
+        if (!regions) {
+            g_free(mappings);
+            return false;
+        }
+    }
+
+    for (mapping_index = 0; mapping_index < uc->mapped_block_count;
+         mapping_index++) {
+        UcMapping *mapping = uc->mapped_blocks[mapping_index];
+        UcContextMapping *saved = &mappings[mapping_index];
+        MemoryRegion *region;
+
+        saved->mapping = mapping;
+        saved->first_region = region_index;
+        if (mapping->root->terminates) {
+            regions[region_index++] = mapping->root;
+        } else {
+            QTAILQ_FOREACH(region, &mapping->root->subregions, subregions_link)
+            {
+                regions[region_index++] = region;
+            }
+        }
+        saved->region_count = region_index - saved->first_region;
+        assert(saved->region_count != 0);
+    }
+
+    assert(region_index == region_count);
+    *mappings_out = mappings;
+    *regions_out = regions;
+    *region_count_out = region_index;
+    return true;
 }
 
 UNICORN_EXPORT
@@ -2590,34 +3309,101 @@ uc_err uc_context_save(uc_engine *uc, uc_context *context)
 {
     UC_INIT(uc);
     uc_err ret = UC_ERR_OK;
+    size_t data_size = context_data_size(uc);
+    size_t capacity = 0;
+    bool allocated;
+
+    if (!context) {
+        restore_jit_state(uc);
+        return UC_ERR_ARG;
+    }
+    allocated = context_allocation_capacity(context, &capacity);
+    if (allocated) {
+        if (!context_matches_arch_mode(uc, context) || capacity < data_size) {
+            restore_jit_state(uc);
+            return UC_ERR_ARG;
+        }
+    } else {
+        if (uc->context_content & UC_CTL_CONTEXT_MEMORY) {
+            restore_jit_state(uc);
+            return UC_ERR_ARG;
+        }
+        memset(context, 0, sizeof(*context));
+        context->arch = uc->arch;
+        context->mode = uc->mode;
+    }
+    if ((uc->context_content & UC_CTL_CONTEXT_MEMORY) &&
+        context->memory_owner && context->memory_owner != uc) {
+        restore_jit_state(uc);
+        return UC_ERR_ARG;
+    }
+    context->context_size = data_size;
 
     if (uc->context_content & UC_CTL_CONTEXT_MEMORY) {
-        if (!context->fv) {
-            context->fv = g_malloc0(sizeof(*context->fv));
+        UcContextMapping *mappings = NULL;
+        MemoryRegion **regions = NULL;
+        uint32_t region_count = 0;
+        FlatView *fv = NULL;
+
+        if (!test_alloc_should_fail(uc, UC_TEST_ALLOC_FAIL_CONTEXT_VIEW)) {
+            fv = g_try_malloc0(sizeof(*fv));
         }
-        if (!context->fv) {
-            return UC_ERR_NOMEM;
+
+        if (uc->memory_context_count == UINT32_MAX) {
+            g_free(fv);
+            restore_jit_state(uc);
+            return UC_ERR_RESOURCE;
         }
-        if (!uc->flatview_copy(uc, context->fv,
-                               uc->address_space_memory.current_map, false)) {
+        if (!context_mapping_refs_available(uc)) {
+            g_free(fv);
+            restore_jit_state(uc);
+            return UC_ERR_RESOURCE;
+        }
+        if (!fv ||
+            !context_capture_mappings(uc, &mappings, &regions, &region_count) ||
+            !uc->flatview_copy(uc, fv, uc->address_space_memory.current_map,
+                               false)) {
+            if (fv) {
+                g_free(fv->ranges);
+            }
+            g_free(fv);
+            g_free(mappings);
+            g_free(regions);
             restore_jit_state(uc);
             return UC_ERR_NOMEM;
         }
         ret = uc_snapshot(uc);
         if (ret != UC_ERR_OK) {
+            g_free(fv->ranges);
+            g_free(fv);
+            g_free(mappings);
+            g_free(regions);
             restore_jit_state(uc);
             return ret;
         }
+
+        context_memory_clear(context, true, false);
+        context->fv = fv;
+        context->mappings = mappings;
+        context->memory_regions = regions;
+        context->mapping_count = uc->mapped_block_count;
+        context->memory_region_count = region_count;
+        for (uint32_t i = 0; i < context->mapping_count; i++) {
+            context->mappings[i].mapping->context_refs++;
+        }
+        for (uint32_t i = 0; i < context->memory_region_count; i++) {
+            context->memory_regions[i]->context_refs++;
+        }
+        context_memory_register(uc, context);
         context->ramblock_freed = uc->ram_list.freed;
         context->last_block = uc->ram_list.last_block;
+        context->snapshot_level = uc->snapshot_level;
         uc->tcg_flush_tlb(uc);
     }
 
-    context->snapshot_level = uc->snapshot_level;
-
     if (uc->context_content & UC_CTL_CONTEXT_CPU) {
         if (!uc->context_save) {
-            memcpy(context->data, uc->cpu->env_ptr, context->context_size);
+            memcpy(context->data, uc->cpu->env_ptr, data_size);
             restore_jit_state(uc);
             return UC_ERR_OK;
         } else {
@@ -2874,33 +3660,100 @@ uc_err uc_context_restore(uc_engine *uc, uc_context *context)
 {
     UC_INIT(uc);
     uc_err ret;
+    size_t capacity = 0;
+
+    if (!context_matches_arch_mode(uc, context)) {
+        restore_jit_state(uc);
+        return UC_ERR_ARG;
+    }
+    if (context_allocation_capacity(context, &capacity) &&
+        context->context_size > capacity) {
+        restore_jit_state(uc);
+        return UC_ERR_ARG;
+    }
+
+    if (uc->context_content & UC_CTL_CONTEXT_CPU) {
+        if (uc->context_validate) {
+            ret = uc->context_validate(uc, context);
+            if (ret != UC_ERR_OK) {
+                restore_jit_state(uc);
+                return ret;
+            }
+        } else if (context->context_size < context_data_size(uc)) {
+            restore_jit_state(uc);
+            return UC_ERR_ARG;
+        }
+    }
 
     if (uc->context_content & UC_CTL_CONTEXT_MEMORY) {
-        uc->snapshot_level = context->snapshot_level;
-        if (!uc->flatview_copy(uc, uc->address_space_memory.current_map,
-                               context->fv, true)) {
+        uint64_t active_tb_mask;
+        FlatView *restore_view;
+        uint32_t i;
+        bool copied;
+
+        if (!context->fv || context->memory_owner != uc) {
+            restore_jit_state(uc);
+            return UC_ERR_ARG;
+        }
+        if (test_alloc_should_fail(uc, UC_TEST_ALLOC_FAIL_RESTORE_VIEW)) {
+            restore_view = NULL;
+        } else {
+            restore_view = g_try_malloc0(sizeof(*restore_view));
+        }
+        if (!restore_view) {
             restore_jit_state(uc);
             return UC_ERR_NOMEM;
         }
-        ret = uc_restore_latest_snapshot(uc);
+        restore_view->ref = 1;
+        ret = uc_restore_snapshot_preflight(uc, context, restore_view);
         if (ret != UC_ERR_OK) {
+            g_free(restore_view->ranges);
+            g_free(restore_view);
             restore_jit_state(uc);
             return ret;
         }
-        uc_snapshot(uc);
-        uc->ram_list.freed = context->ramblock_freed;
-        uc->ram_list.last_block = context->last_block;
-        uc->tcg_flush_tlb(uc);
+
+        active_tb_mask = all_active_tb_mask(uc);
+        mark_active_tbs_for_exit(uc, active_tb_mask);
         request_tb_flush(uc);
+
+        while (uc->mapped_block_count != 0) {
+            UcMapping *mapping = uc->mapped_blocks[uc->mapped_block_count - 1];
+
+            uc->memory_moveout(uc, mapping, false);
+            mem_map_remove(uc, mapping);
+        }
+
+        for (i = 0; i < context->mapping_count; i++) {
+            UcContextMapping *saved = &context->mappings[i];
+            UcMapping *mapping = saved->mapping;
+
+            uc->memory_restore_topology(
+                uc, mapping, &context->memory_regions[saved->first_region],
+                saved->region_count, false);
+            uc->memory_movein(uc, mapping, false);
+            mem_map_activate(uc, mapping);
+        }
+
+        copied = uc->flatview_copy(uc, restore_view, context->fv, false);
+        assert(copied);
+        (void)copied;
+        uc->address_space_restore_flatview(&uc->address_space_memory,
+                                           restore_view);
+        mapping_reclaim_inactive(uc);
+
         if (uc->nested_level != 0) {
             uc->quit_request = true;
             break_translation_loop(uc);
         }
+        uc->tcg_flush_tlb(uc);
     }
 
     if (uc->context_content & UC_CTL_CONTEXT_CPU) {
         if (!uc->context_restore) {
-            memcpy(uc->cpu->env_ptr, context->data, context->context_size);
+            size_t data_size = context_data_size(uc);
+
+            memcpy(uc->cpu->env_ptr, context->data, data_size);
             if (uc->nested_level != 0) {
                 uc_request_pc_change(uc);
             }
@@ -2922,11 +3775,28 @@ uc_err uc_context_restore(uc_engine *uc, uc_context *context)
 UNICORN_EXPORT
 uc_err uc_context_free(uc_context *context)
 {
-    if (context->fv) {
-        free(context->fv->ranges);
-        g_free(context->fv);
+    UcContextAllocation *allocation = NULL;
+    UcContextAllocation **link;
+
+    if (!context) {
+        return UC_ERR_ARG;
     }
-    return uc_free(context);
+    while (emu_atomic_cmpxchg(&context_allocations_lock, 0, 1) != 0) {
+    }
+    for (link = &context_allocations; *link; link = &(*link)->next) {
+        if ((*link)->context == context) {
+            allocation = *link;
+            *link = allocation->next;
+            break;
+        }
+    }
+    emu_atomic_set(&context_allocations_lock, 0);
+    if (!allocation) {
+        return UC_ERR_ARG;
+    }
+
+    context_memory_clear(context, true, true);
+    return uc_free(allocation);
 }
 
 typedef struct _uc_ctl_exit_request {
@@ -3437,48 +4307,68 @@ static uc_err uc_snapshot(struct uc_struct *uc)
     return UC_ERR_OK;
 }
 
-static uc_err uc_restore_latest_snapshot(struct uc_struct *uc)
+static uc_err uc_restore_snapshot_preflight(uc_engine *uc,
+                                            const uc_context *context,
+                                            FlatView *restore_view)
 {
-    MemoryRegion *subregion, *subregion_next, *mr, *initial_mr;
-    int level;
+    uint32_t consumed_regions = 0;
+    UcMapping *previous = NULL;
+    uint32_t i;
 
-    QTAILQ_FOREACH_SAFE(subregion, &uc->system_memory->subregions,
-                        subregions_link, subregion_next)
-    {
-        uc->memory_filter_subregions(subregion, uc->snapshot_level);
-        if (subregion->priority >= uc->snapshot_level ||
-            (!subregion->terminates && QTAILQ_EMPTY(&subregion->subregions))) {
-            uc->memory_unmap(uc, subregion);
-        }
+    if (context->memory_owner != uc || context->snapshot_level <= 0 ||
+        (context->mapping_count != 0 && !context->mappings) ||
+        (context->memory_region_count != 0 && !context->memory_regions) ||
+        (context->fv->nr != 0 && !context->fv->ranges)) {
+        return UC_ERR_ARG;
     }
 
-    for (size_t i = uc->unmapped_regions->len; i-- > 0;) {
-        mr = g_array_index(uc->unmapped_regions, MemoryRegion *, i);
-        // same dirty hack as in memory_moveout see qemu/softmmu/memory.c
-        initial_mr = QTAILQ_FIRST(&mr->subregions);
-        if (!initial_mr) {
-            initial_mr = mr;
-        }
-        /* same dirty hack as in memory_moveout see qemu/softmmu/memory.c */
-        level = (intptr_t)mr->container;
-        mr->container = NULL;
+    for (i = 0; i < context->mapping_count; i++) {
+        const UcContextMapping *saved = &context->mappings[i];
+        UcMapping *mapping = saved->mapping;
+        uint32_t j;
 
-        if (level < uc->snapshot_level) {
-            break;
+        if (!mapping || mapping->owner != uc || !mapping->root ||
+            mapping->size == 0 ||
+            mapping->begin > UINT64_MAX - (mapping->size - 1) ||
+            saved->region_count == 0 ||
+            saved->first_region != consumed_regions ||
+            saved->region_count >
+                context->memory_region_count - consumed_regions) {
+            return UC_ERR_ARG;
         }
-        if (memory_overlap(uc, mr->addr, int128_get64(mr->size))) {
+        if (previous &&
+            (mapping->begin < previous->begin ||
+             ranges_overlap(previous->begin, previous->size, mapping->begin,
+                            mapping->size))) {
             return UC_ERR_MAP;
         }
-        uc->memory_movein(uc, mr);
-        uc->memory_filter_subregions(mr, uc->snapshot_level);
-        if (initial_mr != mr && QTAILQ_EMPTY(&mr->subregions)) {
-            uc->memory_unmap(uc, subregion);
-        }
-        mem_map(uc, initial_mr);
-        g_array_remove_range(uc->unmapped_regions, i, 1);
-    }
-    uc->snapshot_level--;
+        previous = mapping;
 
+        if (mapping->root->terminates &&
+            (saved->region_count != 1 ||
+             context->memory_regions[saved->first_region] != mapping->root)) {
+            return UC_ERR_ARG;
+        }
+
+        for (j = 0; j < saved->region_count; j++) {
+            MemoryRegion *region =
+                context->memory_regions[saved->first_region + j];
+
+            if (!region || region->uc_mapping != mapping ||
+                (!mapping->root->terminates && region == mapping->root)) {
+                return UC_ERR_ARG;
+            }
+        }
+        consumed_regions += saved->region_count;
+    }
+
+    if (consumed_regions != context->memory_region_count) {
+        return UC_ERR_ARG;
+    }
+    if (!mem_map_reserve(uc, context->mapping_count) ||
+        !uc->flatview_reserve(restore_view, context->fv->nr)) {
+        return UC_ERR_NOMEM;
+    }
     return UC_ERR_OK;
 }
 

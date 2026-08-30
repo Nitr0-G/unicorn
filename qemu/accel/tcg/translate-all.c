@@ -865,6 +865,9 @@ static inline void may_remove_handler(struct uc_struct *uc) {
         if (uc->seh_handle) {
             RemoveVectoredExceptionHandler(uc->seh_handle);
         }
+        if (uc->vch_handle) {
+            RemoveVectoredContinueHandler(uc->vch_handle);
+        }
         VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
     }
 }
@@ -906,9 +909,9 @@ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
     // ; rax = &data
     // mov [rax], rdx ; save rdx
     // mov rdx, [rax+0x8] ; move uc pointer to 2nd arg
-    // sub rsp, 0x10; reserve 2 slots as ms fastcall requires
+    // sub rsp, 0x28; align the stack and reserve Win64 shadow space
     // call [rax + 0x10] ; go to handler
-    const char tramp[] = "\x48\x89\x10\x48\x8b\x50\x08\x48\x83\xec\x10\xff\x50\x10";
+    const char tramp[] = "\x48\x89\x10\x48\x8b\x50\x08\x48\x83\xec\x28\xff\x50\x10";
     memcpy(ptr, (void*)tramp, sizeof(tramp) - 1); // Note last zero!
     ptr += sizeof(tramp) - 1;
     *ptr = 0x48; // REX.w
@@ -918,10 +921,10 @@ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
     memcpy(ptr, &data, 8); // mov rdx, &data
     ptr += 8;
     // ; rdx = &data
-    // add rsp, 0x10 ; clean stack
+    // add rsp, 0x28 ; clean stack
     // mov rdx, [rdx] ; restore rdx
     // ret
-    const char tramp2[] = "\x48\x83\xc4\x10\x48\x8b\x12\xc3";
+    const char tramp2[] = "\x48\x83\xc4\x28\x48\x8b\x12\xc3";
     memcpy(ptr, (void*)tramp2, sizeof(tramp2) - 1);
 
     memcpy(data + 0x8,  (void*)&uc, 8);
@@ -958,6 +961,16 @@ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
 
     uc->seh_handle = AddVectoredExceptionHandler(1, (PVECTORED_EXCEPTION_HANDLER)closure);
     if (!uc->seh_handle) {
+        VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
+        uc->seh_closure = NULL;
+        return NULL;
+    }
+    /* Stop later continue handlers after the range-checked VEH succeeds. */
+    uc->vch_handle = AddVectoredContinueHandler(
+        1, (PVECTORED_EXCEPTION_HANDLER)closure);
+    if (!uc->vch_handle) {
+        RemoveVectoredExceptionHandler(uc->seh_handle);
+        uc->seh_handle = NULL;
         VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
         uc->seh_closure = NULL;
         return NULL;
@@ -1269,9 +1282,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tcg_func_start(tcg_ctx);
 
     tcg_ctx->cpu = env_cpu(env);
+    tcg_ctx->gen_tb = tb;
     UC_TRACE_START(UC_TRACE_TB_TRANS);
     gen_intermediate_code(cpu, tb, max_insns);
     UC_TRACE_END(UC_TRACE_TB_TRANS, "[uc] translate tb 0x%" PRIx64 ": ", tb->pc);
+    tcg_ctx->gen_tb = NULL;
     tcg_ctx->cpu = NULL;
 
     /* generate machine code */

@@ -37,6 +37,7 @@ if(UNICORN_HAS_X86)
         eflags_noset
         eflags_nosync
         emu_clear_errors
+        exit_pending_order
         hook_extrainvoke
         invalid_read_in_cpu_tb_exec
         invalid_read_in_tb_flush_x86_64

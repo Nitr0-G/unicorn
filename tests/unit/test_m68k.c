@@ -5,8 +5,52 @@
 const uint64_t code_start = 0x1000;
 const uint64_t code_len = 0x4000;
 
+#define M68K_FPCR_RND_NEAREST 0x0000
+#define M68K_FPCR_RND_ZERO 0x0010
+#define M68K_FPCR_RND_MINUS 0x0020
+#define M68K_FPCR_RND_PLUS 0x0030
+#define M68K_FPSR_CC_NAN 0x01000000
+#define M68K_FPSR_CC_INFINITY 0x02000000
+#define M68K_FPSR_CC_ZERO 0x04000000
+#define M68K_FPSR_CC_MASK 0x0f000000
+#define M68K_MMU_TCR_ENABLED 0x8000
+#define M68K_MMU_TTR_ALL 0x0000c000
+#define M68K_MMU_DESC_VALID 0x00000001
+#define M68K_MMU_DESC_TABLE 0x00000002
+#define M68K_MMU_DESC_WRITE_PROTECT 0x00000004
+#define M68K_MMUSR_WRITE_PROTECT 0x00000004
+#define M68K_MMUSR_RESIDENT 0x00000001
+
+static uint32_t m68k_load_be32(const uint8_t *value)
+{
+    return ((uint32_t)value[0] << 24) | ((uint32_t)value[1] << 16) |
+           ((uint32_t)value[2] << 8) | value[3];
+}
+
+static void m68k_write_be32(uc_engine *uc, uint64_t address, uint32_t value)
+{
+    uint8_t bytes[] = {
+        value >> 24,
+        value >> 16,
+        value >> 8,
+        value,
+    };
+
+    OK(uc_mem_write(uc, address, bytes, sizeof(bytes)));
+}
+
+static void m68k_write_be64(uc_engine *uc, uint64_t address, uint64_t value)
+{
+    uint8_t bytes[] = {
+        value >> 56, value >> 48, value >> 40, value >> 32,
+        value >> 24, value >> 16, value >> 8,  value,
+    };
+
+    OK(uc_mem_write(uc, address, bytes, sizeof(bytes)));
+}
+
 static void uc_common_setup(uc_engine **uc, uc_arch arch, uc_mode mode,
-                            const char *code, uint64_t size,
+                            const void *code, uint64_t size,
                             uc_cpu_m68k cpu_model)
 {
     OK(uc_open(arch, mode, uc));
@@ -73,6 +117,31 @@ static void test_sr_contains_flags(void)
     OK(uc_close(uc));
 }
 
+static void test_m68k_reset_and_lazy_ccr(void)
+{
+    const uint8_t code[] = {
+        0x40, 0xc1, /* move.w sr, d1 */
+        0x70, 0xff, /* moveq #-1, d0 */
+        0x52, 0x00, /* addq.b #1, d0 */
+    };
+    uc_engine *uc;
+    uint32_t d1 = UINT32_MAX;
+    uint32_t sr = 0;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_M68K_M68000);
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_reg_read(uc, UC_M68K_REG_SR, &sr));
+
+    TEST_CHECK_(d1 == 0, "reset sr = 0x%08x", d1);
+    TEST_CHECK_((sr & 0x1f) == 0x15, "lazy ccr = 0x%02x", sr & 0x1f);
+
+    OK(uc_close(uc));
+}
+
 static void test_fetoxm1(void)
 {
     uc_engine *uc;
@@ -98,6 +167,257 @@ static void test_fetoxm1(void)
     OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
     OK(uc_mem_read(uc, a0, result, sizeof(result)));
 
+    TEST_CHECK(memcmp(result, expected, sizeof(expected)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static int32_t run_m68k_fint(uint64_t input, uint32_t fpcr)
+{
+    const uint8_t code[] = {
+        0xf2, 0x00, 0x90, 0x00, /* fmove.l d0, fpcr */
+        0xf2, 0x10, 0x54, 0x00, /* fmove.d (a0), fp0 */
+        0xf2, 0x00, 0x00, 0x81, /* fint.x fp0, fp1 */
+        0xf2, 0x11, 0x60, 0x80, /* fmove.l fp1, (a1) */
+        0xf2, 0x02, 0xb0, 0x00, /* fmove.l fpcr, d2 */
+    };
+    const uint32_t input_address = code_start + 0x800;
+    const uint32_t result_address = input_address + 8;
+    uint8_t result[4];
+    uc_engine *uc;
+    uint32_t observed_fpcr = 0;
+    uint32_t a0 = input_address;
+    uint32_t a1 = result_address;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, (const char *)code,
+                    sizeof(code), UC_CPU_M68K_M68020);
+    m68k_write_be64(uc, input_address, input);
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &fpcr));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_A1, &a1));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_mem_read(uc, result_address, result, sizeof(result)));
+    OK(uc_reg_read(uc, UC_M68K_REG_D2, &observed_fpcr));
+    TEST_CHECK_(observed_fpcr == fpcr, "fpcr = 0x%08x", observed_fpcr);
+
+    OK(uc_close(uc));
+    return (int32_t)m68k_load_be32(result);
+}
+
+static void test_m68k_fpcr_rounding_modes(void)
+{
+    static const struct {
+        uint32_t fpcr;
+        int32_t positive;
+        int32_t negative;
+    } cases[] = {
+        {M68K_FPCR_RND_NEAREST, 2, -2},
+        {M68K_FPCR_RND_ZERO, 1, -1},
+        {M68K_FPCR_RND_MINUS, 1, -2},
+        {M68K_FPCR_RND_PLUS, 2, -1},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST_CHECK_(run_m68k_fint(UINT64_C(0x3ff8000000000000),
+                                  cases[i].fpcr) == cases[i].positive,
+                    "positive rounding mode 0x%02x", cases[i].fpcr);
+        TEST_CHECK_(run_m68k_fint(UINT64_C(0xbff8000000000000),
+                                  cases[i].fpcr) == cases[i].negative,
+                    "negative rounding mode 0x%02x", cases[i].fpcr);
+    }
+}
+
+static void test_m68k_fpsr_exception_condition_codes(void)
+{
+    const uint8_t code[] = {
+        0xf2, 0x10, 0x54, 0x00, /* fmove.d (a0), fp0 */
+        0xf2, 0x00, 0x00, 0x84, /* fsqrt.x fp0, fp1 */
+        0xf2, 0x00, 0xa8, 0x00, /* fmove.l fpsr, d0 */
+        0xf2, 0x11, 0x54, 0x00, /* fmove.d (a1), fp0 */
+        0xf2, 0x12, 0x54, 0x80, /* fmove.d (a2), fp1 */
+        0xf2, 0x00, 0x00, 0xa0, /* fdiv.x fp0, fp1 */
+        0xf2, 0x01, 0xa8, 0x00, /* fmove.l fpsr, d1 */
+    };
+    const uint32_t data_address = code_start + 0x800;
+    uc_engine *uc;
+    uint32_t a0 = data_address;
+    uint32_t a1 = data_address + 8;
+    uint32_t a2 = data_address + 16;
+    uint32_t invalid_fpsr = 0;
+    uint32_t divzero_fpsr = 0;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, (const char *)code,
+                    sizeof(code), UC_CPU_M68K_M68020);
+    m68k_write_be64(uc, a0, UINT64_C(0xbff0000000000000));
+    m68k_write_be64(uc, a1, UINT64_C(0));
+    m68k_write_be64(uc, a2, UINT64_C(0x3ff0000000000000));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_A1, &a1));
+    OK(uc_reg_write(uc, UC_M68K_REG_A2, &a2));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &invalid_fpsr));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &divzero_fpsr));
+
+    TEST_CHECK_((invalid_fpsr & (M68K_FPSR_CC_NAN | M68K_FPSR_CC_INFINITY |
+                                 M68K_FPSR_CC_ZERO)) == M68K_FPSR_CC_NAN,
+                "invalid fpsr = 0x%08x", invalid_fpsr);
+    TEST_CHECK_((divzero_fpsr & M68K_FPSR_CC_MASK) == M68K_FPSR_CC_INFINITY,
+                "divide-by-zero fpsr = 0x%08x", divzero_fpsr);
+
+    OK(uc_close(uc));
+}
+
+static void setup_m68040_mmu(uc_engine **uc, const uint8_t *code,
+                             size_t code_size, uint32_t page_descriptor)
+{
+    const uint32_t root_address = 0x2000;
+    const uint32_t pointer_address = 0x2800;
+    const uint32_t page_table_address = 0x3000;
+    const uint32_t physical_page = 0x4000;
+    const uint32_t page_entry = page_table_address + 0x20;
+    uint32_t sr = 0x2000;
+    uint32_t dfc = 1;
+    uint32_t itt0 = M68K_MMU_TTR_ALL;
+    uint16_t tcr = M68K_MMU_TCR_ENABLED;
+
+    uc_common_setup(uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, (const char *)code,
+                    code_size, UC_CPU_M68K_M68040);
+    m68k_write_be32(*uc, root_address, pointer_address | M68K_MMU_DESC_TABLE);
+    m68k_write_be32(*uc, pointer_address,
+                    page_table_address | M68K_MMU_DESC_TABLE);
+    m68k_write_be32(*uc, page_entry, physical_page | page_descriptor);
+    OK(uc_reg_write(*uc, UC_M68K_REG_SR, &sr));
+    OK(uc_reg_write(*uc, UC_M68K_REG_CR_DFC, &dfc));
+    OK(uc_reg_write(*uc, UC_M68K_REG_CR_SRP, &root_address));
+    OK(uc_reg_write(*uc, UC_M68K_REG_CR_URP, &root_address));
+    OK(uc_reg_write(*uc, UC_M68K_REG_CR_ITT0, &itt0));
+    OK(uc_reg_write(*uc, UC_M68K_REG_CR_TC, &tcr));
+}
+
+static void test_m68040_ptest_updates_mmusr(void)
+{
+    const uint8_t code[] = {
+        0xf5, 0x68, /* ptestr (a0) */
+    };
+    const uint32_t logical_address = 0x8000;
+    uc_engine *uc;
+    uint32_t a0 = logical_address;
+    uint32_t mmusr = 0;
+
+    setup_m68040_mmu(&uc, code, sizeof(code), M68K_MMU_DESC_VALID);
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_M68K_REG_CR_MMUSR, &mmusr));
+    TEST_CHECK_(mmusr == (UINT32_C(0x4000) | M68K_MMUSR_RESIDENT),
+                "mmusr = 0x%08x", mmusr);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68040_write_protection(void)
+{
+    const uint8_t ptest_code[] = {
+        0xf5, 0x48, /* ptestw (a0) */
+    };
+    const uint8_t store_code[] = {
+        0x10, 0x80, /* move.b d0, (a0) */
+    };
+    const uint32_t logical_address = 0x8000;
+    const uint32_t page_descriptor =
+        M68K_MMU_DESC_VALID | M68K_MMU_DESC_WRITE_PROTECT;
+    uc_engine *uc;
+    uint32_t a0 = logical_address;
+    uint32_t d0 = 0xa5;
+    uint32_t mmusr = 0;
+    uint32_t sr = 0;
+    uint8_t original = 0x5a;
+    uint8_t result = 0;
+
+    setup_m68040_mmu(&uc, ptest_code, sizeof(ptest_code), page_descriptor);
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(ptest_code), 0, 0));
+    OK(uc_reg_read(uc, UC_M68K_REG_CR_MMUSR, &mmusr));
+    TEST_CHECK_(mmusr == (UINT32_C(0x4000) | M68K_MMUSR_RESIDENT |
+                          M68K_MMUSR_WRITE_PROTECT),
+                "mmusr = 0x%08x", mmusr);
+    OK(uc_close(uc));
+
+    setup_m68040_mmu(&uc, store_code, sizeof(store_code), page_descriptor);
+    OK(uc_mem_write(uc, 0x4000, &original, sizeof(original)));
+    OK(uc_reg_write(uc, UC_M68K_REG_SR, &sr));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D0, &d0));
+
+    uc_assert_err(
+        UC_ERR_EXCEPTION,
+        uc_emu_start(uc, code_start, code_start + sizeof(store_code), 0, 0));
+    OK(uc_mem_read(uc, 0x4000, &result, sizeof(result)));
+    TEST_CHECK_(result == original, "protected byte = 0x%02x", result);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68020_bitfield_crosses_byte_boundary(void)
+{
+    const uint8_t code[] = {
+        0xe9, 0xd0, 0x01, 0x10, /* bfextu (a0){4:16}, d0 */
+        0xeb, 0xd0, 0x11, 0x10, /* bfexts (a0){4:16}, d1 */
+    };
+    const uint8_t input[] = {0x1a, 0xbc, 0xd6};
+    const uint32_t data_address = code_start + 0x800;
+    uc_engine *uc;
+    uint32_t a0 = data_address;
+    uint32_t d0 = 0;
+    uint32_t d1 = 0;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, (const char *)code,
+                    sizeof(code), UC_CPU_M68K_M68020);
+    OK(uc_mem_write(uc, data_address, input, sizeof(input)));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    TEST_CHECK_(d0 == 0xabcd, "bfextu = 0x%08x", d0);
+    TEST_CHECK_(d1 == 0xffffabcd, "bfexts = 0x%08x", d1);
+
+    OK(uc_close(uc));
+}
+
+static void test_m68020_bitfield_crosses_page_boundary(void)
+{
+    const uint8_t code[] = {
+        0xef, 0xd0, 0x21, 0x10, /* bfins d2, (a0){4:16} */
+        0xe9, 0xd0, 0x01, 0x10, /* bfextu (a0){4:16}, d0 */
+        0xea, 0xd0, 0x01, 0x10, /* bfchg (a0){4:16} */
+        0xe9, 0xd0, 0x11, 0x10, /* bfextu (a0){4:16}, d1 */
+    };
+    const uint8_t input[] = {0x12, 0x34, 0x56};
+    const uint8_t expected[] = {0x15, 0x43, 0x26};
+    const uint32_t data_address = 0x1fff;
+    uint8_t result[sizeof(expected)];
+    uc_engine *uc;
+    uint32_t a0 = data_address;
+    uint32_t d0 = 0;
+    uint32_t d1 = 0;
+    uint32_t d2 = 0xabcd;
+
+    uc_common_setup(&uc, UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, (const char *)code,
+                    sizeof(code), UC_CPU_M68K_M68020);
+    OK(uc_mem_write(uc, data_address, input, sizeof(input)));
+    OK(uc_reg_write(uc, UC_M68K_REG_A0, &a0));
+    OK(uc_reg_write(uc, UC_M68K_REG_D2, &d2));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D0, &d0));
+    OK(uc_reg_read(uc, UC_M68K_REG_D1, &d1));
+    OK(uc_mem_read(uc, data_address, result, sizeof(result)));
+    TEST_CHECK_(d0 == 0xabcd, "inserted field = 0x%08x", d0);
+    TEST_CHECK_(d1 == 0x5432, "changed field = 0x%08x", d1);
     TEST_CHECK(memcmp(result, expected, sizeof(expected)) == 0);
 
     OK(uc_close(uc));
@@ -808,7 +1128,21 @@ static void test_m68k_context_roundtrip(void)
 
 TEST_LIST = {{"test_move_to_sr", test_move_to_sr},
              {"test_sr_contains_flags", test_sr_contains_flags},
+             {"test_m68k_reset_and_lazy_ccr",
+              test_m68k_reset_and_lazy_ccr},
              {"test_fetoxm1", test_fetoxm1},
+             {"test_m68k_fpcr_rounding_modes",
+              test_m68k_fpcr_rounding_modes},
+             {"test_m68k_fpsr_exception_condition_codes",
+              test_m68k_fpsr_exception_condition_codes},
+             {"test_m68040_ptest_updates_mmusr",
+              test_m68040_ptest_updates_mmusr},
+             {"test_m68040_write_protection",
+              test_m68040_write_protection},
+             {"test_m68020_bitfield_crosses_byte_boundary",
+              test_m68020_bitfield_crosses_byte_boundary},
+             {"test_m68020_bitfield_crosses_page_boundary",
+              test_m68020_bitfield_crosses_page_boundary},
              {"test_coldfire_macsr_to_ccr", test_coldfire_macsr_to_ccr},
              {"test_ftrapcc_false_consumes_immediate",
               test_ftrapcc_false_consumes_immediate},

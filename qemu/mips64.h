@@ -4,9 +4,15 @@
 #ifndef UNICORN_ARCH_POSTFIX
 #define UNICORN_ARCH_POSTFIX _mips64
 #endif
+#define gen_helper_check_counted_entry gen_helper_check_counted_entry_mips64
 #define gen_helper_check_exit_request gen_helper_check_exit_request_mips64
+#define gen_helper_exit_request gen_helper_exit_request_mips64
+#define helper_check_counted_entry helper_check_counted_entry_mips64
+#define helper_check_exit_request helper_check_exit_request_mips64
+#define helper_exit_request helper_exit_request_mips64
 #define helper_uc_tracecode_single helper_uc_tracecode_single_mips64
 #define cpu_restore_icount cpu_restore_icount_mips64
+#define cpu_tcg_exit_request cpu_tcg_exit_request_mips64
 #define unicorn_fill_tlb unicorn_fill_tlb_mips64
 #define reg_read reg_read_mips64
 #define reg_write reg_write_mips64
@@ -58,6 +64,8 @@
 #define address_space_dispatch_compact address_space_dispatch_compact_mips64
 #define flatview_translate flatview_translate_mips64
 #define flatview_copy flatview_copy_mips64
+#define flatview_reserve flatview_reserve_mips64
+#define address_space_restore_flatview address_space_restore_flatview_mips64
 #define address_space_translate_for_iotlb address_space_translate_for_iotlb_mips64
 #define qemu_get_cpu qemu_get_cpu_mips64
 #define cpu_address_space_init cpu_address_space_init_mips64
@@ -133,6 +141,10 @@
 #define memory_unmap memory_unmap_mips64
 #define memory_moveout memory_moveout_mips64
 #define memory_movein memory_movein_mips64
+#define memory_mapping_restore_topology memory_mapping_restore_topology_mips64
+#define memory_mapping_free memory_mapping_free_mips64
+#define memory_mapping_prune memory_mapping_prune_mips64
+#define memory_mapping_normalize memory_mapping_normalize_mips64
 #define memory_free memory_free_mips64
 #define flatview_unref flatview_unref_mips64
 #define address_space_get_flatview address_space_get_flatview_mips64

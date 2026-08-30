@@ -6103,7 +6103,11 @@ void hw_watchpoint_update_all(ARMCPU *cpu)
     cpu_watchpoint_remove_all(CPU(cpu), BP_CPU);
     memset(env->cpu_watchpoint, 0, sizeof(env->cpu_watchpoint));
 
-    for (i = 0; i < ARRAY_SIZE(cpu->env.cpu_watchpoint); i++) {
+    if (!is_a64(env) && !arm_feature(env, ARM_FEATURE_V7)) {
+        return;
+    }
+
+    for (i = 0; i < arm_num_wrps(cpu); i++) {
         hw_watchpoint_update(cpu, i);
     }
 }
@@ -6221,7 +6225,11 @@ void hw_breakpoint_update_all(ARMCPU *cpu)
     cpu_breakpoint_remove_all(CPU(cpu), BP_CPU);
     memset(env->cpu_breakpoint, 0, sizeof(env->cpu_breakpoint));
 
-    for (i = 0; i < ARRAY_SIZE(cpu->env.cpu_breakpoint); i++) {
+    if (!is_a64(env) && !arm_feature(env, ARM_FEATURE_V7)) {
+        return;
+    }
+
+    for (i = 0; i < arm_num_brps(cpu); i++) {
         hw_breakpoint_update(cpu, i);
     }
 }

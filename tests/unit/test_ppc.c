@@ -3,23 +3,53 @@
 const uint64_t code_start = 0x1000;
 const uint64_t code_len = 0x4000;
 
-typedef struct PpcCodeHookTrace {
-    uint64_t address[2];
-    uint32_t size[2];
+typedef enum PpcHookEventType {
+    PPC_HOOK_EVENT_FETCH,
+    PPC_HOOK_EVENT_CODE,
+} PpcHookEventType;
+
+typedef struct PpcHookTrace {
+    PpcHookEventType type[4];
+    uint64_t address[4];
+    uint32_t size[4];
     uint32_t count;
-} PpcCodeHookTrace;
+    uint32_t code_count;
+    uint32_t fetch_count;
+} PpcHookTrace;
 
-static void test_ppc64_prefixed_code_hook(uc_engine *uc, uint64_t address,
-                                          uint32_t size, void *user_data)
+static void test_ppc64_hook_record(PpcHookTrace *trace,
+                                   PpcHookEventType type, uint64_t address,
+                                   uint32_t size)
 {
-    PpcCodeHookTrace *trace = (PpcCodeHookTrace *)user_data;
-
-    (void)uc;
-    if (trace->count < 2) {
+    if (TEST_CHECK(trace->count < 4)) {
+        trace->type[trace->count] = type;
         trace->address[trace->count] = address;
         trace->size[trace->count] = size;
     }
     trace->count++;
+}
+
+static void test_ppc64_prefixed_code_hook(uc_engine *uc, uint64_t address,
+                                          uint32_t size, void *user_data)
+{
+    PpcHookTrace *trace = (PpcHookTrace *)user_data;
+
+    (void)uc;
+    trace->code_count++;
+    test_ppc64_hook_record(trace, PPC_HOOK_EVENT_CODE, address, size);
+}
+
+static void test_ppc64_prefixed_fetch_hook(uc_engine *uc, uc_mem_type type,
+                                           uint64_t address, int size,
+                                           int64_t value, void *user_data)
+{
+    PpcHookTrace *trace = (PpcHookTrace *)user_data;
+
+    (void)uc;
+    TEST_CHECK(type == UC_MEM_FETCH);
+    TEST_CHECK(value == 0);
+    trace->fetch_count++;
+    test_ppc64_hook_record(trace, PPC_HOOK_EVENT_FETCH, address, size);
 }
 
 static void uc_common_setup(uc_engine **uc, uc_arch arch, uc_mode mode,
@@ -51,6 +81,33 @@ static void test_ppc32_add(void)
     TEST_CHECK(reg == 1379);
 
     OK(uc_close(uc));
+}
+
+static void test_ppc_engine_lifecycle(void)
+{
+    const uc_mode modes[] = { UC_MODE_32, UC_MODE_64 };
+    size_t i;
+    size_t j;
+
+    for (i = 0; i < 16; i++) {
+        for (j = 0; j < sizeof(modes) / sizeof(modes[0]); j++) {
+            uc_engine *uc;
+
+            OK(uc_open(UC_ARCH_PPC, modes[j] | UC_MODE_BIG_ENDIAN, &uc));
+            if (modes[j] == UC_MODE_32) {
+                uint32_t pc;
+
+                OK(uc_reg_read(uc, UC_PPC_REG_PC, &pc));
+                TEST_CHECK(pc == 0);
+            } else {
+                uint64_t pc;
+
+                OK(uc_reg_read(uc, UC_PPC_REG_PC, &pc));
+                TEST_CHECK(pc == 0);
+            }
+            OK(uc_close(uc));
+        }
+    }
 }
 
 static void run_ppc_instruction_count(uc_mode mode)
@@ -5230,6 +5287,9 @@ static void test_ppc64_power10_pnop_invalid_suffix(void)
 static void test_ppc64_power10_prefixed_boundary(void)
 {
     uc_engine *uc;
+    uc_hook code_hook;
+    uc_hook fetch_hook;
+    PpcHookTrace trace = { 0 };
     uint64_t pc = 0;
     uint64_t start = code_start + 0x3c;
     const char code[] =
@@ -5239,20 +5299,33 @@ static void test_ppc64_power10_prefixed_boundary(void)
     OK(uc_ctl_set_cpu_model(uc, UC_CPU_PPC64_POWER10_V1_0));
     OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
     OK(uc_mem_write(uc, start, code, sizeof(code) - 1));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE,
+                   test_ppc64_prefixed_code_hook, &trace, 1, 0));
+    OK(uc_hook_add(uc, &fetch_hook, UC_HOOK_MEM_FETCH,
+                   test_ppc64_prefixed_fetch_hook, &trace, 1, 0));
 
     TEST_CHECK(uc_emu_start(uc, start, start + sizeof(code) - 1, 0, 0) ==
                UC_ERR_EXCEPTION);
     OK(uc_reg_read(uc, UC_PPC_REG_PC, &pc));
     TEST_CHECK(pc == start + sizeof(code) - 1);
+    TEST_CHECK(trace.fetch_count == 0);
+    TEST_CHECK(trace.code_count == 1);
+    TEST_CHECK(trace.count == 1);
+    TEST_CHECK(trace.type[0] == PPC_HOOK_EVENT_CODE);
+    TEST_CHECK(trace.address[0] == start);
+    TEST_CHECK(trace.size[0] == 8);
 
+    OK(uc_hook_del(uc, fetch_hook));
+    OK(uc_hook_del(uc, code_hook));
     OK(uc_close(uc));
 }
 
 static void test_ppc64_power10_prefixed_hook_size(void)
 {
     uc_engine *uc;
-    uc_hook hook;
-    PpcCodeHookTrace trace = { 0 };
+    uc_hook code_hook;
+    uc_hook fetch_hook;
+    PpcHookTrace trace = { 0 };
     const char code[] =
         "\x07\x00\x00\x00\x60\x00\x00\x00" /* pnop */
         "\x38\x60\x00\x07"; /* addi r3,0,7 */
@@ -5261,17 +5334,31 @@ static void test_ppc64_power10_prefixed_hook_size(void)
     OK(uc_ctl_set_cpu_model(uc, UC_CPU_PPC64_POWER10_V1_0));
     OK(uc_mem_map(uc, code_start, code_len, UC_PROT_ALL));
     OK(uc_mem_write(uc, code_start, code, sizeof(code) - 1));
-    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, test_ppc64_prefixed_code_hook,
-                   &trace, 1, 0));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE,
+                   test_ppc64_prefixed_code_hook, &trace, 1, 0));
+    OK(uc_hook_add(uc, &fetch_hook, UC_HOOK_MEM_FETCH,
+                   test_ppc64_prefixed_fetch_hook, &trace, 1, 0));
 
     OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 0));
 
-    TEST_CHECK(trace.count == 2);
+    TEST_CHECK(trace.fetch_count == 2);
+    TEST_CHECK(trace.code_count == 2);
+    TEST_CHECK(trace.count == 4);
+    TEST_CHECK(trace.type[0] == PPC_HOOK_EVENT_FETCH);
     TEST_CHECK(trace.address[0] == code_start);
     TEST_CHECK(trace.size[0] == 8);
-    TEST_CHECK(trace.address[1] == code_start + 8);
-    TEST_CHECK(trace.size[1] == 4);
+    TEST_CHECK(trace.type[1] == PPC_HOOK_EVENT_CODE);
+    TEST_CHECK(trace.address[1] == code_start);
+    TEST_CHECK(trace.size[1] == 8);
+    TEST_CHECK(trace.type[2] == PPC_HOOK_EVENT_FETCH);
+    TEST_CHECK(trace.address[2] == code_start + 8);
+    TEST_CHECK(trace.size[2] == 4);
+    TEST_CHECK(trace.type[3] == PPC_HOOK_EVENT_CODE);
+    TEST_CHECK(trace.address[3] == code_start + 8);
+    TEST_CHECK(trace.size[3] == 4);
 
+    OK(uc_hook_del(uc, fetch_hook));
+    OK(uc_hook_del(uc, code_hook));
     OK(uc_close(uc));
 }
 
@@ -5363,6 +5450,7 @@ static void test_ppc64_power9_xvp_rejected(void)
 }
 
 TEST_LIST = {{"test_ppc32_add", test_ppc32_add},
+             {"test_ppc_engine_lifecycle", test_ppc_engine_lifecycle},
              {"test_ppc32_instruction_count_boundary",
               test_ppc32_instruction_count_boundary},
              {"test_ppc64_instruction_count_boundary",

@@ -33,6 +33,7 @@
 #include "tcg/tcg-apple-jit.h"
 
 #include <uc_priv.h>
+#include "tb-exec-frame.h"
 
 /* 32-bit helpers */
 
@@ -203,43 +204,57 @@ void HELPER(uc_tracecode_single)(void *item, uint32_t size, void *handle,
             }
         }
     }
-    if (cpu_loop_exit_requested(uc->cpu)) {
-        if (uc->nested_level == 1) {
-            tb_exec_unlock(uc);
-        }
-        qatomic_set(&uc->cpu->tcg_exit_req, 0);
-        if (uc->skip_sync_pc_on_exit) {
-            cpu_restore_icount(uc->cpu, GETPC());
-            uc->skip_sync_pc_on_exit = false;
-            cpu_loop_exit(uc->cpu);
-        } else {
-            cpu_loop_exit_restore(uc->cpu, GETPC());
-        }
+    if (qatomic_read(&uc->cpu->exit_request_pending)) {
+        cpu_tcg_exit_request(uc, GETPC());
     }
 }
 
-void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot,
-                                void *tb_ptr, uint32_t num_insns) {
+void QEMU_NORETURN cpu_tcg_exit_request(uc_engine *uc, uintptr_t retaddr)
+{
+    CPUState *cpu = uc->cpu;
+    uint32_t pending = qatomic_read(&cpu->exit_request_pending);
+
+    g_assert(pending);
+    (void)pending;
+
+    /* Keep the cpu_tb_exec teardown behavior on the slow exit path. */
+    if (uc->nested_level == 1) {
+        tb_exec_unlock(uc);
+    }
+    if (uc->skip_sync_pc_on_exit) {
+        cpu_restore_icount(cpu, retaddr);
+        uc->skip_sync_pc_on_exit = false;
+        cpu_loop_exit(cpu);
+    } else {
+        cpu_loop_exit_restore(cpu, retaddr);
+    }
+}
+
+void HELPER(exit_request)(void *p, uint32_t in_delay_slot)
+{
+    uc_engine *uc = p;
+
+    g_assert(!in_delay_slot);
+    cpu_tcg_exit_request(uc, GETPC());
+}
+
+void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot)
+{
+    uc_engine *uc = p;
+
+    if (!in_delay_slot && qatomic_read(&uc->cpu->exit_request_pending)) {
+        cpu_tcg_exit_request(uc, GETPC());
+    }
+}
+
+void HELPER(check_counted_entry)(void *p, uint32_t in_delay_slot,
+                                 void *tb_ptr, uint32_t num_insns)
+{
     uc_engine *uc = p;
     CPUState *cpu = uc->cpu;
 
-    if (cpu_loop_exit_requested(cpu) && !in_delay_slot) {
-        // There are stil something we have to before exiting to be compatible with previous behaviors
-
-        // from cpu_tb_exec
-        if (uc->nested_level == 1) {
-            // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
-            tb_exec_unlock(uc);
-        }
-        qatomic_set(&cpu->tcg_exit_req, 0);
-
-        if (uc->skip_sync_pc_on_exit) {
-            cpu_restore_icount(cpu, GETPC());
-            uc->skip_sync_pc_on_exit = false;
-            cpu_loop_exit(cpu);
-        } else {
-            cpu_loop_exit_restore(cpu, GETPC());
-        }
+    if (!in_delay_slot && qatomic_read(&cpu->exit_request_pending)) {
+        cpu_tcg_exit_request(uc, GETPC());
     }
 
     if (num_insns != 0 && uc->emu_count != 0) {

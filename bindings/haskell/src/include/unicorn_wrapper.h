@@ -23,8 +23,8 @@ uc_err uc_reg_write_batch_wrapper(uc_engine *uc, int *regs, int64_t *vals, int c
 uc_err uc_reg_read_batch_wrapper(uc_engine *uc, int *regs, int64_t *vals, int count);
 
 /*
- * Wrap Unicorn's uc_free function and ignore the returned error code.
+ * Wrap Unicorn's uc_context_free function and ignore the returned error code.
  */
-void uc_free_wrapper(void *context);
+void uc_context_free_wrapper(uc_context *context);
 
 #endif

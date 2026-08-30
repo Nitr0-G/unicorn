@@ -17,9 +17,13 @@ const uint64_t riscv_data_start = 0x8000;
 #define RISCV_CSR_VSATP 0x280
 #define RISCV_CSR_STIMECMP 0x14d
 #define RISCV_CSR_MSTATUS 0x300
+#define RISCV_CSR_MTINST 0x34a
+#define RISCV_CSR_MTVAL2 0x34b
 #define RISCV_CSR_PMPCFG0 0x3a0
 #define RISCV_CSR_PMPADDR0 0x3b0
 #define RISCV_CSR_HSTATUS 0x600
+#define RISCV_CSR_HTVAL 0x643
+#define RISCV_CSR_HTINST 0x64a
 #define RISCV_CSR_HGATP 0x680
 #define RISCV_CSR_TSELECT 0x7a0
 #define RISCV_CSR_TDATA1 0x7a1
@@ -27,9 +31,12 @@ const uint64_t riscv_data_start = 0x8000;
 #define RISCV_CSR_TINFO 0x7a4
 #define RISCV_MSTATUS_MXR 0x00080000ull
 #define RISCV_PMPCFG_R 0x01
+#define RISCV_PMPCFG_W 0x02
 #define RISCV_PMPCFG_X 0x04
+#define RISCV_PMPCFG_A_TOR 0x08
 #define RISCV_PMPCFG_A_NA4 0x10
 #define RISCV_PMPCFG_A_NAPOT 0x18
+#define RISCV_PMPCFG_L 0x80
 #define RISCV_EXCP_INST_ACCESS_FAULT 0x1
 #define RISCV_EXCP_ILLEGAL_INST 0x2
 #define RISCV_EXCP_BREAKPOINT 0x3
@@ -91,6 +98,26 @@ static void test_riscv_block_count_cb(uc_engine *uc, uint64_t address,
     uint32_t *count = (uint32_t *)user_data;
 
     (*count)++;
+}
+
+typedef struct RiscvFetchTrace {
+    uint64_t address;
+    int size;
+    uint32_t count;
+} RiscvFetchTrace;
+
+static void test_riscv_fetch_trace_cb(uc_engine *uc, uc_mem_type type,
+                                      uint64_t address, int size,
+                                      int64_t value, void *user_data)
+{
+    RiscvFetchTrace *trace = (RiscvFetchTrace *)user_data;
+
+    (void)uc;
+    TEST_CHECK(type == UC_MEM_FETCH);
+    TEST_CHECK(value == 0);
+    trace->address = address;
+    trace->size = size;
+    trace->count++;
 }
 
 static void riscv32_enable_vector_state(uc_engine *uc)
@@ -163,6 +190,28 @@ static void test_riscv64_nop(void)
     OK(uc_reg_read(uc, UC_RISCV_REG_T1, &r_t1));
     TEST_CHECK(r_t0 == 0x1234);
     TEST_CHECK(r_t1 == 0x5678);
+
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_fetch_invalid_compressed_size(void)
+{
+    const uint8_t code[] = {0x00, 0x00};
+    RiscvFetchTrace trace = {0};
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                    (const char *)code, sizeof(code));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_MEM_FETCH,
+                   test_riscv_fetch_trace_cb, &trace, 1, 0));
+
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start, code_start + sizeof(code),
+                               0, 0));
+    TEST_CHECK(trace.count == 1);
+    TEST_CHECK(trace.address == code_start);
+    TEST_CHECK(trace.size == 2);
 
     OK(uc_close(uc));
 }
@@ -1109,8 +1158,8 @@ static void test_riscv64_mmio_map(void)
 }
 
 static bool test_riscv_correct_address_in_small_jump_hook_callback(
-    uc_engine *uc, int type, uint64_t address, int size, int64_t value,
-    void *user_data)
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
 {
     // Check registers
     uint64_t r_x5 = 0x0;
@@ -1157,8 +1206,8 @@ static void test_riscv_correct_address_in_small_jump_hook(void)
 }
 
 static bool test_riscv_correct_address_in_long_jump_hook_callback(
-    uc_engine *uc, int type, uint64_t address, int size, int64_t value,
-    void *user_data)
+    uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+    int64_t value, void *user_data)
 {
     // Check registers
     uint64_t r_x5 = 0x0;
@@ -2372,6 +2421,51 @@ static void test_riscv_rvh_hstatus_layout(void)
     OK(uc_close(uc));
 }
 
+static void test_riscv64_rvh_trap_metadata_csr_access(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_csr(RISCV_CSR_HTVAL, 0, 2, 9),
+        riscv_encode_csr(RISCV_CSR_HTINST, 0, 2, 10),
+        riscv_encode_csr(RISCV_CSR_MTVAL2, 5, 1, 0),
+        riscv_encode_csr(RISCV_CSR_MTINST, 6, 1, 0),
+        riscv_encode_csr(RISCV_CSR_MTVAL2, 0, 2, 11),
+        riscv_encode_csr(RISCV_CSR_MTINST, 0, 2, 12),
+    };
+    uint8_t code[sizeof(insns)];
+    uint64_t htval = 0x123456789abull;
+    uint64_t htinst = 0x00002003;
+    uint64_t mtval2 = 0x23456789abcull;
+    uint64_t mtinst = 0x00003003;
+    uint64_t actual[4] = {0};
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup_model(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_BASE64);
+    OK(uc_reg_write(uc, UC_RISCV_REG_HTVAL, &htval));
+    OK(uc_reg_write(uc, UC_RISCV_REG_HTINST, &htinst));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X5, &mtval2));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X6, &mtinst));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X9, &actual[0]));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X10, &actual[1]));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X11, &actual[2]));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X12, &actual[3]));
+
+    TEST_CHECK(actual[0] == htval);
+    TEST_CHECK(actual[1] == htinst);
+    TEST_CHECK(actual[2] == mtval2);
+    TEST_CHECK(actual[3] == mtinst);
+
+    OK(uc_close(uc));
+}
+
 static void test_riscv_rvh_hedeleg_mask(void)
 {
     uc_engine *uc;
@@ -2627,6 +2721,101 @@ static void test_riscv64_type2_exec_privilege_filter(void)
     TEST_CHECK(value == 1);
 }
 
+static void test_riscv64_context_check_debug_state(uc_engine *uc,
+                                                   uint64_t data_address,
+                                                   uint32_t initial_value)
+{
+    uint32_t actual = 0;
+
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start + 12, code_start + 16, 0, 0));
+    uc_assert_err(UC_ERR_EXCEPTION,
+                  uc_emu_start(uc, code_start + 16, code_start + 20, 0, 0));
+    OK(uc_mem_read(uc, data_address, &actual, sizeof(actual)));
+    TEST_CHECK(actual == initial_value);
+}
+
+static void test_riscv64_context_debug_lifecycle(void)
+{
+    const uint64_t data_address = riscv_data_start;
+    const uint64_t breakpoint_address = code_start + 12;
+    const uint64_t exec_control =
+        RISCV64_TRIGGER_TYPE2 | RISCV_TRIGGER_TYPE2_EXEC |
+        RISCV_TRIGGER_TYPE2_M;
+    const uint64_t store_control =
+        RISCV64_TRIGGER_TYPE2 | RISCV_TRIGGER_TYPE2_STORE |
+        RISCV_TRIGGER_TYPE2_SIZE_4 | RISCV_TRIGGER_TYPE2_M;
+    const uint64_t disabled_control = RISCV64_TRIGGER_TYPE2;
+    const uint64_t stored_value = 0x11223344;
+    const uint32_t initial_value = 0xaabbccdd;
+    uint32_t insns[] = {
+        riscv_encode_csr(RISCV_CSR_TSELECT, 5, 1, 0),
+        riscv_encode_csr(RISCV_CSR_TDATA2, 6, 1, 0),
+        riscv_encode_csr(RISCV_CSR_TDATA1, 7, 1, 0),
+        riscv_encode_addi(10, 0, 1),
+        riscv_encode_s(0, 9, 6, 2, 0x23),
+    };
+    uint8_t code[sizeof(insns)];
+    uc_engine *source;
+    uc_engine *destination;
+    uc_context *context;
+    uint64_t trigger_index;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup_model(&source, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_SIFIVE_U54);
+    uc_common_setup_model(&destination, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_SIFIVE_U54);
+    OK(uc_mem_map(source, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(destination, data_address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_write(source, data_address, &initial_value,
+                    sizeof(initial_value)));
+    OK(uc_mem_write(destination, data_address, &initial_value,
+                    sizeof(initial_value)));
+
+    trigger_index = 0;
+    OK(uc_reg_write(source, UC_RISCV_REG_X5, &trigger_index));
+    OK(uc_reg_write(source, UC_RISCV_REG_X6, &breakpoint_address));
+    OK(uc_reg_write(source, UC_RISCV_REG_X7, &exec_control));
+    OK(uc_emu_start(source, code_start, code_start + 12, 0, 0));
+
+    trigger_index = 1;
+    OK(uc_reg_write(source, UC_RISCV_REG_X5, &trigger_index));
+    OK(uc_reg_write(source, UC_RISCV_REG_X6, &data_address));
+    OK(uc_reg_write(source, UC_RISCV_REG_X7, &store_control));
+    OK(uc_reg_write(source, UC_RISCV_REG_X9, &stored_value));
+    OK(uc_emu_start(source, code_start, code_start + 12, 0, 0));
+
+    OK(uc_context_alloc(source, &context));
+    OK(uc_context_save(source, context));
+
+    trigger_index = 0;
+    OK(uc_reg_write(source, UC_RISCV_REG_X5, &trigger_index));
+    OK(uc_reg_write(source, UC_RISCV_REG_X7, &disabled_control));
+    OK(uc_emu_start(source, code_start, code_start + 12, 0, 0));
+    trigger_index = 1;
+    OK(uc_reg_write(source, UC_RISCV_REG_X5, &trigger_index));
+    OK(uc_emu_start(source, code_start, code_start + 12, 0, 0));
+
+    OK(uc_context_restore(source, context));
+    test_riscv64_context_check_debug_state(source, data_address,
+                                           initial_value);
+
+    OK(uc_close(source));
+    OK(uc_context_restore(destination, context));
+    test_riscv64_context_check_debug_state(destination, data_address,
+                                           initial_value);
+
+    OK(uc_context_free(context));
+    OK(uc_close(destination));
+}
+
 static uint64_t riscv_pmp_napot_addr(uint64_t base, uint64_t size)
 {
     return (base >> 2) | (((size / 2) - 1) >> 2);
@@ -2711,6 +2900,336 @@ static void test_riscv64_pmp_na4_rejects_store(void)
     run_riscv64_pmp_na4_data_access(store, riscv_data_start, &capture, NULL);
     TEST_CHECK(capture.count == 1);
     TEST_CHECK(capture.intno == RISCV_EXCP_STORE_AMO_ACCESS_FAULT);
+}
+
+static void run_riscv64_pmp_data_access(const uint64_t pmpaddr[4],
+                                        uint64_t pmpcfg, uint32_t access_insn,
+                                        uint64_t access_addr,
+                                        RiscvIntrCapture *capture,
+                                        uint64_t *result)
+{
+    static const uint32_t data[] = {
+        0x10203040,
+        0x11223344,
+        0x22334455,
+        0x33445566,
+    };
+    uc_engine *uc;
+    uc_hook hook;
+    uint32_t insns[] = {
+        riscv_encode_csr(RISCV_CSR_PMPADDR0, 5, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 6, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 2, 7, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 3, 10, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPCFG0, 11, 1, 0),
+        access_insn,
+    };
+    uint8_t code[sizeof(insns)];
+    uint64_t priv = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+
+    uc_common_setup_model(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_SIFIVE_U54);
+    OK(uc_mem_map(uc, riscv_data_start - 0x1000, 0x3000, UC_PROT_ALL));
+    OK(uc_mem_write(uc, riscv_data_start, data, sizeof(data)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_INTR, test_riscv_intr_capture_cb, capture,
+                   1, 0));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X5, &pmpaddr[0]));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X6, &pmpaddr[1]));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X7, &pmpaddr[2]));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X10, &pmpaddr[3]));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X11, &pmpcfg));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X8, &access_addr));
+
+    OK(uc_emu_start(uc, code_start, code_start + 5 * 4, 0, 0));
+    OK(uc_reg_write(uc, UC_RISCV_REG_PRIV, &priv));
+    OK(uc_emu_start(uc, code_start + 5 * 4, code_start + sizeof(code), 0, 0));
+    if (result != NULL) {
+        OK(uc_reg_read(uc, UC_RISCV_REG_X9, result));
+    }
+
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_pmp_tor_boundaries(void)
+{
+    const uint32_t load = riscv_encode_i(0, 8, 2, 9, 0x03);
+    const uint64_t pmpaddr[] = {
+        riscv_pmp_napot_addr(code_start, 0x1000),
+        riscv_data_start >> 2,
+        (riscv_data_start + 16) >> 2,
+        0,
+    };
+    const uint64_t pmpcfg = (RISCV_PMPCFG_R | RISCV_PMPCFG_A_TOR) << 16 |
+                            (RISCV_PMPCFG_X | RISCV_PMPCFG_A_NAPOT);
+    RiscvIntrCapture capture = {0};
+    uint64_t value = 0;
+
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start,
+                                &capture, &value);
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(value == 0x10203040);
+
+    capture = (RiscvIntrCapture){0};
+    value = 0;
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start + 12,
+                                &capture, &value);
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(value == 0x33445566);
+
+    capture = (RiscvIntrCapture){0};
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start - 4,
+                                &capture, NULL);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_LOAD_ACCESS_FAULT);
+
+    capture = (RiscvIntrCapture){0};
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start + 16,
+                                &capture, NULL);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_LOAD_ACCESS_FAULT);
+}
+
+static void test_riscv64_pmp_napot_boundaries(void)
+{
+    const uint32_t load = riscv_encode_i(0, 8, 2, 9, 0x03);
+    const uint64_t pmpaddr[] = {
+        riscv_pmp_napot_addr(code_start, 0x1000),
+        riscv_pmp_napot_addr(riscv_data_start, 16),
+        0,
+        0,
+    };
+    const uint64_t pmpcfg = (RISCV_PMPCFG_R | RISCV_PMPCFG_A_NAPOT) << 8 |
+                            (RISCV_PMPCFG_X | RISCV_PMPCFG_A_NAPOT);
+    RiscvIntrCapture capture = {0};
+    uint64_t value = 0;
+
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start,
+                                &capture, &value);
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(value == 0x10203040);
+
+    capture = (RiscvIntrCapture){0};
+    value = 0;
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start + 12,
+                                &capture, &value);
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(value == 0x33445566);
+
+    capture = (RiscvIntrCapture){0};
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start - 4,
+                                &capture, NULL);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_LOAD_ACCESS_FAULT);
+
+    capture = (RiscvIntrCapture){0};
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start + 16,
+                                &capture, NULL);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_LOAD_ACCESS_FAULT);
+}
+
+static void test_riscv64_pmp_entry_priority(void)
+{
+    const uint32_t load = riscv_encode_i(0, 8, 2, 9, 0x03);
+    const uint64_t pmpaddr[] = {
+        riscv_pmp_napot_addr(code_start, 0x1000),
+        riscv_pmp_napot_addr(riscv_data_start, 0x1000),
+        riscv_pmp_napot_addr(riscv_data_start, 16),
+        0,
+    };
+    uint64_t pmpcfg = (RISCV_PMPCFG_R | RISCV_PMPCFG_A_NAPOT) << 16 |
+                      RISCV_PMPCFG_A_NAPOT << 8 |
+                      (RISCV_PMPCFG_X | RISCV_PMPCFG_A_NAPOT);
+    RiscvIntrCapture capture = {0};
+    uint64_t value = 0;
+
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start,
+                                &capture, NULL);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_LOAD_ACCESS_FAULT);
+
+    pmpcfg = RISCV_PMPCFG_A_NAPOT << 16 |
+             (RISCV_PMPCFG_R | RISCV_PMPCFG_A_NAPOT) << 8 |
+             (RISCV_PMPCFG_X | RISCV_PMPCFG_A_NAPOT);
+    capture = (RiscvIntrCapture){0};
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start,
+                                &capture, &value);
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(value == 0x10203040);
+}
+
+static void test_riscv64_pmp_locked_entry(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 5, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPCFG0, 6, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 7, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPCFG0, 8, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 0, 2, 9),
+        riscv_encode_csr(RISCV_CSR_PMPCFG0, 0, 2, 10),
+    };
+    uint8_t code[sizeof(insns)];
+    uint64_t initial_addr = riscv_pmp_napot_addr(riscv_data_start, 16);
+    uint64_t attempted_addr =
+        riscv_pmp_napot_addr(riscv_data_start + 0x100, 16);
+    uint64_t locked_cfg =
+        (RISCV_PMPCFG_R | RISCV_PMPCFG_A_NAPOT | RISCV_PMPCFG_L) << 8;
+    uint64_t attempted_cfg = (RISCV_PMPCFG_W | RISCV_PMPCFG_A_NAPOT) << 8;
+    uint64_t observed_addr = 0;
+    uint64_t observed_cfg = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+    uc_common_setup_model(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_SIFIVE_U54);
+    OK(uc_reg_write(uc, UC_RISCV_REG_X5, &initial_addr));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X6, &locked_cfg));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X7, &attempted_addr));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X8, &attempted_cfg));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X9, &observed_addr));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X10, &observed_cfg));
+    TEST_CHECK_(observed_addr == initial_addr, "locked pmpaddr1 = 0x%llx",
+                (unsigned long long)observed_addr);
+    TEST_CHECK_(observed_cfg == locked_cfg, "locked pmpcfg0 = 0x%llx",
+                (unsigned long long)observed_cfg);
+
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_pmp_locked_tor_lower_bound(void)
+{
+    uc_engine *uc;
+    uint32_t insns[] = {
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 5, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 2, 6, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPCFG0, 7, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 8, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 0, 2, 9),
+    };
+    uint8_t code[sizeof(insns)];
+    uint64_t lower = riscv_data_start >> 2;
+    uint64_t upper = (riscv_data_start + 16) >> 2;
+    uint64_t attempted_lower = (riscv_data_start + 4) >> 2;
+    uint64_t locked_tor_cfg =
+        (RISCV_PMPCFG_R | RISCV_PMPCFG_A_TOR | RISCV_PMPCFG_L) << 16;
+    uint64_t observed_lower = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+    uc_common_setup_model(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_SIFIVE_U54);
+    OK(uc_reg_write(uc, UC_RISCV_REG_X5, &lower));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X6, &upper));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X7, &locked_tor_cfg));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X8, &attempted_lower));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X9, &observed_lower));
+    TEST_CHECK_(observed_lower == lower, "locked TOR lower bound = 0x%llx",
+                (unsigned long long)observed_lower);
+
+    OK(uc_close(uc));
+}
+
+static void run_riscv64_pmp_execute(bool executable, RiscvIntrCapture *capture,
+                                    uint64_t *result)
+{
+    const uint64_t target_address = code_start + 0x1000;
+    uc_engine *uc;
+    uc_hook hook;
+    uint32_t insns[] = {
+        riscv_encode_csr(RISCV_CSR_PMPADDR0, 5, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPADDR0 + 1, 6, 1, 0),
+        riscv_encode_csr(RISCV_CSR_PMPCFG0, 7, 1, 0),
+    };
+    uint32_t target_insn = riscv_encode_i(1, 0, 0, 9, 0x13);
+    uint8_t code[sizeof(insns)];
+    uint8_t target_code[4];
+    uint64_t setup_addr = riscv_pmp_napot_addr(code_start, 0x1000);
+    uint64_t target_addr = riscv_pmp_napot_addr(target_address, 0x1000);
+    uint64_t target_cfg = RISCV_PMPCFG_R | RISCV_PMPCFG_A_NAPOT;
+    uint64_t pmpcfg;
+    uint64_t priv = 0;
+    size_t i;
+
+    if (executable) {
+        target_cfg |= RISCV_PMPCFG_X;
+    }
+    pmpcfg = target_cfg << 8 | (RISCV_PMPCFG_X | RISCV_PMPCFG_A_NAPOT);
+    for (i = 0; i < sizeof(insns) / sizeof(insns[0]); i++) {
+        riscv_insn_to_code(&code[i * 4], insns[i]);
+    }
+    riscv_insn_to_code(target_code, target_insn);
+
+    uc_common_setup_model(&uc, UC_ARCH_RISCV, UC_MODE_RISCV64,
+                          (const char *)code, sizeof(code),
+                          UC_CPU_RISCV64_SIFIVE_U54);
+    OK(uc_mem_write(uc, target_address, target_code, sizeof(target_code)));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_INTR, test_riscv_intr_capture_cb, capture,
+                   1, 0));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X5, &setup_addr));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X6, &target_addr));
+    OK(uc_reg_write(uc, UC_RISCV_REG_X7, &pmpcfg));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 0));
+    OK(uc_reg_write(uc, UC_RISCV_REG_PRIV, &priv));
+    OK(uc_emu_start(uc, target_address, target_address + sizeof(target_code), 0,
+                    0));
+    OK(uc_reg_read(uc, UC_RISCV_REG_X9, result));
+
+    OK(uc_close(uc));
+}
+
+static void test_riscv64_pmp_execute_permission(void)
+{
+    RiscvIntrCapture capture = {0};
+    uint64_t result = 0;
+
+    run_riscv64_pmp_execute(true, &capture, &result);
+    TEST_CHECK(capture.count == 0);
+    TEST_CHECK(result == 1);
+
+    capture = (RiscvIntrCapture){0};
+    result = 0;
+    run_riscv64_pmp_execute(false, &capture, &result);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_INST_ACCESS_FAULT);
+    TEST_CHECK(result == 0);
+}
+
+static void test_riscv64_pmp_access_crosses_two_regions(void)
+{
+    const uint32_t load = riscv_encode_i(0, 8, 3, 9, 0x03);
+    const uint64_t pmpaddr[] = {
+        riscv_pmp_napot_addr(code_start, 0x1000),
+        riscv_data_start >> 2,
+        (riscv_data_start + 4) >> 2,
+        (riscv_data_start + 8) >> 2,
+    };
+    const uint64_t pmpcfg = (RISCV_PMPCFG_R | RISCV_PMPCFG_A_TOR) << 24 |
+                            (RISCV_PMPCFG_R | RISCV_PMPCFG_A_TOR) << 16 |
+                            (RISCV_PMPCFG_X | RISCV_PMPCFG_A_NAPOT);
+    RiscvIntrCapture capture = {0};
+
+    run_riscv64_pmp_data_access(pmpaddr, pmpcfg, load, riscv_data_start,
+                                &capture, NULL);
+    TEST_CHECK(capture.count == 1);
+    TEST_CHECK(capture.intno == RISCV_EXCP_LOAD_ACCESS_FAULT);
 }
 
 static void run_riscv64_rvh_virtual_instruction(uint32_t insn)
@@ -9909,7 +10428,6 @@ static void test_riscv64_rvv_mask_set(void)
 static void test_riscv64_rvv_viota_vid(void)
 {
     uc_engine *uc;
-    uint8_t code[8 * 4];
     uint32_t insns[] = {
         riscv_encode_rvv_vsetvli(0, 16, 0xc8),
         riscv_encode_rvv_mask_ldst(0, 10, 0),
@@ -10846,7 +11364,6 @@ static void test_riscv64_rvv_float_reduction_illegal(void)
 static void test_riscv64_rvv_divide_remainder(void)
 {
     uc_engine *uc;
-    uint8_t code[20 * 4];
     uint32_t insns[] = {
         riscv_encode_rvv_vsetvli(0, 5, 0xc8),
         riscv_encode_rvv_mask_ldst(0, 10, 0),
@@ -11670,6 +12187,8 @@ static void test_riscv64_rvv_requires_vs(void)
 TEST_LIST = {
     {"test_riscv32_nop", test_riscv32_nop},
     {"test_riscv64_nop", test_riscv64_nop},
+    {"test_riscv64_fetch_invalid_compressed_size",
+     test_riscv64_fetch_invalid_compressed_size},
     {"test_riscv32_lr_sc", test_riscv32_lr_sc},
     {"test_riscv64_lr_sc", test_riscv64_lr_sc},
     {"test_riscv32_amo", test_riscv32_amo},
@@ -11720,6 +12239,8 @@ TEST_LIST = {
      test_riscv64_type2_store_privilege_filter},
     {"test_riscv64_type2_exec_trigger",
      test_riscv64_type2_exec_trigger},
+    {"test_riscv64_context_debug_lifecycle",
+     test_riscv64_context_debug_lifecycle},
     {"test_riscv64_type2_exec_privilege_filter",
      test_riscv64_type2_exec_privilege_filter},
     {"test_riscv64_pmp_na4_load", test_riscv64_pmp_na4_load},
@@ -11727,6 +12248,16 @@ TEST_LIST = {
      test_riscv64_pmp_na4_rejects_outside},
     {"test_riscv64_pmp_na4_rejects_store",
      test_riscv64_pmp_na4_rejects_store},
+    {"test_riscv64_pmp_tor_boundaries", test_riscv64_pmp_tor_boundaries},
+    {"test_riscv64_pmp_napot_boundaries", test_riscv64_pmp_napot_boundaries},
+    {"test_riscv64_pmp_entry_priority", test_riscv64_pmp_entry_priority},
+    {"test_riscv64_pmp_locked_entry", test_riscv64_pmp_locked_entry},
+    {"test_riscv64_pmp_locked_tor_lower_bound",
+     test_riscv64_pmp_locked_tor_lower_bound},
+    {"test_riscv64_pmp_execute_permission",
+     test_riscv64_pmp_execute_permission},
+    {"test_riscv64_pmp_access_crosses_two_regions",
+     test_riscv64_pmp_access_crosses_two_regions},
     {"test_riscv32_svinval", test_riscv32_svinval},
     {"test_riscv64_svinval", test_riscv64_svinval},
     {"test_riscv_svinval_hinval_requires_rvh",
@@ -11739,6 +12270,8 @@ TEST_LIST = {
     {"test_riscv_rvh_requires_h", test_riscv_rvh_requires_h},
     {"test_riscv_rvh_requires_hlsx", test_riscv_rvh_requires_hlsx},
     {"test_riscv_rvh_hstatus_layout", test_riscv_rvh_hstatus_layout},
+    {"test_riscv64_rvh_trap_metadata_csr_access",
+     test_riscv64_rvh_trap_metadata_csr_access},
     {"test_riscv_rvh_hedeleg_mask", test_riscv_rvh_hedeleg_mask},
     {"test_riscv_rvh_hu_allows_u_mode", test_riscv_rvh_hu_allows_u_mode},
     {"test_riscv_rvh_hu_tb_flags", test_riscv_rvh_hu_tb_flags},

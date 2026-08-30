@@ -3234,6 +3234,9 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         (GET_FIELD_SP(insn, 20, 21) << 14);
                     target = sign_extend(target, 16);
                     target <<= 2;
+                    if ((GET_FIELD_SP(insn, 25, 27) & 3) == 0) {
+                        goto illegal_insn;
+                    }
                     cpu_src1 = get_src1(dc, insn);
                     do_branch_reg(dc, target, insn, cpu_src1);
                     goto jmp_insn;
@@ -5957,6 +5960,13 @@ static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 #endif
         dcbase->is_jmp = DISAS_NORETURN;
         return;
+    }
+
+    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_MEM_FETCH, dc->pc)) {
+        tcg_gen_movi_tl(tcg_ctx, tcg_ctx->cpu_pc, dc->pc);
+        tcg_gen_movi_tl(tcg_ctx, tcg_ctx->cpu_npc, dc->npc);
+        gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, uc, dc->pc);
+        check_exit_request(tcg_ctx);
     }
 
     // Unicorn: trace this instruction on request

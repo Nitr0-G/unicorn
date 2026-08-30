@@ -132,6 +132,621 @@ static void test_uc_timeout_reuse(void)
     OK(uc_close(uc));
 }
 
+static void test_uc_timeout_max_tb(void)
+{
+    enum {
+        max_tb_insns = 512,
+        nop_insns = max_tb_insns - 1,
+        loop_size = nop_insns + 5,
+    };
+    uint8_t code[loop_size];
+    const int32_t displacement = -(int32_t)sizeof(code);
+    size_t timed_out;
+    uint32_t eip;
+    uc_engine *uc;
+
+    memset(code, 0x90, nop_insns);
+    code[nop_insns] = 0xe9;
+    memcpy(&code[nop_insns + 1], &displacement, sizeof(displacement));
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, (const char *)code,
+                    sizeof(code));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code),
+                    UC_SECOND_SCALE / 20, 0));
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    OK(uc_reg_read(uc, UC_X86_REG_EIP, &eip));
+    TEST_CHECK(timed_out == 1);
+    TEST_CHECK_(eip == code_start, "eip=0x%x", eip);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_reg_sized(void)
+{
+    const uint64_t initial_rax = UINT64_C(0x0123456789abcdef);
+    const uint64_t rejected_rax = UINT64_C(0xfedcba9876543210);
+    const uint64_t initial_xmm[2] = {
+        UINT64_C(0x0011223344556677),
+        UINT64_C(0x8899aabbccddeeff),
+    };
+    const uint64_t rejected_xmm[2] = {
+        UINT64_C(0xffeeddccbbaa9988),
+        UINT64_C(0x7766554433221100),
+    };
+    uint64_t rax;
+    uint64_t xmm[2];
+    size_t size;
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+
+    size = sizeof(initial_rax);
+    OK(uc_reg_write2(uc, UC_X86_REG_RAX, &initial_rax, &size));
+    TEST_CHECK(size == sizeof(initial_rax));
+    size = sizeof(initial_xmm);
+    OK(uc_reg_write2(uc, UC_X86_REG_XMM0, initial_xmm, &size));
+    TEST_CHECK(size == sizeof(initial_xmm));
+
+    rax = 0;
+    size = sizeof(rax);
+    OK(uc_reg_read2(uc, UC_X86_REG_RAX, &rax, &size));
+    TEST_CHECK(size == sizeof(rax));
+    TEST_CHECK(rax == initial_rax);
+    memset(xmm, 0, sizeof(xmm));
+    size = sizeof(xmm);
+    OK(uc_reg_read2(uc, UC_X86_REG_XMM0, xmm, &size));
+    TEST_CHECK(size == sizeof(xmm));
+    TEST_CHECK(memcmp(xmm, initial_xmm, sizeof(xmm)) == 0);
+
+    rax = UINT64_MAX;
+    size = sizeof(rax) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_reg_read2(uc, UC_X86_REG_RAX, &rax, &size));
+    TEST_CHECK(rax == UINT64_MAX);
+    size = sizeof(rejected_rax) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_reg_write2(uc, UC_X86_REG_RAX, &rejected_rax, &size));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+    TEST_CHECK(rax == initial_rax);
+
+    xmm[0] = UINT64_MAX;
+    xmm[1] = UINT64_MAX;
+    size = sizeof(xmm) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_reg_read2(uc, UC_X86_REG_XMM0, xmm, &size));
+    TEST_CHECK(xmm[0] == UINT64_MAX && xmm[1] == UINT64_MAX);
+    size = sizeof(rejected_xmm) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_reg_write2(uc, UC_X86_REG_XMM0, rejected_xmm, &size));
+    OK(uc_reg_read(uc, UC_X86_REG_XMM0, xmm));
+    TEST_CHECK(memcmp(xmm, initial_xmm, sizeof(xmm)) == 0);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_reg_batch(void)
+{
+    const int regs[] = {
+        UC_X86_REG_RAX,
+        UC_X86_REG_XMM0,
+        UC_X86_REG_RIP,
+    };
+    uint64_t rax = UINT64_C(0x1122334455667788);
+    uint64_t xmm[2] = {
+        UINT64_C(0x1020304050607080),
+        UINT64_C(0x90a0b0c0d0e0f000),
+    };
+    uint64_t rip = code_start + 0x20;
+    void *write_values[] = {&rax, xmm, &rip};
+    uint64_t read_rax = 0;
+    uint64_t read_xmm[2] = {0};
+    uint64_t read_rip = 0;
+    void *read_values[] = {&read_rax, read_xmm, &read_rip};
+    const void *const_values[] = {&rax, xmm, &rip};
+    size_t sizes[] = {sizeof(rax), sizeof(xmm), sizeof(rip)};
+    size_t read_sizes[] = {
+        sizeof(read_rax),
+        sizeof(read_xmm),
+        sizeof(read_rip),
+    };
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+
+    OK(uc_reg_write_batch(uc, regs, write_values, 3));
+    OK(uc_reg_read_batch(uc, regs, read_values, 3));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(memcmp(read_xmm, xmm, sizeof(xmm)) == 0);
+    TEST_CHECK(read_rip == rip);
+
+    rax = UINT64_C(0x8877665544332211);
+    xmm[0] = UINT64_C(0xf0e0d0c0b0a09080);
+    xmm[1] = UINT64_C(0x7060504030201000);
+    rip = code_start + 0x40;
+    OK(uc_reg_write_batch2(uc, regs, const_values, sizes, 3));
+    TEST_CHECK(sizes[0] == sizeof(rax));
+    TEST_CHECK(sizes[1] == sizeof(xmm));
+    TEST_CHECK(sizes[2] == sizeof(rip));
+    memset(read_values[0], 0, sizeof(read_rax));
+    memset(read_values[1], 0, sizeof(read_xmm));
+    memset(read_values[2], 0, sizeof(read_rip));
+    OK(uc_reg_read_batch2(uc, regs, read_values, read_sizes, 3));
+    TEST_CHECK(read_sizes[0] == sizeof(read_rax));
+    TEST_CHECK(read_sizes[1] == sizeof(read_xmm));
+    TEST_CHECK(read_sizes[2] == sizeof(read_rip));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(memcmp(read_xmm, xmm, sizeof(xmm)) == 0);
+    TEST_CHECK(read_rip == rip);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_reg_batch_partial_failure(void)
+{
+    const int invalid_regs[] = {
+        UC_X86_REG_RAX,
+        UC_X86_REG_ENDING,
+        UC_X86_REG_RBX,
+    };
+    const int overflow_regs[] = {
+        UC_X86_REG_RAX,
+        UC_X86_REG_XMM0,
+        UC_X86_REG_RBX,
+    };
+    uint64_t rax = 1;
+    uint64_t invalid = 2;
+    uint64_t rbx = 3;
+    void *write_values[] = {&rax, &invalid, &rbx};
+    uint64_t read_rax = UINT64_MAX;
+    uint64_t read_invalid = UINT64_MAX;
+    uint64_t read_rbx = UINT64_MAX;
+    void *read_values[] = {&read_rax, &read_invalid, &read_rbx};
+    uint64_t xmm[2] = {5, 6};
+    const void *overflow_values[] = {&rax, xmm, &rbx};
+    uint64_t read_xmm[2] = {UINT64_MAX, UINT64_MAX};
+    void *overflow_read_values[] = {&read_rax, read_xmm, &read_rbx};
+    size_t sizes[] = {sizeof(rax), sizeof(xmm) - 1, sizeof(rbx)};
+    uint64_t value;
+    uc_err error;
+    bool strict_errors;
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    value = 10;
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &value));
+    value = 20;
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &value));
+
+    strict_errors = getenv("UC_IGNORE_REG_BREAK") != NULL;
+    error = uc_reg_write_batch(uc, invalid_regs, write_values, 3);
+    TEST_CHECK(error == (strict_errors ? UC_ERR_ARG : UC_ERR_OK));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &value));
+    TEST_CHECK(value == rax);
+    OK(uc_reg_read(uc, UC_X86_REG_RBX, &value));
+    TEST_CHECK(value == (strict_errors ? 20 : rbx));
+    error = uc_reg_read_batch(uc, invalid_regs, read_values, 3);
+    TEST_CHECK(error == (strict_errors ? UC_ERR_ARG : UC_ERR_OK));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(read_invalid == UINT64_MAX);
+    TEST_CHECK(read_rbx == (strict_errors ? UINT64_MAX : value));
+
+    rax = 4;
+    value = 30;
+    OK(uc_reg_write(uc, UC_X86_REG_RAX, &value));
+    value = 40;
+    OK(uc_reg_write(uc, UC_X86_REG_RBX, &value));
+    uc_assert_err(
+        UC_ERR_OVERFLOW,
+        uc_reg_write_batch2(uc, overflow_regs, overflow_values, sizes, 3));
+    OK(uc_reg_read(uc, UC_X86_REG_RAX, &value));
+    TEST_CHECK(value == rax);
+    OK(uc_reg_read(uc, UC_X86_REG_RBX, &value));
+    TEST_CHECK(value == 40);
+
+    read_rax = UINT64_MAX;
+    read_xmm[0] = UINT64_MAX;
+    read_xmm[1] = UINT64_MAX;
+    read_rbx = UINT64_MAX;
+    sizes[0] = sizeof(read_rax);
+    sizes[1] = sizeof(read_xmm) - 1;
+    sizes[2] = sizeof(read_rbx);
+    uc_assert_err(
+        UC_ERR_OVERFLOW,
+        uc_reg_read_batch2(uc, overflow_regs, overflow_read_values, sizes, 3));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(read_xmm[0] == UINT64_MAX && read_xmm[1] == UINT64_MAX);
+    TEST_CHECK(read_rbx == UINT64_MAX);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_context_reg_apis(void)
+{
+    const int regs[] = {
+        UC_X86_REG_RAX,
+        UC_X86_REG_XMM0,
+        UC_X86_REG_RIP,
+    };
+    uint64_t rax = UINT64_C(0x0123456789abcdef);
+    uint64_t xmm[2] = {
+        UINT64_C(0x1111222233334444),
+        UINT64_C(0x5555666677778888),
+    };
+    uint64_t rip = code_start + 0x20;
+    void *write_values[] = {&rax, xmm, &rip};
+    const void *const_values[] = {&rax, xmm, &rip};
+    uint64_t read_rax = 0;
+    uint64_t read_xmm[2] = {0};
+    uint64_t read_rip = 0;
+    void *read_values[] = {&read_rax, read_xmm, &read_rip};
+    size_t sizes[] = {sizeof(rax), sizeof(xmm), sizeof(rip)};
+    size_t read_sizes[] = {
+        sizeof(read_rax),
+        sizeof(read_xmm),
+        sizeof(read_rip),
+    };
+    size_t context_size;
+    uc_context *context;
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    context_size = uc_context_size(uc);
+    TEST_CHECK(context_size > sizeof(rax) + sizeof(xmm));
+    TEST_CHECK(uc_context_size(uc) == context_size);
+    OK(uc_context_alloc(uc, &context));
+    OK(uc_context_save(uc, context));
+
+    sizes[0] = sizeof(rax);
+    OK(uc_context_reg_write2(context, UC_X86_REG_RAX, &rax, &sizes[0]));
+    TEST_CHECK(sizes[0] == sizeof(rax));
+    sizes[1] = sizeof(xmm);
+    OK(uc_context_reg_write2(context, UC_X86_REG_XMM0, xmm, &sizes[1]));
+    TEST_CHECK(sizes[1] == sizeof(xmm));
+    read_rax = 0;
+    read_sizes[0] = sizeof(read_rax);
+    OK(uc_context_reg_read2(context, UC_X86_REG_RAX, &read_rax,
+                            &read_sizes[0]));
+    TEST_CHECK(read_sizes[0] == sizeof(read_rax));
+    TEST_CHECK(read_rax == rax);
+    memset(read_xmm, 0, sizeof(read_xmm));
+    read_sizes[1] = sizeof(read_xmm);
+    OK(uc_context_reg_read2(context, UC_X86_REG_XMM0, read_xmm,
+                            &read_sizes[1]));
+    TEST_CHECK(read_sizes[1] == sizeof(read_xmm));
+    TEST_CHECK(memcmp(read_xmm, xmm, sizeof(xmm)) == 0);
+
+    read_rax = UINT64_MAX;
+    read_sizes[0] = sizeof(read_rax) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_context_reg_read2(context, UC_X86_REG_RAX, &read_rax,
+                                       &read_sizes[0]));
+    TEST_CHECK(read_rax == UINT64_MAX);
+    read_sizes[0] = sizeof(rax) - 1;
+    read_rax = rax + 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_context_reg_write2(context, UC_X86_REG_RAX, &read_rax,
+                                        &read_sizes[0]));
+    OK(uc_context_reg_read(context, UC_X86_REG_RAX, &read_rax));
+    TEST_CHECK(read_rax == rax);
+    read_xmm[0] = UINT64_MAX;
+    read_xmm[1] = UINT64_MAX;
+    read_sizes[1] = sizeof(read_xmm) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_context_reg_read2(context, UC_X86_REG_XMM0, read_xmm,
+                                       &read_sizes[1]));
+    TEST_CHECK(read_xmm[0] == UINT64_MAX && read_xmm[1] == UINT64_MAX);
+    read_sizes[1] = sizeof(read_xmm) - 1;
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_context_reg_write2(context, UC_X86_REG_XMM0, read_xmm,
+                                        &read_sizes[1]));
+    OK(uc_context_reg_read(context, UC_X86_REG_XMM0, read_xmm));
+    TEST_CHECK(memcmp(read_xmm, xmm, sizeof(xmm)) == 0);
+
+    rax = UINT64_C(0x8877665544332211);
+    xmm[0] = UINT64_C(0x9999aaaabbbbcccc);
+    xmm[1] = UINT64_C(0xddddeeeeffff0000);
+    rip = code_start + 0x40;
+    OK(uc_context_reg_write_batch(context, regs, write_values, 3));
+    OK(uc_context_reg_read_batch(context, regs, read_values, 3));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(memcmp(read_xmm, xmm, sizeof(xmm)) == 0);
+    TEST_CHECK(read_rip == rip);
+    OK(uc_context_restore(uc, context));
+    OK(uc_reg_read(uc, UC_X86_REG_RIP, &read_rip));
+    TEST_CHECK(read_rip == rip);
+
+    rax = UINT64_C(0x1020304050607080);
+    xmm[0] = UINT64_C(0x0f1e2d3c4b5a6978);
+    xmm[1] = UINT64_C(0x8796a5b4c3d2e1f0);
+    rip = code_start + 0x60;
+    sizes[0] = sizeof(rax);
+    sizes[1] = sizeof(xmm);
+    sizes[2] = sizeof(rip);
+    OK(uc_context_reg_write_batch2(context, regs, const_values, sizes, 3));
+    TEST_CHECK(sizes[0] == sizeof(rax));
+    TEST_CHECK(sizes[1] == sizeof(xmm));
+    TEST_CHECK(sizes[2] == sizeof(rip));
+    read_rax = 0;
+    memset(read_xmm, 0, sizeof(read_xmm));
+    read_rip = 0;
+    read_sizes[0] = sizeof(read_rax);
+    read_sizes[1] = sizeof(read_xmm);
+    read_sizes[2] = sizeof(read_rip);
+    OK(uc_context_reg_read_batch2(context, regs, read_values, read_sizes, 3));
+    TEST_CHECK(read_sizes[0] == sizeof(read_rax));
+    TEST_CHECK(read_sizes[1] == sizeof(read_xmm));
+    TEST_CHECK(read_sizes[2] == sizeof(read_rip));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(memcmp(read_xmm, xmm, sizeof(xmm)) == 0);
+    TEST_CHECK(read_rip == rip);
+    OK(uc_context_restore(uc, context));
+    OK(uc_reg_read(uc, UC_X86_REG_RIP, &read_rip));
+    TEST_CHECK(read_rip == rip);
+
+    OK(uc_context_free(context));
+    OK(uc_close(uc));
+}
+
+static void test_uc_context_batch_partial_failure(void)
+{
+    const int invalid_regs[] = {
+        UC_X86_REG_RAX,
+        UC_X86_REG_ENDING,
+        UC_X86_REG_RBX,
+    };
+    const int overflow_regs[] = {
+        UC_X86_REG_RAX,
+        UC_X86_REG_XMM0,
+        UC_X86_REG_RBX,
+    };
+    uint64_t rax = 1;
+    uint64_t invalid = 2;
+    uint64_t rbx = 3;
+    void *write_values[] = {&rax, &invalid, &rbx};
+    uint64_t read_rax = UINT64_MAX;
+    uint64_t read_invalid = UINT64_MAX;
+    uint64_t read_rbx = UINT64_MAX;
+    void *read_values[] = {&read_rax, &read_invalid, &read_rbx};
+    uint64_t xmm[2] = {5, 6};
+    const void *overflow_values[] = {&rax, xmm, &rbx};
+    uint64_t read_xmm[2] = {UINT64_MAX, UINT64_MAX};
+    void *overflow_read_values[] = {&read_rax, read_xmm, &read_rbx};
+    size_t sizes[] = {sizeof(rax), sizeof(xmm) - 1, sizeof(rbx)};
+    uint64_t value;
+    uc_err error;
+    bool strict_errors;
+    uc_context *context;
+    uc_engine *uc;
+
+    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
+    OK(uc_context_alloc(uc, &context));
+    OK(uc_context_save(uc, context));
+    value = 10;
+    OK(uc_context_reg_write(context, UC_X86_REG_RAX, &value));
+    value = 20;
+    OK(uc_context_reg_write(context, UC_X86_REG_RBX, &value));
+
+    strict_errors = getenv("UC_IGNORE_REG_BREAK") != NULL;
+    error = uc_context_reg_write_batch(context, invalid_regs, write_values, 3);
+    TEST_CHECK(error == (strict_errors ? UC_ERR_ARG : UC_ERR_OK));
+    OK(uc_context_reg_read(context, UC_X86_REG_RAX, &value));
+    TEST_CHECK(value == rax);
+    OK(uc_context_reg_read(context, UC_X86_REG_RBX, &value));
+    TEST_CHECK(value == (strict_errors ? 20 : rbx));
+    error = uc_context_reg_read_batch(context, invalid_regs, read_values, 3);
+    TEST_CHECK(error == (strict_errors ? UC_ERR_ARG : UC_ERR_OK));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(read_invalid == UINT64_MAX);
+    TEST_CHECK(read_rbx == (strict_errors ? UINT64_MAX : value));
+
+    rax = 4;
+    value = 30;
+    OK(uc_context_reg_write(context, UC_X86_REG_RAX, &value));
+    value = 40;
+    OK(uc_context_reg_write(context, UC_X86_REG_RBX, &value));
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_context_reg_write_batch2(context, overflow_regs,
+                                              overflow_values, sizes, 3));
+    OK(uc_context_reg_read(context, UC_X86_REG_RAX, &value));
+    TEST_CHECK(value == rax);
+    OK(uc_context_reg_read(context, UC_X86_REG_RBX, &value));
+    TEST_CHECK(value == 40);
+
+    read_rax = UINT64_MAX;
+    read_xmm[0] = UINT64_MAX;
+    read_xmm[1] = UINT64_MAX;
+    read_rbx = UINT64_MAX;
+    sizes[0] = sizeof(read_rax);
+    sizes[1] = sizeof(read_xmm) - 1;
+    sizes[2] = sizeof(read_rbx);
+    uc_assert_err(UC_ERR_OVERFLOW,
+                  uc_context_reg_read_batch2(context, overflow_regs,
+                                             overflow_read_values, sizes, 3));
+    TEST_CHECK(read_rax == rax);
+    TEST_CHECK(read_xmm[0] == UINT64_MAX && read_xmm[1] == UINT64_MAX);
+    TEST_CHECK(read_rbx == UINT64_MAX);
+
+    OK(uc_context_free(context));
+    OK(uc_close(uc));
+}
+
+typedef struct TestNestedTimeoutData {
+    uint64_t inner_address;
+    uint64_t inner_size;
+    uint64_t inner_timeout;
+    uc_err inner_error;
+    uc_err query_error;
+    size_t timed_out;
+    uint32_t calls;
+} TestNestedTimeoutData;
+
+static void test_uc_nested_timeout_cb(uc_engine *uc, uint64_t address,
+                                      uint32_t size, void *user_data)
+{
+    TestNestedTimeoutData *data = (TestNestedTimeoutData *)user_data;
+
+    data->calls++;
+    data->inner_error =
+        uc_emu_start(uc, data->inner_address,
+                     data->inner_address + data->inner_size,
+                     data->inner_timeout, 0);
+    data->query_error = uc_query(uc, UC_QUERY_TIMEOUT, &data->timed_out);
+}
+
+static void test_uc_nested_timeout_case(uint64_t inner_timeout,
+                                        uint64_t outer_timeout,
+                                        bool outer_continues)
+{
+    const char outer_code[] = "\x40\x43"; /* inc eax; inc ebx */
+    const char inner_code[] = "\xeb\xfe"; /* jmp inner_code */
+    const char reuse_code[] = "\x41";     /* inc ecx */
+    const uint64_t inner_address = code_start + 0x100;
+    const uint64_t reuse_address = code_start + 0x200;
+    TestNestedTimeoutData data = {
+        .inner_address = inner_address,
+        .inner_size = sizeof(inner_code) - 1,
+        .inner_timeout = inner_timeout,
+    };
+    size_t timed_out;
+    uint32_t value;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, outer_code,
+                    sizeof(outer_code) - 1);
+    OK(uc_mem_write(uc, inner_address, inner_code, sizeof(inner_code) - 1));
+    OK(uc_mem_write(uc, reuse_address, reuse_code, sizeof(reuse_code) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, test_uc_nested_timeout_cb, &data,
+                   code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(outer_code) - 1,
+                    outer_timeout, 0));
+    TEST_CHECK(data.calls == 1);
+    TEST_CHECK(data.inner_error == UC_ERR_OK);
+    TEST_CHECK(data.query_error == UC_ERR_OK);
+    TEST_CHECK(data.timed_out == 1);
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    TEST_CHECK(timed_out == 1);
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &value));
+    TEST_CHECK(value == (outer_continues ? 1 : 0));
+    OK(uc_reg_read(uc, UC_X86_REG_EBX, &value));
+    TEST_CHECK(value == (outer_continues ? 1 : 0));
+
+    OK(uc_hook_del(uc, hook));
+    OK(uc_emu_start(uc, reuse_address, reuse_address + sizeof(reuse_code) - 1,
+                    0, 1));
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    TEST_CHECK(timed_out == 0);
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &value));
+    TEST_CHECK(value == 1);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_nested_timeout(void)
+{
+    test_uc_nested_timeout_case(UC_SECOND_SCALE / 20, 0, true);
+    test_uc_nested_timeout_case(0, UC_SECOND_SCALE / 20, false);
+    test_uc_nested_timeout_case(UC_SECOND_SCALE / 50,
+                                UC_SECOND_SCALE / 2, true);
+    test_uc_nested_timeout_case(UC_SECOND_SCALE / 2,
+                                UC_SECOND_SCALE / 50, false);
+}
+
+static void test_uc_nested_timeout_completion(void)
+{
+    const char outer_code[] = "\x40\x43"; /* inc eax; inc ebx */
+    const char inner_code[] = "\x42";     /* inc edx */
+    const char reuse_code[] = "\x41";     /* inc ecx */
+    const uint64_t inner_address = code_start + 0x100;
+    const uint64_t reuse_address = code_start + 0x200;
+    TestNestedTimeoutData data = {
+        .inner_address = inner_address,
+        .inner_size = sizeof(inner_code) - 1,
+        .inner_timeout = UC_SECOND_SCALE / 2,
+    };
+    size_t timed_out;
+    uint32_t value;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, outer_code,
+                    sizeof(outer_code) - 1);
+    OK(uc_mem_write(uc, inner_address, inner_code, sizeof(inner_code) - 1));
+    OK(uc_mem_write(uc, reuse_address, reuse_code, sizeof(reuse_code) - 1));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, test_uc_nested_timeout_cb, &data,
+                   code_start, code_start));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(outer_code) - 1,
+                    UC_SECOND_SCALE / 2, 0));
+    TEST_CHECK(data.calls == 1);
+    TEST_CHECK(data.inner_error == UC_ERR_OK);
+    TEST_CHECK(data.query_error == UC_ERR_OK);
+    TEST_CHECK(data.timed_out == 0);
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    TEST_CHECK(timed_out == 0);
+    OK(uc_reg_read(uc, UC_X86_REG_EAX, &value));
+    TEST_CHECK(value == 1);
+    OK(uc_reg_read(uc, UC_X86_REG_EBX, &value));
+    TEST_CHECK(value == 1);
+    OK(uc_reg_read(uc, UC_X86_REG_EDX, &value));
+    TEST_CHECK(value == 1);
+
+    OK(uc_hook_del(uc, hook));
+    OK(uc_emu_start(uc, reuse_address, reuse_address + sizeof(reuse_code) - 1,
+                    0, 1));
+    OK(uc_query(uc, UC_QUERY_TIMEOUT, &timed_out));
+    TEST_CHECK(timed_out == 0);
+    OK(uc_reg_read(uc, UC_X86_REG_ECX, &value));
+    TEST_CHECK(value == 1);
+
+    OK(uc_close(uc));
+}
+
+static void test_uc_invalid_hook_cb(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data)
+{
+    uint32_t *calls = (uint32_t *)user_data;
+
+    (*calls)++;
+}
+
+static void test_uc_invalid_hook_types(void)
+{
+    const char code[] = "\x90";
+    const int unknown_type = 1U << 30;
+    uint32_t calls = 0;
+    uc_hook hook;
+    uc_engine *uc;
+
+    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code, sizeof(code) - 1);
+
+    hook = UINTPTR_MAX;
+    uc_assert_err(
+        UC_ERR_HOOK,
+        uc_hook_add(uc, &hook, 0, test_uc_invalid_hook_cb, &calls, 1, 0));
+    TEST_CHECK(hook == UINTPTR_MAX);
+    hook = UINTPTR_MAX;
+    uc_assert_err(UC_ERR_HOOK,
+                  uc_hook_add(uc, &hook, unknown_type, test_uc_invalid_hook_cb,
+                              &calls, 1, 0));
+    TEST_CHECK(hook == UINTPTR_MAX);
+    hook = UINTPTR_MAX;
+    uc_assert_err(UC_ERR_HOOK,
+                  uc_hook_add(uc, &hook, UC_HOOK_CODE | unknown_type,
+                              test_uc_invalid_hook_cb, &calls, 1, 0));
+    TEST_CHECK(hook == UINTPTR_MAX);
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    TEST_CHECK(calls == 0);
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE, test_uc_invalid_hook_cb, &calls, 1,
+                   0));
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code) - 1, 0, 1));
+    TEST_CHECK(calls == 1);
+
+    OK(uc_close(uc));
+}
+
 static void test_uc_query_and_cpu_model(void)
 {
     const char code[] = "\x90";
@@ -323,7 +938,7 @@ static void test_uc_ctl_arm_cpu(void)
 }
 #endif
 
-static void test_uc_hook_cached_cb(uc_engine *uc, uint64_t addr, size_t size,
+static void test_uc_hook_cached_cb(uc_engine *uc, uint64_t addr, uint32_t size,
                                    void *user_data)
 {
     uint64_t *p = (uint64_t *)user_data;
@@ -647,6 +1262,17 @@ TEST_LIST = {
     {"test_uc_ctl_exits", test_uc_ctl_exits},
     {"test_uc_ctl_exits_boundaries", test_uc_ctl_exits_boundaries},
     {"test_uc_timeout_reuse", test_uc_timeout_reuse},
+    {"test_uc_timeout_max_tb", test_uc_timeout_max_tb},
+    {"test_uc_reg_sized", test_uc_reg_sized},
+    {"test_uc_reg_batch", test_uc_reg_batch},
+    {"test_uc_reg_batch_partial_failure", test_uc_reg_batch_partial_failure},
+    {"test_uc_context_reg_apis", test_uc_context_reg_apis},
+    {"test_uc_context_batch_partial_failure",
+     test_uc_context_batch_partial_failure},
+    {"test_uc_nested_timeout", test_uc_nested_timeout},
+    {"test_uc_nested_timeout_completion",
+     test_uc_nested_timeout_completion},
+    {"test_uc_invalid_hook_types", test_uc_invalid_hook_types},
     {"test_uc_query_and_cpu_model", test_uc_query_and_cpu_model},
     {"test_uc_ctl_tb_cache", test_uc_ctl_tb_cache},
 #ifdef UNICORN_HAS_ARM

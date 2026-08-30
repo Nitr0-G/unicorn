@@ -45,6 +45,6 @@ uc_err uc_reg_read_batch_wrapper(uc_engine *uc, int *regs, int64_t *vals, int co
     return ret;
 }
 
-void uc_free_wrapper(void *mem) {
-    uc_free(mem);
+void uc_context_free_wrapper(uc_context *context) {
+    uc_context_free(context);
 }

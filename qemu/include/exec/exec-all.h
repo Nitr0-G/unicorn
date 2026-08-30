@@ -56,6 +56,8 @@ void restore_state_to_opc(CPUArchState *env, TranslationBlock *tb,
  */
 bool cpu_restore_state(CPUState *cpu, uintptr_t searched_pc, bool will_exit);
 bool cpu_restore_icount(CPUState *cpu, uintptr_t searched_pc);
+void QEMU_NORETURN cpu_tcg_exit_request(struct uc_struct *uc,
+                                        uintptr_t retaddr);
 
 void QEMU_NORETURN cpu_loop_exit_noexc(CPUState *cpu);
 void QEMU_NORETURN cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);

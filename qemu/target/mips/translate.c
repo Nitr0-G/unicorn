@@ -31572,10 +31572,11 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     struct uc_struct *uc = cs->uc;
     TCGContext *tcg_ctx = uc->tcg_ctx;
-    TCGOp *tcg_op, *prev_op = NULL, *slot_op = NULL;
+    TCGOp *tcg_op, *prev_op = NULL, *fetch_prev_op = NULL, *slot_op = NULL;
     int insn_bytes;
     int is_slot;
     bool hook_insn = false;
+    bool fetch_hook = false;
     TCGv_i32 dyn_is_slot = NULL;
 
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
@@ -31603,6 +31604,15 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         gen_set_label(tcg_ctx, l1);
     }
 
+    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_MEM_FETCH, ctx->base.pc_next)) {
+        gen_save_pc(tcg_ctx, ctx->base.pc_next);
+        fetch_prev_op = tcg_last_op(tcg_ctx);
+        fetch_hook = true;
+        gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, uc,
+                          ctx->base.pc_next);
+        check_exit_request(tcg_ctx);
+    }
+
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE, ctx->base.pc_next)) {
 
@@ -31612,7 +31622,8 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         // save the last operand
         prev_op = tcg_last_op(tcg_ctx);
         hook_insn = true;
-        gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, uc, ctx->base.pc_next);
+        gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, uc,
+                         ctx->base.pc_next);
         check_exit_request(tcg_ctx);
     }
     
@@ -31669,6 +31680,15 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             tcg_op = QTAILQ_FIRST(&tcg_ctx->ops);
         }
 
+        tcg_op->args[1] = insn_bytes;
+    }
+
+    if (fetch_hook) {
+        if (fetch_prev_op) {
+            tcg_op = QTAILQ_NEXT(fetch_prev_op, link);
+        } else {
+            tcg_op = QTAILQ_FIRST(&tcg_ctx->ops);
+        }
         tcg_op->args[1] = insn_bytes;
     }
 

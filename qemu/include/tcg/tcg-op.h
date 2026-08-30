@@ -29,6 +29,10 @@
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 
+#define UC_TRACE_SIZE_UNKNOWN ((int32_t)0xf1f1f1f1U)
+
+static inline void gen_active_tb(TCGContext *tcg_ctx);
+
 static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t type, void *uc, uint64_t pc)
 {
     TCGv_i32 tsize = tcg_const_i32(tcg_ctx, size);
@@ -46,6 +50,8 @@ static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t t
         tcgv_i32_temp(tcg_ctx, tsize),
         0
     };
+
+    gen_active_tb(tcg_ctx);
 
     const int hook_type = type & UC_HOOK_IDX_MASK;
     if (hook_type == UC_HOOK_CODE_IDX &&
@@ -120,6 +126,7 @@ static inline void gen_uc_traceopcode(TCGContext *tcg_ctx, void* hook, TCGv_i64 
 //     TCGv_i64 targ1 = arg1;
 //     TCGv_i64 targ2 = arg2;
 // #endif
+    gen_active_tb(tcg_ctx);
     gen_helper_uc_traceopcode(tcg_ctx, thook, arg1, arg2, tsz, tuc, tpc);
     tcg_temp_free_i32(tcg_ctx, tsz);
     tcg_temp_free_i64(tcg_ctx, tpc);
@@ -414,6 +421,7 @@ void tcg_gen_setcond_i32(TCGContext *tcg_ctx, TCGCond cond, TCGv_i32 ret,
                          TCGv_i32 arg1, TCGv_i32 arg2);
 void tcg_gen_setcondi_i32(TCGContext *tcg_ctx, TCGCond cond, TCGv_i32 ret,
                           TCGv_i32 arg1, int32_t arg2);
+
 void tcg_gen_movcond_i32(TCGContext *tcg_ctx, TCGCond cond, TCGv_i32 ret, TCGv_i32 c1,
                          TCGv_i32 c2, TCGv_i32 v1, TCGv_i32 v2);
 void tcg_gen_add2_i32(TCGContext *tcg_ctx, TCGv_i32 rl, TCGv_i32 rh, TCGv_i32 al,
@@ -434,6 +442,31 @@ void tcg_gen_smax_i32(TCGContext *tcg_ctx, TCGv_i32, TCGv_i32 arg1, TCGv_i32 arg
 void tcg_gen_umin_i32(TCGContext *tcg_ctx, TCGv_i32, TCGv_i32 arg1, TCGv_i32 arg2);
 void tcg_gen_umax_i32(TCGContext *tcg_ctx, TCGv_i32, TCGv_i32 arg1, TCGv_i32 arg2);
 void tcg_gen_abs_i32(TCGContext *tcg_ctx, TCGv_i32, TCGv_i32);
+
+static inline void gen_uc_tracefetch(TCGContext *tcg_ctx, int32_t size,
+                                     int32_t type, void *uc, uint64_t pc)
+{
+    TCGLabel *skip = NULL;
+    TCGv_i32 tsize = tcg_const_i32(tcg_ctx, size);
+    TCGv_i32 ttype = tcg_const_i32(tcg_ctx, type);
+    TCGv_ptr tuc = tcg_const_ptr(tcg_ctx, uc);
+    TCGv_i64 tpc = tcg_const_i64(tcg_ctx, pc);
+
+    if (size == UC_TRACE_SIZE_UNKNOWN) {
+        skip = gen_new_label(tcg_ctx);
+        tcg_gen_brcondi_i32(tcg_ctx, TCG_COND_EQ, tsize,
+                            UC_TRACE_SIZE_UNKNOWN, skip);
+    }
+    gen_active_tb(tcg_ctx);
+    gen_helper_uc_tracecode(tcg_ctx, tsize, ttype, tuc, tpc);
+    if (skip) {
+        gen_set_label(tcg_ctx, skip);
+    }
+    tcg_temp_free_i64(tcg_ctx, tpc);
+    tcg_temp_free_ptr(tcg_ctx, tuc);
+    tcg_temp_free_i32(tcg_ctx, ttype);
+    tcg_temp_free_i32(tcg_ctx, tsize);
+}
 
 static inline void tcg_gen_discard_i32(TCGContext *tcg_ctx, TCGv_i32 arg)
 {
@@ -1378,6 +1411,21 @@ static inline void tcg_gen_ld_ptr(TCGContext *tcg_ctx, TCGv_ptr r, TCGv_ptr a, i
 static inline void tcg_gen_st_ptr(TCGContext *tcg_ctx, TCGv_ptr r, TCGv_ptr a, intptr_t o)
 {
     glue(tcg_gen_st_, PTR)(tcg_ctx, (NAT)r, a, o);
+}
+
+static inline void gen_active_tb(TCGContext *tcg_ctx)
+{
+    TCGv_ptr tuc = tcg_const_ptr(tcg_ctx, tcg_ctx->uc);
+    TCGv_ptr tframe = tcg_temp_new_ptr(tcg_ctx);
+    TCGv_ptr ttb = tcg_const_ptr(tcg_ctx, tcg_ctx->gen_tb);
+
+    tcg_debug_assert(tcg_ctx->gen_tb != NULL);
+    tcg_gen_ld_ptr(tcg_ctx, tframe, tuc,
+                   offsetof(struct uc_struct, active_tb_exec_frame));
+    tcg_gen_st_ptr(tcg_ctx, ttb, tframe, offsetof(UcTbExecFrame, tb));
+    tcg_temp_free_ptr(tcg_ctx, ttb);
+    tcg_temp_free_ptr(tcg_ctx, tframe);
+    tcg_temp_free_ptr(tcg_ctx, tuc);
 }
 
 static inline void tcg_gen_discard_ptr(TCGContext *tcg_ctx, TCGv_ptr a)

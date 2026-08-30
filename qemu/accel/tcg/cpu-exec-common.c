@@ -36,11 +36,22 @@ void cpu_reloading_memory_map(void)
 void cpu_loop_exit(CPUState *cpu)
 {
     unsigned int level = cpu->uc->nested_level - 1;
+    UcTbExecFrame *frame = &cpu->uc->tb_exec_frames[level];
 
-    if (cpu->uc->tb_exec_active[level]) {
-        cpu->uc->tb_exec_active[level] = false;
+    if (frame->active) {
+        frame->active = false;
+        frame->exit_requested = false;
+        frame->tb = NULL;
         g_assert(cpu->uc->tb_exec_depth != 0);
         cpu->uc->tb_exec_depth--;
+    }
+    cpu->uc->active_tb_exec_frame = NULL;
+    while (level != 0) {
+        frame = &cpu->uc->tb_exec_frames[--level];
+        if (frame->active) {
+            cpu->uc->active_tb_exec_frame = frame;
+            break;
+        }
     }
     /* Unlock JIT write protect if applicable. */
     if (cpu->uc->nested_level == 1) {

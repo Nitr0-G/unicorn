@@ -151,7 +151,7 @@ int main(int argc, char **argv, char **envp)
         if (!strcmp(argv[1], "-32")) {
             test_i386();
         } else if (!strcmp(argv[1], "-h")) {
-            printf("Syntax: %s <-32|-64>\n", argv[0]);
+            printf("Syntax: %s <-32>\n", argv[0]);
         }
     } else {
         test_i386();

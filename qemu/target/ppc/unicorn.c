@@ -4,6 +4,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/ppc/ppc.h"
+#include "qemu/timer.h"
 #include "sysemu/cpus.h"
 #include "cpu.h"
 #include "unicorn_common.h"
@@ -117,6 +118,13 @@ static void ppc_release(void *ctx)
     g_free(tcg_ctx->cpu_dspctrl);
 
     //    g_free(tcg_ctx->tb_ctx.tbs);
+
+    if (env->tb_env != NULL) {
+        timer_free(env->tb_env->decr_timer);
+        timer_free(env->tb_env->hdecr_timer);
+        g_free(env->tb_env);
+        env->tb_env = NULL;
+    }
 
     if (env->nb_tlb != 0) {
         switch (env->tlb_type) {

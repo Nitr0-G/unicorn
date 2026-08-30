@@ -6,6 +6,7 @@
 #include "unicorn/unicorn.h"
 #include "sysemu/cpus.h"
 #include "cpu.h"
+#include "internals.h"
 #include "kvm-consts.h"
 #include "unicorn_common.h"
 #include "uc_priv.h"
@@ -450,6 +451,20 @@ static bool arm64_insn_hook_validate(uint32_t insn_enum)
     return true;
 }
 
+static uc_err arm64_context_restore(struct uc_struct *uc,
+                                    uc_context *context)
+{
+    ARMCPU *cpu = ARM_CPU(uc->cpu);
+    CPUARMState *env = &cpu->env;
+    size_t pointer_offset = offsetof(CPUARMState, cpu_breakpoint);
+
+    memcpy(env, context->data, pointer_offset);
+    hw_breakpoint_update_all(cpu);
+    hw_watchpoint_update_all(cpu);
+    arm_rebuild_hflags(env);
+    return UC_ERR_OK;
+}
+
 uint64_t _uc_pauth_sign(CPUARMState *env, uint64_t ptr, uint64_t diversifier, uint32_t sctlr_bit, ARMPACKey *key, bool data);
 uint64_t _uc_pauth_sign_ga(CPUARMState *env, uint64_t ptr, uint64_t diversifier);
 uint64_t _uc_pauth_strip(CPUARMState *env, uint64_t ptr, bool data);
@@ -534,6 +549,7 @@ void uc_init(struct uc_struct *uc)
     uc->cpus_init = arm64_cpus_init;
     uc->insn_hook_validate = arm64_insn_hook_validate;
     uc->cpu_context_size = offsetof(CPUARMState, cpu_watchpoint);
+    uc->context_restore = arm64_context_restore;
     uc->pauth_sign = arm64_pauth_sign;
     uc->pauth_strip = arm64_pauth_strip;
     uc->pauth_auth = arm64_pauth_auth;

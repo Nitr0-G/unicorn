@@ -4,9 +4,15 @@
 #ifndef UNICORN_ARCH_POSTFIX
 #define UNICORN_ARCH_POSTFIX _riscv32
 #endif
+#define gen_helper_check_counted_entry gen_helper_check_counted_entry_riscv32
 #define gen_helper_check_exit_request gen_helper_check_exit_request_riscv32
+#define gen_helper_exit_request gen_helper_exit_request_riscv32
+#define helper_check_counted_entry helper_check_counted_entry_riscv32
+#define helper_check_exit_request helper_check_exit_request_riscv32
+#define helper_exit_request helper_exit_request_riscv32
 #define helper_uc_tracecode_single helper_uc_tracecode_single_riscv32
 #define cpu_restore_icount cpu_restore_icount_riscv32
+#define cpu_tcg_exit_request cpu_tcg_exit_request_riscv32
 #define unicorn_fill_tlb unicorn_fill_tlb_riscv32
 #define reg_read reg_read_riscv32
 #define reg_write reg_write_riscv32
@@ -58,6 +64,8 @@
 #define address_space_dispatch_compact address_space_dispatch_compact_riscv32
 #define flatview_translate flatview_translate_riscv32
 #define flatview_copy flatview_copy_riscv32
+#define flatview_reserve flatview_reserve_riscv32
+#define address_space_restore_flatview address_space_restore_flatview_riscv32
 #define address_space_translate_for_iotlb address_space_translate_for_iotlb_riscv32
 #define qemu_get_cpu qemu_get_cpu_riscv32
 #define cpu_address_space_init cpu_address_space_init_riscv32
@@ -133,6 +141,10 @@
 #define memory_unmap memory_unmap_riscv32
 #define memory_moveout memory_moveout_riscv32
 #define memory_movein memory_movein_riscv32
+#define memory_mapping_restore_topology memory_mapping_restore_topology_riscv32
+#define memory_mapping_free memory_mapping_free_riscv32
+#define memory_mapping_prune memory_mapping_prune_riscv32
+#define memory_mapping_normalize memory_mapping_normalize_riscv32
 #define memory_free memory_free_riscv32
 #define flatview_unref flatview_unref_riscv32
 #define address_space_get_flatview address_space_get_flatview_riscv32
@@ -2112,6 +2124,7 @@
 #define riscv_cpu_debug_check_breakpoint riscv_cpu_debug_check_breakpoint_riscv32
 #define riscv_cpu_debug_check_watchpoint riscv_cpu_debug_check_watchpoint_riscv32
 #define riscv_trigger_init riscv_trigger_init_riscv32
+#define riscv_trigger_update_all riscv_trigger_update_all_riscv32
 #define riscv_cpu_get_fflags riscv_cpu_get_fflags_riscv32
 #define riscv_cpu_set_fflags riscv_cpu_set_fflags_riscv32
 #define helper_set_rounding_mode helper_set_rounding_mode_riscv32

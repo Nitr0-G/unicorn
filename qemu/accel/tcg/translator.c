@@ -64,9 +64,10 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     /* Unicorn: early check to see if the address of this block is
      * the "run until" address. */
     if (uc_addr_is_exit(uc, tb->pc)) {
-        TCGv_ptr puc = tcg_const_ptr(tcg_ctx, uc);
+        TCGv_ptr puc;
 
         gen_tb_start(tcg_ctx, db->tb);
+        puc = tcg_const_ptr(tcg_ctx, uc);
         ops->tb_start(db, cpu);
         db->num_insns++;
         ops->insn_start(db, cpu);

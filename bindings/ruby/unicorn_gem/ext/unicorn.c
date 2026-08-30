@@ -30,6 +30,10 @@ VALUE UcError = Qnil;
 VALUE SavedContext = Qnil;
 VALUE Hook = Qnil;
 
+static void uc_context_free_wrapper(void *context) {
+    uc_context_free((uc_context *)context);
+}
+
 
 void Init_unicorn_engine(void) {
     rb_require("unicorn_engine/unicorn_const");
@@ -556,7 +560,8 @@ VALUE m_uc_context_save(VALUE self){
       rb_raise(UcError, "%s", uc_strerror(err));
     }
 
-    VALUE sc = Data_Wrap_Struct(SavedContext, 0, uc_free, _context);
+    VALUE sc = Data_Wrap_Struct(SavedContext, 0, uc_context_free_wrapper,
+                                _context);
     return sc;
 }
 

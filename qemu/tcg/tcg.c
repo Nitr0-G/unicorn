@@ -305,7 +305,7 @@ static int ptr_cmp_tb_tc(const void *ptr, const struct tb_tc *s)
     return 0;
 }
 
-static gint tb_tc_cmp(gconstpointer ap, gconstpointer bp)
+static gint tb_tc_cmp(gconstpointer ap, gconstpointer bp, gpointer user_data)
 {
     const struct tb_tc *a = ap;
     const struct tb_tc *b = bp;
@@ -540,7 +540,7 @@ void tcg_region_init(TCGContext *tcg_ctx)
         (void)qemu_mprotect_none(end, page_size);
     }
 
-    tcg_ctx->tree = g_tree_new(tb_tc_cmp);
+    tcg_ctx->tree = g_tree_new_full(tb_tc_cmp, NULL, NULL, NULL);
     // Unicorn: Though this code is taken from CONFIG_USER_ONLY, it is crucial or
     //          tcg_ctx->region.current is 0 and we will miss a tb_flush when the
     //          buffer gets full.

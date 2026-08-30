@@ -4,9 +4,15 @@
 #ifndef UNICORN_ARCH_POSTFIX
 #define UNICORN_ARCH_POSTFIX _s390x
 #endif
+#define gen_helper_check_counted_entry gen_helper_check_counted_entry_s390x
 #define gen_helper_check_exit_request gen_helper_check_exit_request_s390x
+#define gen_helper_exit_request gen_helper_exit_request_s390x
+#define helper_check_counted_entry helper_check_counted_entry_s390x
+#define helper_check_exit_request helper_check_exit_request_s390x
+#define helper_exit_request helper_exit_request_s390x
 #define helper_uc_tracecode_single helper_uc_tracecode_single_s390x
 #define cpu_restore_icount cpu_restore_icount_s390x
+#define cpu_tcg_exit_request cpu_tcg_exit_request_s390x
 #define unicorn_fill_tlb unicorn_fill_tlb_s390x
 #define reg_read reg_read_s390x
 #define reg_write reg_write_s390x
@@ -58,6 +64,8 @@
 #define address_space_dispatch_compact address_space_dispatch_compact_s390x
 #define flatview_translate flatview_translate_s390x
 #define flatview_copy flatview_copy_s390x
+#define flatview_reserve flatview_reserve_s390x
+#define address_space_restore_flatview address_space_restore_flatview_s390x
 #define address_space_translate_for_iotlb address_space_translate_for_iotlb_s390x
 #define qemu_get_cpu qemu_get_cpu_s390x
 #define cpu_address_space_init cpu_address_space_init_s390x
@@ -133,6 +141,10 @@
 #define memory_unmap memory_unmap_s390x
 #define memory_moveout memory_moveout_s390x
 #define memory_movein memory_movein_s390x
+#define memory_mapping_restore_topology memory_mapping_restore_topology_s390x
+#define memory_mapping_free memory_mapping_free_s390x
+#define memory_mapping_prune memory_mapping_prune_s390x
+#define memory_mapping_normalize memory_mapping_normalize_s390x
 #define memory_free memory_free_s390x
 #define flatview_unref flatview_unref_s390x
 #define address_space_get_flatview address_space_get_flatview_s390x

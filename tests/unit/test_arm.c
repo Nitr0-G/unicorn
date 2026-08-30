@@ -1,4 +1,5 @@
 #include "unicorn_test.h"
+#include <stdlib.h>
 #include <string.h>
 
 const uint64_t code_start = 0x1000;
@@ -42,6 +43,17 @@ static void test_arm_enable_vfp(uc_engine *uc)
     OK(uc_reg_write(uc, UC_ARM_REG_FPEXC, &fpexc));
 }
 
+static void test_arm_query_initial_thumb_mode(void)
+{
+    uc_engine *uc;
+    size_t mode;
+
+    OK(uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &uc));
+    OK(uc_query(uc, UC_QUERY_MODE, &mode));
+    TEST_CHECK(mode == UC_MODE_THUMB);
+    OK(uc_close(uc));
+}
+
 static uint32_t test_arm_id_isar6_read(uc_engine *uc)
 {
     uc_arm_cp_reg reg = {
@@ -52,6 +64,24 @@ static uint32_t test_arm_id_isar6_read(uc_engine *uc)
         .crm = 2,
         .opc1 = 0,
         .opc2 = 7,
+        .val = 0,
+    };
+
+    OK(uc_reg_read(uc, UC_ARM_REG_CP_REG, &reg));
+    return (uint32_t)reg.val;
+}
+
+static uint32_t test_arm_cp14_read(uc_engine *uc, uint32_t crm,
+                                   uint32_t opc2)
+{
+    uc_arm_cp_reg reg = {
+        .cp = 14,
+        .is64 = 0,
+        .sec = 0,
+        .crn = 0,
+        .crm = crm,
+        .opc1 = 0,
+        .opc2 = opc2,
         .val = 0,
     };
 
@@ -767,6 +797,324 @@ static void test_arm_thumb_ite(void)
     OK(uc_close(uc));
 }
 
+typedef struct ArmItStop {
+    uc_err error;
+    uint32_t calls;
+} ArmItStop;
+
+static void test_arm_thumb_it_stop_callback(uc_engine *uc, uint64_t address,
+                                            uint32_t size, void *user_data)
+{
+    ArmItStop *stop = (ArmItStop *)user_data;
+
+    stop->calls++;
+    stop->error = uc_emu_stop(uc);
+}
+
+static void test_arm_thumb_it_pending_stop(void)
+{
+    const uint8_t code[] = {
+        0x9a, 0x42, /* cmp r2,r3 */
+        0x15, 0xbf, /* itete ne */
+        0x00, 0x9a, /* ldrne r2,[sp] */
+        0x01, 0x9a, /* ldreq r2,[sp,#4] */
+        0x78, 0x23, /* movne r3,#0x78 */
+        0x15, 0x23, /* moveq r3,#0x15 */
+    };
+    const uint32_t stack_address = 0x8000;
+    ArmItStop stop = {0};
+    uint32_t r2 = 0;
+    uint32_t r3 = 1;
+    uint32_t pc;
+    uint32_t value;
+    uc_engine *uc;
+    uc_hook hook;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_THUMB, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    OK(uc_mem_map(uc, stack_address, 0x1000, UC_PROT_ALL));
+    value = LEINT32(0x68);
+    OK(uc_mem_write(uc, stack_address, &value, sizeof(value)));
+    value = LEINT32(0x4d);
+    OK(uc_mem_write(uc, stack_address + 4, &value, sizeof(value)));
+    OK(uc_reg_write(uc, UC_ARM_REG_SP, &stack_address));
+    OK(uc_reg_write(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_ARM_REG_R3, &r3));
+    OK(uc_hook_add(uc, &hook, UC_HOOK_CODE,
+                   test_arm_thumb_it_stop_callback, &stop,
+                   code_start + 4, code_start + 4));
+
+    OK(uc_emu_start(uc, code_start | 1, code_start + sizeof(code), 0, 0));
+    OK(stop.error);
+    OK(uc_reg_read(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_read(uc, UC_ARM_REG_R3, &r3));
+    OK(uc_reg_read(uc, UC_ARM_REG_PC, &pc));
+    TEST_CHECK(stop.calls == 1);
+    TEST_CHECK(r2 == 0x68);
+    TEST_CHECK(r3 == 0x78);
+    TEST_CHECK_(pc == code_start + sizeof(code), "pc=0x%x", pc);
+
+    OK(uc_close(uc));
+}
+
+typedef struct ArmFetchPredicateTrace {
+    uint64_t fetch_address;
+    uint32_t fetch_pc;
+    uint32_t fetch_size;
+    uint32_t fetch_r0;
+    uint32_t fetch_r1;
+    uint64_t code_address[2];
+    uint64_t event_address[4];
+    uint32_t event_pc[4];
+    uint32_t event_size[4];
+    uint8_t event_type[4];
+    size_t fetch_count;
+    size_t code_count;
+    size_t event_count;
+    bool mutate_z;
+    bool code_sets_z;
+} ArmFetchPredicateTrace;
+
+enum {
+    ARM_FETCH_EVENT_FETCH,
+    ARM_FETCH_EVENT_CODE,
+};
+
+static void test_arm_fetch_predicate_callback(uc_engine *uc,
+                                              uc_mem_type type,
+                                              uint64_t address, int size,
+                                              int64_t value, void *user_data)
+{
+    ArmFetchPredicateTrace *trace = (ArmFetchPredicateTrace *)user_data;
+    size_t event_index = trace->event_count;
+
+    TEST_CHECK(type == UC_MEM_FETCH);
+    TEST_CHECK(value == 0);
+    if (TEST_CHECK(event_index < 4)) {
+        trace->event_type[event_index] = ARM_FETCH_EVENT_FETCH;
+        trace->event_address[event_index] = address;
+        trace->event_size[event_index] = size;
+    }
+    trace->event_count++;
+    trace->fetch_count++;
+    trace->fetch_address = address;
+    trace->fetch_size = size;
+    OK(uc_reg_read(uc, UC_ARM_REG_PC, &trace->fetch_pc));
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &trace->fetch_r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &trace->fetch_r1));
+    if (event_index < 4) {
+        trace->event_pc[event_index] = trace->fetch_pc;
+    }
+}
+
+static void test_arm_fetch_predicate_code_callback(uc_engine *uc,
+                                                   uint64_t address,
+                                                   uint32_t size,
+                                                   void *user_data)
+{
+    ArmFetchPredicateTrace *trace = (ArmFetchPredicateTrace *)user_data;
+    uint32_t cpsr;
+    uint32_t pc;
+
+    if (TEST_CHECK(trace->code_count < 2)) {
+        trace->code_address[trace->code_count] = address;
+    }
+    trace->code_count++;
+    if (TEST_CHECK(trace->event_count < 4)) {
+        trace->event_type[trace->event_count] = ARM_FETCH_EVENT_CODE;
+        trace->event_address[trace->event_count] = address;
+        trace->event_size[trace->event_count] = size;
+        OK(uc_reg_read(uc, UC_ARM_REG_PC, &pc));
+        trace->event_pc[trace->event_count] = pc;
+    }
+    trace->event_count++;
+
+    if (trace->mutate_z) {
+        OK(uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr));
+        if (trace->code_sets_z) {
+            cpsr |= 1U << 30;
+        } else {
+            cpsr &= ~(1U << 30);
+        }
+        OK(uc_reg_write(uc, UC_ARM_REG_CPSR, &cpsr));
+    }
+}
+
+static void test_arm_fetch_assert_event(const ArmFetchPredicateTrace *trace,
+                                        size_t index, uint8_t type,
+                                        uint64_t address, uint32_t size)
+{
+    TEST_ASSERT(index < trace->event_count);
+    TEST_CHECK(trace->event_type[index] == type);
+    TEST_CHECK(trace->event_address[index] == address);
+    TEST_CHECK(trace->event_pc[index] == address);
+    TEST_CHECK(trace->event_size[index] == size);
+}
+
+static void test_arm_fetch_predicate(void)
+{
+    const uint8_t code[] = {
+        0x01, 0x00, 0xa0, 0x03, /* moveq r0,#1 */
+        0x02, 0x10, 0xa0, 0x13, /* movne r1,#2 */
+    };
+    ArmFetchPredicateTrace trace = {0};
+    uint32_t cpsr;
+    uint32_t r0 = 0;
+    uint32_t r1 = 0;
+    uc_engine *uc;
+    uc_hook code_hook;
+    uc_hook fetch_hook;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    OK(uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr));
+    cpsr &= ~(1U << 30);
+    OK(uc_reg_write(uc, UC_ARM_REG_CPSR, &cpsr));
+    OK(uc_hook_add(uc, &fetch_hook, UC_HOOK_MEM_FETCH,
+                   test_arm_fetch_predicate_callback, &trace, 1, 0));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE,
+                   test_arm_fetch_predicate_code_callback, &trace, 1, 0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 2));
+
+    TEST_CHECK(trace.code_count == 2);
+    TEST_CHECK(trace.code_address[0] == code_start);
+    TEST_CHECK(trace.code_address[1] == code_start + 4);
+    TEST_CHECK(trace.fetch_count == 1);
+    TEST_CHECK(trace.fetch_address == code_start + 4);
+    TEST_CHECK(trace.fetch_pc == code_start + 4);
+    TEST_CHECK(trace.fetch_size == 4);
+    TEST_CHECK(trace.fetch_r0 == 0);
+    TEST_CHECK(trace.fetch_r1 == 0);
+    TEST_CHECK(trace.event_count == 3);
+    test_arm_fetch_assert_event(&trace, 0, ARM_FETCH_EVENT_CODE, code_start,
+                                4);
+    test_arm_fetch_assert_event(&trace, 1, ARM_FETCH_EVENT_CODE,
+                                code_start + 4, 4);
+    test_arm_fetch_assert_event(&trace, 2, ARM_FETCH_EVENT_FETCH,
+                                code_start + 4, 4);
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    TEST_CHECK(r0 == 0);
+    TEST_CHECK(r1 == 2);
+
+    OK(uc_hook_del(uc, code_hook));
+    OK(uc_hook_del(uc, fetch_hook));
+    OK(uc_close(uc));
+}
+
+static void test_arm_thumb_fetch_predicate(void)
+{
+    const uint8_t code[] = {
+        0x80, 0x42, /* cmp r0,r0 */
+        0x0c, 0xbf, /* ite eq */
+        0x01, 0x21, /* moveq r1,#1 */
+        0x02, 0x22, /* movne r2,#2 */
+    };
+    ArmFetchPredicateTrace trace = {0};
+    uint32_t r1 = 0;
+    uint32_t r2 = 0;
+    uc_engine *uc;
+    uc_hook code_hook;
+    uc_hook fetch_hook;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_THUMB, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    OK(uc_hook_add(uc, &fetch_hook, UC_HOOK_MEM_FETCH,
+                   test_arm_fetch_predicate_callback, &trace,
+                   code_start + 4, code_start + 6));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE,
+                   test_arm_fetch_predicate_code_callback, &trace,
+                   code_start + 4, code_start + 6));
+
+    OK(uc_emu_start(uc, code_start | 1, code_start + sizeof(code), 0, 0));
+
+    TEST_CHECK(trace.fetch_count == 1);
+    TEST_CHECK(trace.fetch_address == code_start + 4);
+    TEST_CHECK(trace.fetch_pc == code_start + 4);
+    TEST_CHECK(trace.fetch_size == 2);
+    TEST_CHECK(trace.fetch_r0 == 0);
+    TEST_CHECK(trace.fetch_r1 == 0);
+    TEST_CHECK(trace.code_count == 1);
+    TEST_CHECK(trace.code_address[0] == code_start + 4);
+    TEST_CHECK(trace.event_count == 2);
+    test_arm_fetch_assert_event(&trace, 0, ARM_FETCH_EVENT_FETCH,
+                                code_start + 4, 2);
+    test_arm_fetch_assert_event(&trace, 1, ARM_FETCH_EVENT_CODE,
+                                code_start + 4, 2);
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_ARM_REG_R2, &r2));
+    TEST_CHECK(r1 == 1);
+    TEST_CHECK(r2 == 0);
+
+    OK(uc_hook_del(uc, code_hook));
+    OK(uc_hook_del(uc, fetch_hook));
+    OK(uc_close(uc));
+}
+
+static void test_arm_fetch_predicate_code_mutation_one(bool initial_z,
+                                                       bool callback_z,
+                                                       bool executes)
+{
+    const uint8_t code[] = {
+        0x01, 0x00, 0xa0, 0x03, /* moveq r0,#1 */
+    };
+    ArmFetchPredicateTrace trace = {
+        .mutate_z = true,
+        .code_sets_z = callback_z,
+    };
+    uint32_t cpsr;
+    uint32_t pc;
+    uint32_t r0 = 0;
+    uc_engine *uc;
+    uc_hook code_hook;
+    uc_hook fetch_hook;
+
+    uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    OK(uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr));
+    if (initial_z) {
+        cpsr |= 1U << 30;
+    } else {
+        cpsr &= ~(1U << 30);
+    }
+    OK(uc_reg_write(uc, UC_ARM_REG_CPSR, &cpsr));
+    OK(uc_hook_add(uc, &fetch_hook, UC_HOOK_MEM_FETCH,
+                   test_arm_fetch_predicate_callback, &trace, 1, 0));
+    OK(uc_hook_add(uc, &code_hook, UC_HOOK_CODE,
+                   test_arm_fetch_predicate_code_callback, &trace, 1, 0));
+
+    OK(uc_emu_start(uc, code_start, code_start + sizeof(code), 0, 1));
+
+    TEST_CHECK(trace.code_count == 1);
+    TEST_CHECK(trace.code_address[0] == code_start);
+    test_arm_fetch_assert_event(&trace, 0, ARM_FETCH_EVENT_CODE, code_start,
+                                4);
+    if (executes) {
+        TEST_CHECK(trace.fetch_count == 1);
+        TEST_CHECK(trace.event_count == 2);
+        test_arm_fetch_assert_event(&trace, 1, ARM_FETCH_EVENT_FETCH,
+                                    code_start, 4);
+    } else {
+        TEST_CHECK(trace.fetch_count == 0);
+        TEST_CHECK(trace.event_count == 1);
+    }
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_PC, &pc));
+    TEST_CHECK(r0 == (executes ? 1U : 0U));
+    TEST_CHECK(pc == code_start + sizeof(code));
+
+    OK(uc_hook_del(uc, code_hook));
+    OK(uc_hook_del(uc, fetch_hook));
+    OK(uc_close(uc));
+}
+
+static void test_arm_fetch_predicate_code_mutation(void)
+{
+    test_arm_fetch_predicate_code_mutation_one(false, true, true);
+    test_arm_fetch_predicate_code_mutation_one(true, false, false);
+}
+
 static void test_arm_m_thumb_mrs(void)
 {
     uc_engine *uc;
@@ -1246,6 +1594,69 @@ static void test_arm_intr_capture_cb(uc_engine *uc, uint32_t intno,
     OK(uc_emu_stop(uc));
 }
 
+static void test_arm_m55_vlldm(void)
+{
+    const uint32_t control_fpca = 1U << 2;
+    const uint32_t control_sfpa = 1U << 3;
+    const uint32_t frame_addr = code_start + 0x1000;
+    const uint32_t frame_s0 = 0x0badc0de;
+    const uint32_t frame_s1 = 0xf00d1234;
+    const uint32_t frame_fpscr = 0xa0000000;
+    const uint32_t frame_vpr = 0x00fedcba;
+    uc_engine *uc;
+    uint8_t code[4];
+    uint8_t frame[0x48] = { 0 };
+    uint32_t control;
+    uint32_t fpscr = 0;
+    uint32_t s0 = 0;
+    uint32_t s1 = 0;
+    uint32_t vpr = 0;
+    uc_err err;
+
+    test_arm_store_le(frame, 4, frame_s0);
+    test_arm_store_le(frame + 4, 4, frame_s1);
+    test_arm_store_le(frame + 0x40, 4, frame_fpscr);
+    test_arm_store_le(frame + 0x44, 4, frame_vpr);
+    test_arm_emit32(code, 0, 0x0a80ec30); /* vlldm r0 */
+
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    test_arm_m_profile_activate_fp_context(uc);
+    OK(uc_mem_write(uc, frame_addr, frame, sizeof(frame)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &frame_addr));
+    OK(uc_emu_start(uc, code_start | 1,
+                    code_start + sizeof(code), 0, 0));
+
+    OK(uc_reg_read(uc, UC_ARM_REG_S0, &s0));
+    OK(uc_reg_read(uc, UC_ARM_REG_S1, &s1));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_VPR, &vpr));
+    OK(uc_reg_read(uc, UC_ARM_REG_CONTROL, &control));
+    TEST_CHECK_(s0 == frame_s0, "s0=0x%08x", s0);
+    TEST_CHECK_(s1 == frame_s1, "s1=0x%08x", s1);
+    TEST_CHECK_((fpscr & 0xf0000000) == frame_fpscr,
+                "fpscr=0x%08x", fpscr);
+    TEST_CHECK_(vpr == frame_vpr, "vpr=0x%08x", vpr);
+    TEST_CHECK_((control & (control_fpca | control_sfpa)) ==
+                (control_fpca | control_sfpa),
+                "control=0x%08x", control);
+    OK(uc_close(uc));
+
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_ARM_CORTEX_M33);
+    test_arm_enable_vfp(uc);
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &frame_addr));
+    err = uc_emu_start(uc, code_start | 1,
+                       code_start + sizeof(code), 0, 0);
+    TEST_CHECK_(err == UC_ERR_INSN_INVALID, "err=%u", (unsigned)err);
+    OK(uc_close(uc));
+}
+
 static void test_arm_m55_vlstm_lazy_preserve(void)
 {
     const uint32_t frame_addr = code_start + 0x2000;
@@ -1327,6 +1738,266 @@ static void test_arm_m55_vlstm_lazy_fault(void)
                 capture.count, capture.intno);
     TEST_CHECK_(capture.intno == 20, "intno=%u", capture.intno);
     TEST_CHECK(vpr == initial_vpr);
+    OK(uc_close(uc));
+}
+
+static void test_arm_m55_fpcxt_s(void)
+{
+    const uint32_t control_fpca = 1U << 2;
+    const uint32_t control_sfpa = 1U << 3;
+    const uint32_t nzcv_mask = 0xf0000000;
+    const uint32_t fpdscr_ns_reset = 4U << 16;
+    const uint32_t data_addr = code_start + 0x1000;
+    const uint32_t fpscr_initial = 0x0a040000 | 0xa0000000;
+    const uint32_t fpcxt_write = 0x86040000;
+    const uint32_t expected_write = fpcxt_write & ~nzcv_mask;
+    uc_engine *uc;
+    uint8_t code[8];
+    uint8_t mem[16] = { 0 };
+    uint32_t control;
+    uint32_t expected_read;
+    uint32_t fpscr = fpscr_initial;
+    uint32_t r1 = data_addr;
+    uint32_t r2 = fpcxt_write;
+    uint32_t r3 = 0;
+
+    test_arm_emit32(code, 0, 0x3a10eeff); /* vmrs r3,fpcxt_s */
+    test_arm_emit32(code, 4, 0x2a10eeef); /* vmsr fpcxt_s,r2 */
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    test_arm_m_profile_activate_fp_context(uc);
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_write(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_read = (fpscr & ~nzcv_mask) | 0x80000000;
+    OK(uc_emu_start(uc, code_start | 1,
+                    code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R3, &r3));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_CONTROL, &control));
+    TEST_CHECK_(r3 == expected_read, "r3=0x%08x expected=0x%08x",
+                r3, expected_read);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == expected_write,
+                "fpscr=0x%08x expected=0x%08x", fpscr,
+                expected_write);
+    TEST_CHECK_((fpscr & nzcv_mask) == 0, "fpscr=0x%08x", fpscr);
+    TEST_CHECK_((control & (control_fpca | control_sfpa)) ==
+                (control_fpca | control_sfpa),
+                "control=0x%08x", control);
+    OK(uc_close(uc));
+
+    test_arm_emit32(code, 0, 0xef80edc1); /* vstr fpcxt_s,[r1] */
+    memset(mem, 0, sizeof(mem));
+    fpscr = fpscr_initial;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, 4, UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    test_arm_m_profile_activate_fp_context(uc);
+    OK(uc_mem_write(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_read = (fpscr & ~nzcv_mask) | 0x80000000;
+    OK(uc_emu_start(uc, code_start | 1, code_start + 4, 0, 0));
+    OK(uc_mem_read(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_CONTROL, &control));
+    TEST_CHECK_(test_arm_load_le(mem, 4) == expected_read,
+                "stored=0x%08x expected=0x%08x",
+                test_arm_load_le(mem, 4), expected_read);
+    TEST_CHECK_((control & control_sfpa) == 0,
+                "control=0x%08x", control);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == fpdscr_ns_reset,
+                "fpscr=0x%08x", fpscr);
+    OK(uc_close(uc));
+
+    test_arm_emit32(code, 0, 0xef80edd1); /* vldr fpcxt_s,[r1] */
+    memset(mem, 0, sizeof(mem));
+    test_arm_store_le(mem, 4, fpcxt_write);
+    fpscr = 0;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, 4, UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    test_arm_m_profile_activate_fp_context(uc);
+    OK(uc_mem_write(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_emu_start(uc, code_start | 1, code_start + 4, 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_CONTROL, &control));
+    TEST_CHECK_((control & control_sfpa) != 0,
+                "control=0x%08x", control);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == expected_write,
+                "fpscr=0x%08x expected=0x%08x", fpscr,
+                expected_write);
+    OK(uc_close(uc));
+}
+
+static void test_arm_m55_fpcxt_ns(void)
+{
+    const uint32_t control_fpca = 1U << 2;
+    const uint32_t control_sfpa = 1U << 3;
+    const uint32_t nzcv_mask = 0xf0000000;
+    const uint32_t fpdscr_ns_reset = 4U << 16;
+    const uint32_t data_addr = code_start + 0x1000;
+    const uint32_t fpscr_initial = 0x0a040000 | 0xa0000000;
+    const uint32_t fpcxt_write = 0x86040000;
+    const uint32_t expected_write = fpcxt_write & ~nzcv_mask;
+    uc_engine *uc;
+    uint8_t code[8];
+    uint8_t mem[16] = { 0 };
+    uint32_t control = 0;
+    uint32_t expected_fpscr;
+    uint32_t expected_read;
+    uint32_t fpscr;
+    uint32_t r0 = fpcxt_write;
+    uint32_t r1 = 0;
+    uint32_t r2;
+    uc_err err;
+
+    test_arm_emit32(code, 0, 0x1a10eefe); /* vmrs r1,fpcxt_ns */
+    test_arm_emit32(code, 4, 0x0a10eeee); /* vmsr fpcxt_ns,r0 */
+    fpscr = 0x01030000;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    OK(uc_reg_write(uc, UC_ARM_REG_CONTROL, &control));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_fpscr = fpscr & ~nzcv_mask;
+    OK(uc_emu_start(uc, code_start | 1,
+                    code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_CONTROL, &control));
+    TEST_CHECK_(r1 == fpdscr_ns_reset, "r1=0x%08x", r1);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == expected_fpscr,
+                "fpscr=0x%08x expected=0x%08x", fpscr,
+                expected_fpscr);
+    TEST_CHECK_((control & (control_fpca | control_sfpa)) == 0,
+                "control=0x%08x", control);
+    OK(uc_close(uc));
+
+    control = control_fpca;
+    fpscr = fpscr_initial;
+    r1 = 0;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    OK(uc_reg_write(uc, UC_ARM_REG_CONTROL, &control));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_read = fpscr & ~nzcv_mask;
+    OK(uc_emu_start(uc, code_start | 1,
+                    code_start + sizeof(code), 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_CONTROL, &control));
+    TEST_CHECK_(r1 == expected_read, "r1=0x%08x expected=0x%08x",
+                r1, expected_read);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == expected_write,
+                "fpscr=0x%08x expected=0x%08x", fpscr,
+                expected_write);
+    TEST_CHECK_((control & (control_fpca | control_sfpa)) ==
+                (control_fpca | control_sfpa),
+                "control=0x%08x", control);
+    OK(uc_close(uc));
+
+    test_arm_emit32(code, 0, 0xcf80edc1); /* vstr fpcxt_ns,[r1] */
+    memset(mem, 0, sizeof(mem));
+    control = control_fpca;
+    fpscr = fpscr_initial;
+    r1 = data_addr;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, 4, UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    OK(uc_mem_write(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_write(uc, UC_ARM_REG_CONTROL, &control));
+    OK(uc_reg_write(uc, UC_ARM_REG_R1, &r1));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_read = fpscr & ~nzcv_mask;
+    OK(uc_emu_start(uc, code_start | 1, code_start + 4, 0, 0));
+    OK(uc_mem_read(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    TEST_CHECK_(test_arm_load_le(mem, 4) == expected_read,
+                "stored=0x%08x expected=0x%08x",
+                test_arm_load_le(mem, 4), expected_read);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == fpdscr_ns_reset,
+                "fpscr=0x%08x", fpscr);
+    OK(uc_close(uc));
+
+    test_arm_emit32(code, 0, 0xcf81ecf2); /* vldr fpcxt_ns,[r2],#4 */
+    memset(mem, 0, sizeof(mem));
+    test_arm_store_le(mem, 4, fpcxt_write);
+    control = 0;
+    fpscr = 0x04460000;
+    r2 = data_addr;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, 4, UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    OK(uc_mem_write(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_write(uc, UC_ARM_REG_CONTROL, &control));
+    OK(uc_reg_write(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_fpscr = fpscr & ~nzcv_mask;
+    OK(uc_emu_start(uc, code_start | 1, code_start + 4, 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    TEST_CHECK_(r2 == data_addr + 4, "r2=0x%08x", r2);
+    TEST_CHECK_((fpscr & ~nzcv_mask) == expected_fpscr,
+                "fpscr=0x%08x expected=0x%08x", fpscr,
+                expected_fpscr);
+    OK(uc_close(uc));
+
+    test_arm_emit32(code, 0, 0xcf81ece2); /* vstr fpcxt_ns,[r2],#4 */
+    memset(mem, 0, sizeof(mem));
+    control = 0;
+    fpscr = 0x04460000;
+    r2 = data_addr;
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, 4, UC_CPU_ARM_CORTEX_M55);
+    test_arm_enable_vfp(uc);
+    OK(uc_mem_write(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_write(uc, UC_ARM_REG_CONTROL, &control));
+    OK(uc_reg_write(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    expected_fpscr = fpscr & ~nzcv_mask;
+    OK(uc_emu_start(uc, code_start | 1, code_start + 4, 0, 0));
+    OK(uc_reg_read(uc, UC_ARM_REG_R2, &r2));
+    OK(uc_mem_read(uc, data_addr, mem, sizeof(mem)));
+    OK(uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr));
+    TEST_CHECK_(r2 == data_addr + 4, "r2=0x%08x", r2);
+    TEST_CHECK_(test_arm_load_le(mem, 4) == fpdscr_ns_reset,
+                "stored=0x%08x", test_arm_load_le(mem, 4));
+    TEST_CHECK_((fpscr & ~nzcv_mask) == expected_fpscr,
+                "fpscr=0x%08x expected=0x%08x", fpscr,
+                expected_fpscr);
+    OK(uc_close(uc));
+
+    test_arm_emit32(code, 0, 0x1a10eefe); /* vmrs r1,fpcxt_ns */
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS,
+                    (const char *)code, 4, UC_CPU_ARM_CORTEX_M33);
+    test_arm_enable_vfp(uc);
+    err = uc_emu_start(uc, code_start | 1, code_start + 4, 0, 0);
+    TEST_CHECK_(err == UC_ERR_INSN_INVALID, "err=%u", (unsigned)err);
     OK(uc_close(uc));
 }
 
@@ -11392,7 +12063,7 @@ static void test_arm_m55_mve_vcmp_fp(void)
 //   EXC_RETURN. We can't help user handle EXC_RETURN since unicorn is designed
 //   not to handle any CPU exception.
 //
-static void test_arm_m_exc_return_hook_interrupt(uc_engine *uc, int intno,
+static void test_arm_m_exc_return_hook_interrupt(uc_engine *uc, uint32_t intno,
                                                  void *data)
 {
     int r_pc;
@@ -11885,10 +12556,14 @@ static void test_arm_context_save(void)
     char code[] = "\x83\xb0"; // sub    sp, #0xc
     uc_context *ctx;
     uint32_t pc;
+    uint32_t saved_r0 = 0x1a2b3c4d;
+    uint32_t target_r0 = 0xa5a5a5a5;
+    uint32_t read_r0;
 
     uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_THUMB, code, sizeof(code) - 1,
                     UC_CPU_ARM_CORTEX_R5);
 
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &saved_r0));
     OK(uc_context_alloc(uc, &ctx));
     OK(uc_context_save(uc, ctx));
     OK(uc_context_reg_read(ctx, UC_ARM_REG_PC, (void *)&pc));
@@ -11896,13 +12571,509 @@ static void test_arm_context_save(void)
     OK(uc_context_restore(uc, ctx));
 
     uc_common_setup(&uc2, UC_ARCH_ARM, UC_MODE_THUMB, code, sizeof(code) - 1,
-                    UC_CPU_ARM_CORTEX_A7); // Note the different CPU model
+                    UC_CPU_ARM_CORTEX_A7);
+    TEST_CHECK(uc_context_size(uc) != uc_context_size(uc2));
+    OK(uc_reg_write(uc2, UC_ARM_REG_R0, &target_r0));
+    OK(uc_close(uc));
 
     OK(uc_context_restore(uc2, ctx));
+    OK(uc_reg_read(uc2, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == saved_r0);
+
+    OK(uc_context_free(ctx));
+    OK(uc_close(uc2));
+}
+
+static void test_arm_context_cross_engine_after_source_close(void)
+{
+    const uc_mode mode = UC_MODE_THUMB | UC_MODE_MCLASS;
+    uc_engine *source;
+    uc_engine *destination;
+    uc_context *ctx;
+    uint32_t saved_r0 = 0x12345678;
+    uint32_t target_r0 = 0x87654321;
+    uint32_t read_r0;
+
+    OK(uc_open(UC_ARCH_ARM, mode, &source));
+    OK(uc_ctl_set_cpu_model(source, UC_CPU_ARM_CORTEX_M33));
+    OK(uc_open(UC_ARCH_ARM, mode, &destination));
+    OK(uc_ctl_set_cpu_model(destination, UC_CPU_ARM_CORTEX_M33));
+
+    OK(uc_reg_write(source, UC_ARM_REG_R0, &saved_r0));
+    OK(uc_context_alloc(source, &ctx));
+    OK(uc_context_save(source, ctx));
+    OK(uc_reg_write(destination, UC_ARM_REG_R0, &target_r0));
+    OK(uc_close(source));
+
+    OK(uc_context_restore(destination, ctx));
+    OK(uc_reg_read(destination, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == saved_r0);
+
+    OK(uc_context_free(ctx));
+    OK(uc_close(destination));
+}
+
+static void test_arm_context_serialized_restore(void)
+{
+    const uc_mode mode = UC_MODE_THUMB | UC_MODE_MCLASS;
+    uc_engine *source;
+    uc_engine *destination;
+    uc_context *source_ctx;
+    uc_context *restored_ctx;
+    uint8_t *serialized;
+    size_t context_size;
+    size_t payload_size;
+    uint32_t saved_r0 = 0x0badc0de;
+    uint32_t target_r0 = 0xf00dcafe;
+    uint32_t read_r0;
+
+    OK(uc_open(UC_ARCH_ARM, mode, &source));
+    OK(uc_ctl_set_cpu_model(source, UC_CPU_ARM_CORTEX_M33));
+    OK(uc_reg_write(source, UC_ARM_REG_R0, &saved_r0));
+    context_size = uc_context_size(source);
+    serialized = malloc(context_size);
+    TEST_ASSERT(serialized != NULL);
+    OK(uc_context_alloc(source, &source_ctx));
+    OK(uc_context_save(source, source_ctx));
+    memcpy(serialized, source_ctx, context_size);
+    OK(uc_context_free(source_ctx));
+    OK(uc_close(source));
+
+    OK(uc_open(UC_ARCH_ARM, mode, &destination));
+    OK(uc_ctl_set_cpu_model(destination, UC_CPU_ARM_CORTEX_M33));
+    TEST_CHECK(uc_context_size(destination) == context_size);
+    OK(uc_context_alloc(destination, &restored_ctx));
+    memcpy(restored_ctx, serialized, context_size);
+
+    OK(uc_context_restore(destination, restored_ctx));
+    OK(uc_reg_read(destination, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == saved_r0);
+
+    OK(uc_reg_write(destination, UC_ARM_REG_R0, &target_r0));
+    memcpy(&payload_size, restored_ctx, sizeof(payload_size));
+    TEST_ASSERT(payload_size != 0);
+    payload_size--;
+    memcpy(restored_ctx, &payload_size, sizeof(payload_size));
+    uc_assert_err(UC_ERR_ARG,
+                  uc_context_restore(destination, restored_ctx));
+    OK(uc_reg_read(destination, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == target_r0);
+
+    free(serialized);
+    OK(uc_context_free(restored_ctx));
+    OK(uc_close(destination));
+}
+
+static void test_arm_context_incompatible_mode(void)
+{
+    uc_engine *arm;
+    uc_engine *thumb;
+    uc_context *ctx;
+    uint32_t saved_r0 = 0x11223344;
+    uint32_t target_r0 = 0x55667788;
+    uint32_t read_r0;
+
+    OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &arm));
+    OK(uc_ctl_set_cpu_model(arm, UC_CPU_ARM_CORTEX_A15));
+    OK(uc_open(UC_ARCH_ARM, UC_MODE_THUMB, &thumb));
+    OK(uc_ctl_set_cpu_model(thumb, UC_CPU_ARM_CORTEX_A15));
+    TEST_CHECK(uc_context_size(arm) == uc_context_size(thumb));
+
+    OK(uc_reg_write(arm, UC_ARM_REG_R0, &saved_r0));
+    OK(uc_context_alloc(arm, &ctx));
+    OK(uc_context_save(arm, ctx));
+    OK(uc_reg_write(thumb, UC_ARM_REG_R0, &target_r0));
+
+    uc_assert_err(UC_ERR_ARG, uc_context_save(thumb, ctx));
+    OK(uc_context_reg_read(ctx, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == saved_r0);
+    OK(uc_reg_read(thumb, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == target_r0);
+
+    uc_assert_err(UC_ERR_ARG, uc_context_restore(thumb, ctx));
+    OK(uc_reg_read(thumb, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == target_r0);
+
+    OK(uc_context_free(ctx));
+    OK(uc_close(arm));
+    OK(uc_close(thumb));
+}
+
+static void test_arm_context_cross_model_size(void)
+{
+    const uc_mode mode = UC_MODE_THUMB | UC_MODE_MCLASS;
+    uc_engine *m0;
+    uc_engine *m33;
+    uc_context *m0_ctx;
+    uc_context *m33_ctx;
+    uint32_t m0_saved_r0 = 0x10203040;
+    uint32_t m33_saved_r0 = 0x50607080;
+    uint32_t m0_target_r0 = 0x90a0b0c0;
+    uint32_t m33_target_r0 = 0xd0e0f000;
+    uint32_t read_r0;
+
+    OK(uc_open(UC_ARCH_ARM, mode, &m0));
+    OK(uc_ctl_set_cpu_model(m0, UC_CPU_ARM_CORTEX_M0));
+    OK(uc_open(UC_ARCH_ARM, mode, &m33));
+    OK(uc_ctl_set_cpu_model(m33, UC_CPU_ARM_CORTEX_M33));
+    TEST_CHECK(uc_context_size(m0) != uc_context_size(m33));
+
+    OK(uc_reg_write(m0, UC_ARM_REG_R0, &m0_saved_r0));
+    OK(uc_context_alloc(m0, &m0_ctx));
+    OK(uc_context_save(m0, m0_ctx));
+    OK(uc_reg_write(m33, UC_ARM_REG_R0, &m33_saved_r0));
+    OK(uc_context_alloc(m33, &m33_ctx));
+    OK(uc_context_save(m33, m33_ctx));
+    OK(uc_reg_write(m0, UC_ARM_REG_R0, &m0_target_r0));
+    OK(uc_reg_write(m33, UC_ARM_REG_R0, &m33_target_r0));
+
+    uc_assert_err(UC_ERR_ARG, uc_context_save(m33, m0_ctx));
+    OK(uc_context_reg_read(m0_ctx, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == m0_saved_r0);
+    OK(uc_reg_read(m33, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == m33_target_r0);
+    OK(uc_context_restore(m33, m0_ctx));
+    OK(uc_reg_read(m33, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == m0_saved_r0);
+
+    OK(uc_context_restore(m0, m33_ctx));
+    OK(uc_reg_read(m0, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == m33_saved_r0);
+
+    OK(uc_reg_write(m0, UC_ARM_REG_R0, &m0_target_r0));
+    OK(uc_context_save(m0, m33_ctx));
+    OK(uc_context_reg_read(m33_ctx, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == m0_target_r0);
+
+    OK(uc_reg_write(m0, UC_ARM_REG_R0, &m33_target_r0));
+    OK(uc_context_restore(m0, m33_ctx));
+    OK(uc_reg_read(m0, UC_ARM_REG_R0, &read_r0));
+    TEST_CHECK(read_r0 == m0_target_r0);
+
+    OK(uc_context_free(m0_ctx));
+    OK(uc_context_free(m33_ctx));
+    OK(uc_close(m0));
+    OK(uc_close(m33));
+}
+
+static void test_arm_memory_context_cross_owner_save_unchanged(void)
+{
+    const uc_mode mode = UC_MODE_THUMB | UC_MODE_MCLASS;
+    const uint64_t address = 0x8000;
+    uc_engine *source;
+    uc_engine *other;
+    uc_context *context;
+    uint8_t *before;
+    size_t context_size;
+
+    OK(uc_open(UC_ARCH_ARM, mode, &source));
+    OK(uc_ctl_set_cpu_model(source, UC_CPU_ARM_CORTEX_M33));
+    OK(uc_open(UC_ARCH_ARM, mode, &other));
+    OK(uc_ctl_set_cpu_model(other, UC_CPU_ARM_CORTEX_M0));
+    TEST_CHECK(uc_context_size(source) > uc_context_size(other));
+    OK(uc_ctl_context_mode(source, UC_CTL_CONTEXT_MEMORY));
+    OK(uc_ctl_context_mode(other, UC_CTL_CONTEXT_MEMORY));
+    OK(uc_mem_map(source, address, 0x1000, UC_PROT_ALL));
+    OK(uc_mem_map(other, address, 0x1000, UC_PROT_ALL));
+
+    context_size = uc_context_size(source);
+    before = malloc(context_size);
+    TEST_ASSERT(before != NULL);
+    OK(uc_context_alloc(source, &context));
+    OK(uc_context_save(source, context));
+    memcpy(before, context, context_size);
+
+    uc_assert_err(UC_ERR_ARG, uc_context_save(other, context));
+    TEST_CHECK(memcmp(before, context, context_size) == 0);
+
+    free(before);
+    OK(uc_context_free(context));
+    OK(uc_close(source));
+    OK(uc_close(other));
+}
+
+static void test_arm_context_cross_model_features(void)
+{
+    const char code[] = "\x00\xf0\x04\x00"; /* and.w r0,r0,#4 */
+    uc_engine *source;
+    uc_engine *destination;
+    uc_context *ctx;
+    uint32_t r0 = 0x24;
+
+    uc_common_setup(&source, UC_ARCH_ARM, UC_MODE_THUMB, code,
+                    sizeof(code) - 1, UC_CPU_ARM_926);
+    uc_common_setup(&destination, UC_ARCH_ARM, UC_MODE_THUMB, code,
+                    sizeof(code) - 1, UC_CPU_ARM_CORTEX_A15);
+    OK(uc_reg_write(source, UC_ARM_REG_R0, &r0));
+    OK(uc_context_alloc(source, &ctx));
+    OK(uc_context_save(source, ctx));
+    OK(uc_close(source));
+
+    OK(uc_context_restore(destination, ctx));
+    OK(uc_emu_start(destination, code_start | 1,
+                    code_start + sizeof(code) - 1, 0, 0));
+    OK(uc_reg_read(destination, UC_ARM_REG_R0, &r0));
+    TEST_CHECK_(r0 == 4, "r0=0x%08x", r0);
+
+    OK(uc_context_free(ctx));
+    OK(uc_close(destination));
+}
+
+static void test_arm_context_source_close_debug_state(void)
+{
+    const uint32_t breakpoint_address = (uint32_t)code_start + 20;
+    const uint32_t watchpoint_address = (uint32_t)code_start + 0x100;
+    const uint32_t breakpoint_control = 1U | (1U << 1) | (0xfU << 5);
+    const uint32_t watchpoint_control =
+        1U | (1U << 1) | (2U << 3) | (0xfU << 5);
+    const uint32_t mdscr = 1U << 15;
+    const uint32_t stored_value = 0x12345678;
+    ArmIntrCapture capture = { 0 };
+    uc_engine *source;
+    uc_engine *destination;
+    uc_context *ctx;
+    uc_hook hook;
+    uint8_t code[28];
+
+    test_arm_emit32(code, 0, 0xee000e90);  /* mcr p14,0,r0,c0,c0,4 */
+    test_arm_emit32(code, 4, 0xee001eb0);  /* mcr p14,0,r1,c0,c0,5 */
+    test_arm_emit32(code, 8, 0xee002ed0);  /* mcr p14,0,r2,c0,c0,6 */
+    test_arm_emit32(code, 12, 0xee003ef0); /* mcr p14,0,r3,c0,c0,7 */
+    test_arm_emit32(code, 16, 0xee004e52); /* mcr p14,0,r4,c0,c2,2 */
+    test_arm_emit32(code, 20, 0xe1a05005); /* mov r5,r5 */
+    test_arm_emit32(code, 24, 0xe5826000); /* str r6,[r2] */
+
+    uc_common_setup(&source, UC_ARCH_ARM, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    uc_common_setup(&destination, UC_ARCH_ARM, UC_MODE_ARM,
+                    (const char *)code, sizeof(code),
+                    UC_CPU_ARM_CORTEX_A15);
+    OK(uc_reg_write(source, UC_ARM_REG_R0, &breakpoint_address));
+    OK(uc_reg_write(source, UC_ARM_REG_R1, &breakpoint_control));
+    OK(uc_reg_write(source, UC_ARM_REG_R2, &watchpoint_address));
+    OK(uc_reg_write(source, UC_ARM_REG_R3, &watchpoint_control));
+    OK(uc_reg_write(source, UC_ARM_REG_R4, &mdscr));
+    OK(uc_reg_write(source, UC_ARM_REG_R6, &stored_value));
+    OK(uc_emu_start(source, code_start, breakpoint_address, 0, 5));
+    TEST_CHECK(test_arm_cp14_read(source, 0, 4) == breakpoint_address);
+    TEST_CHECK(test_arm_cp14_read(source, 0, 5) == breakpoint_control);
+    TEST_CHECK(test_arm_cp14_read(source, 0, 6) == watchpoint_address);
+    TEST_CHECK(test_arm_cp14_read(source, 0, 7) == watchpoint_control);
+    TEST_CHECK(test_arm_cp14_read(source, 2, 2) == mdscr);
+    OK(uc_context_alloc(source, &ctx));
+    OK(uc_context_save(source, ctx));
+    OK(uc_hook_add(source, &hook, UC_HOOK_INTR,
+                   test_arm_intr_capture_cb, &capture, 1, 0));
+    OK(uc_emu_start(source, breakpoint_address,
+                    breakpoint_address + 4, 0, 1));
+    TEST_CHECK_(capture.count == 1,
+                "source breakpoint count=%u intno=%u",
+                capture.count, capture.intno);
+
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_emu_start(source, breakpoint_address + 4,
+                    breakpoint_address + 8, 0, 1));
+    TEST_CHECK_(capture.count == 1,
+                "source watchpoint count=%u intno=%u",
+                capture.count, capture.intno);
+
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_close(source));
+
+    OK(uc_context_restore(destination, ctx));
+    OK(uc_hook_add(destination, &hook, UC_HOOK_INTR,
+                   test_arm_intr_capture_cb, &capture, 1, 0));
+    OK(uc_emu_start(destination, breakpoint_address,
+                    breakpoint_address + 4, 0, 1));
+    TEST_CHECK_(capture.count == 1, "breakpoint count=%u intno=%u",
+                capture.count, capture.intno);
+
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_emu_start(destination, breakpoint_address + 4,
+                    breakpoint_address + 8, 0, 1));
+    TEST_CHECK_(capture.count == 1, "watchpoint count=%u intno=%u",
+                capture.count, capture.intno);
+
+    OK(uc_context_free(ctx));
+    OK(uc_close(destination));
+}
+
+static void test_arm_context_cross_model_debug_gating(void)
+{
+    const uint32_t breakpoint_address = (uint32_t)code_start + 20;
+    const uint32_t watchpoint_address = (uint32_t)code_start + 0x100;
+    const uint32_t breakpoint_control = 1U | (1U << 1) | (0xfU << 5);
+    const uint32_t watchpoint_control =
+        1U | (1U << 1) | (2U << 3) | (0xfU << 5);
+    const uint32_t mdscr = 1U << 15;
+    const uint32_t stored_value = 0x12345678;
+    ArmIntrCapture capture = { 0 };
+    uc_engine *source;
+    uc_engine *a8;
+    uc_engine *arm926;
+    uc_context *ctx;
+    uc_hook hook;
+    uint32_t actual;
+    uint8_t code[28];
+
+    test_arm_emit32(code, 0, 0xee000e95);  /* mcr p14,0,r0,c0,c5,4 */
+    test_arm_emit32(code, 4, 0xee001eb5);  /* mcr p14,0,r1,c0,c5,5 */
+    test_arm_emit32(code, 8, 0xee002ed3);  /* mcr p14,0,r2,c0,c3,6 */
+    test_arm_emit32(code, 12, 0xee003ef3); /* mcr p14,0,r3,c0,c3,7 */
+    test_arm_emit32(code, 16, 0xee004e52); /* mcr p14,0,r4,c0,c2,2 */
+    test_arm_emit32(code, 20, 0xe1a05005); /* mov r5,r5 */
+    test_arm_emit32(code, 24, 0xe5826000); /* str r6,[r2] */
+
+    uc_common_setup(&source, UC_ARCH_ARM, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A15);
+    uc_common_setup(&a8, UC_ARCH_ARM, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_CORTEX_A8);
+    uc_common_setup(&arm926, UC_ARCH_ARM, UC_MODE_ARM, (const char *)code,
+                    sizeof(code), UC_CPU_ARM_926);
+    OK(uc_reg_write(source, UC_ARM_REG_R0, &breakpoint_address));
+    OK(uc_reg_write(source, UC_ARM_REG_R1, &breakpoint_control));
+    OK(uc_reg_write(source, UC_ARM_REG_R2, &watchpoint_address));
+    OK(uc_reg_write(source, UC_ARM_REG_R3, &watchpoint_control));
+    OK(uc_reg_write(source, UC_ARM_REG_R4, &mdscr));
+    OK(uc_reg_write(source, UC_ARM_REG_R6, &stored_value));
+    OK(uc_emu_start(source, code_start, breakpoint_address, 0, 5));
+    TEST_CHECK(test_arm_cp14_read(source, 5, 4) == breakpoint_address);
+    TEST_CHECK(test_arm_cp14_read(source, 5, 5) == breakpoint_control);
+    TEST_CHECK(test_arm_cp14_read(source, 3, 6) == watchpoint_address);
+    TEST_CHECK(test_arm_cp14_read(source, 3, 7) == watchpoint_control);
+    OK(uc_context_alloc(source, &ctx));
+    OK(uc_context_save(source, ctx));
+    OK(uc_hook_add(source, &hook, UC_HOOK_INTR,
+                   test_arm_intr_capture_cb, &capture, 1, 0));
+
+    OK(uc_emu_start(source, breakpoint_address,
+                    breakpoint_address + 4, 0, 1));
+    TEST_CHECK_(capture.count == 1,
+                "source breakpoint count=%u intno=%u",
+                capture.count, capture.intno);
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_emu_start(source, breakpoint_address + 4,
+                    breakpoint_address + 8, 0, 1));
+    TEST_CHECK_(capture.count == 1,
+                "source watchpoint count=%u intno=%u",
+                capture.count, capture.intno);
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_close(source));
+
+    OK(uc_context_restore(a8, ctx));
+    OK(uc_hook_add(a8, &hook, UC_HOOK_INTR, test_arm_intr_capture_cb,
+                   &capture, 1, 0));
+    OK(uc_emu_start(a8, breakpoint_address,
+                    breakpoint_address + 4, 0, 1));
+    TEST_CHECK_(capture.count == 1,
+                "A8 breakpoint count=%u intno=%u",
+                capture.count, capture.intno);
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_emu_start(a8, breakpoint_address + 4,
+                    breakpoint_address + 8, 0, 1));
+    TEST_CHECK_(capture.count == 0,
+                "A8 unsupported watchpoint count=%u intno=%u",
+                capture.count, capture.intno);
+    OK(uc_mem_read(a8, watchpoint_address, &actual, sizeof(actual)));
+    TEST_CHECK(actual == stored_value);
+    OK(uc_close(a8));
+
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_context_restore(arm926, ctx));
+    OK(uc_hook_add(arm926, &hook, UC_HOOK_INTR,
+                   test_arm_intr_capture_cb, &capture, 1, 0));
+    OK(uc_emu_start(arm926, breakpoint_address,
+                    breakpoint_address + 4, 0, 1));
+    TEST_CHECK_(capture.count == 0,
+                "ARM926 unsupported breakpoint count=%u intno=%u",
+                capture.count, capture.intno);
+    capture.count = 0;
+    capture.intno = 0;
+    OK(uc_emu_start(arm926, breakpoint_address + 4,
+                    breakpoint_address + 8, 0, 1));
+    TEST_CHECK_(capture.count == 0,
+                "ARM926 unsupported watchpoint count=%u intno=%u",
+                capture.count, capture.intno);
+    OK(uc_mem_read(arm926, watchpoint_address, &actual, sizeof(actual)));
+    TEST_CHECK(actual == stored_value);
+
+    OK(uc_context_free(ctx));
+    OK(uc_close(arm926));
+}
+
+static void test_arm_context_malformed_cpu_memory_atomic(void)
+{
+    const uint32_t data_address = (uint32_t)code_start + 0x2000;
+    const uint32_t saved_memory = 0x11223344;
+    const uint32_t current_memory = 0xaabbccdd;
+    const uint32_t saved_r0 = 0x12345678;
+    const uint32_t current_r0 = 0x87654321;
+    const char code[] = "\x00\xf0\x20\xe3"; /* nop */
+    uc_engine *uc;
+    uc_context *ctx;
+    size_t payload_size;
+    uint32_t actual;
+
+    uc_common_setup(&uc, UC_ARCH_ARM,
+                    UC_MODE_THUMB | UC_MODE_MCLASS, code,
+                    sizeof(code) - 1, UC_CPU_ARM_CORTEX_M33);
+    OK(uc_ctl_context_mode(uc,
+                           UC_CTL_CONTEXT_CPU | UC_CTL_CONTEXT_MEMORY));
+    OK(uc_mem_write(uc, data_address, &saved_memory, sizeof(saved_memory)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &saved_r0));
+    OK(uc_context_alloc(uc, &ctx));
+    OK(uc_context_save(uc, ctx));
+
+    OK(uc_mem_write(uc, data_address, &current_memory,
+                    sizeof(current_memory)));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &current_r0));
+    memcpy(&payload_size, ctx, sizeof(payload_size));
+    TEST_ASSERT(payload_size != 0);
+    payload_size--;
+    memcpy(ctx, &payload_size, sizeof(payload_size));
+
+    uc_assert_err(UC_ERR_ARG, uc_context_restore(uc, ctx));
+    OK(uc_mem_read(uc, data_address, &actual, sizeof(actual)));
+    TEST_CHECK_(actual == current_memory, "memory=0x%08x", actual);
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &actual));
+    TEST_CHECK_(actual == current_r0, "r0=0x%08x", actual);
 
     OK(uc_context_free(ctx));
     OK(uc_close(uc));
-    OK(uc_close(uc2));
+}
+
+static void test_arm_context_raw_buffer(void)
+{
+    const uint32_t saved_r0 = 0x12345678;
+    const uint32_t current_r0 = 0x87654321;
+    uc_engine *uc;
+    uc_context *ctx;
+    size_t context_size;
+    uint32_t actual;
+
+    OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc));
+    OK(uc_ctl_set_cpu_model(uc, UC_CPU_ARM_CORTEX_A15));
+    context_size = uc_context_size(uc);
+    ctx = (uc_context *)malloc(context_size);
+    TEST_ASSERT(ctx != NULL);
+    memset(ctx, 0xa5, context_size);
+
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &saved_r0));
+    OK(uc_context_save(uc, ctx));
+    OK(uc_reg_write(uc, UC_ARM_REG_R0, &current_r0));
+    OK(uc_context_restore(uc, ctx));
+    OK(uc_reg_read(uc, UC_ARM_REG_R0, &actual));
+    TEST_CHECK_(actual == saved_r0, "r0=0x%08x", actual);
+
+    free(ctx);
+    OK(uc_close(uc));
 }
 
 static void test_arm_thumb2(void)
@@ -11945,9 +13116,9 @@ static void test_armeb_be32_thumb2(void)
     OK(uc_close(uc));
 }
 
-static bool test_arm_mem_read_write_cb(uc_engine *uc, int type,
-                                       uint64_t address, int size,
-                                       int64_t value, void *user_data)
+static void test_arm_mem_read_write_cb(uc_engine *uc, uc_mem_type type,
+                                      uint64_t address, int size,
+                                      int64_t value, void *user_data)
 {
     uint64_t *count = (uint64_t *)user_data;
     uint64_t total = count[0] + count[1];
@@ -11964,7 +13135,6 @@ static bool test_arm_mem_read_write_cb(uc_engine *uc, int type,
         break;
     }
 
-    return 0;
 }
 static void test_arm_mem_hook_read_write(void)
 {
@@ -12137,12 +13307,14 @@ typedef struct {
 
 static void _uc_hook_sub_cmp(uc_engine *uc, uint64_t address, uint64_t arg1,
                              uint64_t arg2, uint32_t size,
-                             _last_cmp_info *user_data)
+                             void *user_data)
 {
-    user_data->pc = address;
-    user_data->size = size;
-    user_data->v0 = arg1;
-    user_data->v1 = arg2;
+    _last_cmp_info *cmp_info = user_data;
+
+    cmp_info->pc = address;
+    cmp_info->size = size;
+    cmp_info->v0 = arg1;
+    cmp_info->v1 = arg2;
 }
 
 static void test_arm_tcg_opcode_cmp(void)
@@ -12272,7 +13444,7 @@ static bool test_arm_v7_lpae_hook_tlb(uc_engine *uc, uint64_t addr,
 
 static void test_arm_v7_lpae_hook_read(uc_engine *uc, uc_mem_type type,
                                        uint64_t address, int size,
-                                       uint64_t value, void *user_data)
+                                       int64_t value, void *user_data)
 {
     TEST_CHECK(address == 0x100001000);
 }
@@ -12303,7 +13475,8 @@ static void test_arm_v7_lpae(void)
     OK(uc_close(uc));
 }
 
-static void test_arm_svc_interrupt(uc_engine *uc, int intno, void *user_data)
+static void test_arm_svc_interrupt(uc_engine *uc, uint32_t intno,
+                                   void *user_data)
 {
     uint32_t esr;
     OK(uc_reg_read(uc, UC_ARM_REG_ESR, &esr));
@@ -12366,6 +13539,8 @@ static void test_arm_hook_insn_wfi(void)
 }
 
 TEST_LIST = {{"test_arm_nop", test_arm_nop},
+             {"test_arm_query_initial_thumb_mode",
+              test_arm_query_initial_thumb_mode},
              {"test_arm_legacy_count_transition",
               test_arm_legacy_count_transition},
              {"test_arm_exclusive_monitor", test_arm_exclusive_monitor},
@@ -12376,6 +13551,13 @@ TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_armeb_be8_sub", test_armeb_be8_sub},
              {"test_arm_thumbeb_sub", test_arm_thumbeb_sub},
              {"test_arm_thumb_ite", test_arm_thumb_ite},
+             {"test_arm_thumb_it_pending_stop",
+              test_arm_thumb_it_pending_stop},
+             {"test_arm_fetch_predicate", test_arm_fetch_predicate},
+             {"test_arm_thumb_fetch_predicate",
+              test_arm_thumb_fetch_predicate},
+             {"test_arm_fetch_predicate_code_mutation",
+              test_arm_fetch_predicate_code_mutation},
              {"test_arm_m_thumb_mrs", test_arm_m_thumb_mrs},
              {"test_arm_i8mm", test_arm_i8mm},
              {"test_arm_bf16", test_arm_bf16},
@@ -12386,10 +13568,13 @@ TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_arm_m55_fpscr_ltpsize", test_arm_m55_fpscr_ltpsize},
              {"test_arm_m55_fpscr_nzcvqc_sysreg",
               test_arm_m55_fpscr_nzcvqc_sysreg},
+             {"test_arm_m55_vlldm", test_arm_m55_vlldm},
              {"test_arm_m55_vlstm_lazy_preserve",
               test_arm_m55_vlstm_lazy_preserve},
              {"test_arm_m55_vlstm_lazy_fault",
               test_arm_m55_vlstm_lazy_fault},
+             {"test_arm_m55_fpcxt_s", test_arm_m55_fpcxt_s},
+             {"test_arm_m55_fpcxt_ns", test_arm_m55_fpcxt_ns},
              {"test_arm_m55_sysreg_mem", test_arm_m55_sysreg_mem},
              {"test_arm_m55_vscclrm", test_arm_m55_vscclrm},
              {"test_arm_m55_vctp", test_arm_m55_vctp},
@@ -12467,6 +13652,26 @@ TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_arm_switch_endian", test_arm_switch_endian},
              {"test_armeb_ldrb", test_armeb_ldrb},
              {"test_arm_context_save", test_arm_context_save},
+             {"test_arm_context_cross_engine_after_source_close",
+              test_arm_context_cross_engine_after_source_close},
+             {"test_arm_context_serialized_restore",
+              test_arm_context_serialized_restore},
+             {"test_arm_context_incompatible_mode",
+              test_arm_context_incompatible_mode},
+             {"test_arm_context_cross_model_size",
+              test_arm_context_cross_model_size},
+             {"test_arm_memory_context_cross_owner_save_unchanged",
+              test_arm_memory_context_cross_owner_save_unchanged},
+             {"test_arm_context_cross_model_features",
+              test_arm_context_cross_model_features},
+             {"test_arm_context_source_close_debug_state",
+              test_arm_context_source_close_debug_state},
+             {"test_arm_context_cross_model_debug_gating",
+              test_arm_context_cross_model_debug_gating},
+             {"test_arm_context_malformed_cpu_memory_atomic",
+              test_arm_context_malformed_cpu_memory_atomic},
+             {"test_arm_context_raw_buffer",
+              test_arm_context_raw_buffer},
              {"test_arm_thumb2", test_arm_thumb2},
              {"test_armeb_be32_thumb2", test_armeb_be32_thumb2},
              {"test_arm_mem_hook_read_write", test_arm_mem_hook_read_write},

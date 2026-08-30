@@ -1,0 +1,23 @@
+# target sha256 url
+fuzz_emu_arm_arm 7c60b7bb6907e670ff12686e1f9d7dc89be248826c16dc32cb597d5a7b85d568 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_arm_arm/public.zip
+fuzz_emu_arm_armbe a4a1b7fbc8776ece467cab816d03ab03f2c067bfe2cd9dcd9f82b361de1e3c7f https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_arm_armbe/public.zip
+fuzz_emu_arm_thumb 9be72fef8e91bd4431c4fcaeb8748506e16b49b5d2e6fabbde11044a8152d552 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_arm_thumb/public.zip
+fuzz_emu_arm64_arm b842a9596be46cf8aec331c6d7d3056d1ee67a87fdb75663a7999a64056ff17a https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_arm64_arm/public.zip
+fuzz_emu_arm64_armbe 7ea32599d636317e53287dd7a56013a42a15acd575f2a636e9ed04904edbf199 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_arm64_armbe/public.zip
+fuzz_emu_m68k_be c88366d7949afbe679e5cfc34a02165d9132af4e2398e78622cb3e7a1c5d55df https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_m68k_be/public.zip
+fuzz_emu_mips_32be 777e7e6c788fcba4e673fbb6e6a1aa995a578b7aae6395ba167cc0f92a0abbbb https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_mips_32be/public.zip
+fuzz_emu_mips_32le f09bd198b11898335627ba1db4ad926b5948b2ff93bcacfdcfd5f3d62b50b565 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_mips_32le/public.zip
+fuzz_emu_mips_64be - -
+fuzz_emu_mips_64le - -
+fuzz_emu_ppc_32be - -
+fuzz_emu_ppc_64be - -
+fuzz_emu_riscv_32le - -
+fuzz_emu_riscv_64le - -
+fuzz_emu_s390x_be 73b83433f15c9d0a1cc62af4b91a2de1730bb86da1a119fd29dec17764205645 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_s390x_be/public.zip
+fuzz_emu_sparc_32be 6d2976512a0a852c68b999e42298572499699dc9fda06721de27724dfd82a034 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_sparc_32be/public.zip
+fuzz_emu_sparc_64be - -
+fuzz_emu_tricore_le - -
+fuzz_emu_x86_16 d7bbaef28b70c04545945ca95986dde6e842ed4f5591db6a9241ffedbd323d6e https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_x86_16/public.zip
+fuzz_emu_x86_32 1198bbf040045859f0c31433ecf345f5df11b872867e2db30bbef891ae9540b6 https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_x86_32/public.zip
+fuzz_emu_x86_64 ae3b30cb3c2630cb327d3e9f0febb31179a6faa27858229e317b5decb7dba6be https://storage.googleapis.com/unicorn-backup.clusterfuzz-external.appspot.com/corpus/libFuzzer/unicorn_fuzz_emu_x86_64/public.zip
+fuzz_uc_api - -

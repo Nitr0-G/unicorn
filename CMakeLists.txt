@@ -86,6 +86,8 @@ option(UNICORN_FUZZ "Enable fuzzing" OFF)
 option(UNICORN_FUZZ_LIBFUZZER "Build fuzz targets with libFuzzer" OFF)
 option(UNICORN_LOGGING "Enable logging" OFF)
 option(UNICORN_BUILD_TESTS "Build unicorn tests" ${PROJECT_IS_TOP_LEVEL})
+option(UNICORN_TEST_PYTHON_REGRESSIONS
+    "Run Python regressions against the current shared library" OFF)
 option(UNICORN_INSTALL "Enable unicorn installation" ${PROJECT_IS_TOP_LEVEL})
 option(UNICORN_ENABLE_LTO "Enable interprocedural optimization" OFF)
 set(UNICORN_ARCH "x86;arm;aarch64;riscv;mips;sparc;m68k;ppc;s390x;tricore" CACHE STRING "Enabled unicorn architectures")
@@ -1640,6 +1642,15 @@ if(UNICORN_FUZZ)
 endif()
 
 if(UNICORN_BUILD_TESTS)
+    include(cmake/Acutest.cmake)
+    if(UNICORN_HAS_X86 AND NOT ANDROID_ABI)
+        target_compile_definitions(unicorn PRIVATE
+            UNICORN_TEST_ALLOC_FAILURE)
+        if(TARGET unicorn_static)
+            target_compile_definitions(unicorn_static PRIVATE
+                UNICORN_TEST_ALLOC_FAILURE)
+        endif()
+    endif()
     set(UNICORN_CTEST_PARALLEL_LEVEL "40" CACHE STRING
         "Default CTest parallel job count")
     if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.17 AND NOT CMAKE_CTEST_ARGUMENTS)
@@ -1677,18 +1688,114 @@ if(UNICORN_BUILD_TESTS)
         target_link_libraries(${TEST_FILE} PRIVATE
             ${SAMPLES_LIB}
         )
-        add_test(${TEST_FILE} ${TEST_FILE})
-        set_tests_properties(${TEST_FILE} PROPERTIES TIMEOUT 900)
         if(ANDROID_ABI)
             file(APPEND ${CMAKE_BINARY_DIR}/adb.sh "adb push ${TEST_FILE} /data/local/tmp/build/\n")
             file(APPEND ${CMAKE_BINARY_DIR}/adb.sh "adb shell \"chmod +x /data/local/tmp/build/${TEST_FILE}\"\n")
-            file(APPEND ${CMAKE_BINARY_DIR}/adb.sh "adb shell \'LD_LIBRARY_PATH=/data/local/tmp/build:$LD_LIBRARY_PATH /data/local/tmp/build/${TEST_FILE}\' || exit -1\n")
         endif()
+        string(REGEX REPLACE "^test_" "" TEST_ARCHITECTURE "${TEST_FILE}")
+        unicorn_discover_acutest(
+            ${TEST_FILE}
+            900
+            "unit;${TEST_ARCHITECTURE}"
+        )
         if (UNICORN_TARGET_ARCH STREQUAL "aarch64" OR UNICORN_TARGET_ARCH STREQUAL "ppc")
             target_compile_definitions(${TEST_FILE} PRIVATE TARGET_READ_INLINED)
         endif()
     endforeach()
+    if(UNICORN_HAS_ARM AND NOT ANDROID_ABI)
+        add_executable(test_arm_m_profile_internal
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/internal/test_arm_m_profile.c
+        )
+        target_compile_definitions(test_arm_m_profile_internal PRIVATE
+            NEED_CPU_H
+        )
+        target_compile_options(test_arm_m_profile_internal PRIVATE
+            ${UNICORN_COMPILE_OPTIONS}
+        )
+        target_include_directories(test_arm_m_profile_internal PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
+            ${CMAKE_CURRENT_SOURCE_DIR}/qemu/target/arm
+        )
+        if(MSVC)
+            target_compile_options(test_arm_m_profile_internal PRIVATE
+                /FIarm.h
+            )
+            target_include_directories(test_arm_m_profile_internal PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/msvc/arm-softmmu
+            )
+        else()
+            target_compile_options(test_arm_m_profile_internal PRIVATE
+                -include arm.h
+            )
+            target_include_directories(test_arm_m_profile_internal PRIVATE
+                ${CMAKE_BINARY_DIR}/arm-softmmu
+            )
+        endif()
+        target_link_libraries(test_arm_m_profile_internal PRIVATE
+            ${SAMPLES_LIB}
+        )
+        unicorn_discover_acutest(
+            test_arm_m_profile_internal
+            900
+            "unit;internal;arm"
+        )
+        add_dependencies(test_parallel test_arm_m_profile_internal)
+    endif()
+    if(UNICORN_HAS_X86 AND NOT ANDROID_ABI)
+        add_executable(test_alloc_failure
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/internal/test_alloc_failure.c
+        )
+        target_compile_options(test_alloc_failure PRIVATE
+            ${UNICORN_COMPILE_OPTIONS}
+        )
+        target_include_directories(test_alloc_failure PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
+        )
+        target_link_libraries(test_alloc_failure PRIVATE
+            ${SAMPLES_LIB}
+        )
+        unicorn_discover_acutest(
+            test_alloc_failure
+            900
+            "unit;internal;memory"
+        )
+        add_dependencies(test_parallel test_alloc_failure)
+    endif()
     include(${CMAKE_CURRENT_SOURCE_DIR}/tests/regress/CMakeLists.txt)
+    if(UNICORN_TEST_PYTHON_REGRESSIONS)
+        if(CMAKE_CROSSCOMPILING OR NOT BUILD_SHARED_LIBS)
+            message(STATUS
+                "Python regressions require a native shared-library build")
+        else()
+            if(POLICY CMP0148)
+                cmake_policy(SET CMP0148 OLD)
+            endif()
+            find_package(PythonInterp 3.7 REQUIRED)
+            file(GLOB PYTHON_REGRESSION_FILES
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/regress/*.py)
+            foreach(PYTHON_REGRESSION ${PYTHON_REGRESSION_FILES})
+                get_filename_component(PYTHON_REGRESSION_NAME
+                    ${PYTHON_REGRESSION} NAME_WE)
+                if(PYTHON_REGRESSION_NAME STREQUAL "regress")
+                    continue()
+                endif()
+                add_test(
+                    NAME python-regression.${PYTHON_REGRESSION_NAME}
+                    COMMAND ${PYTHON_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/regress/runner/run_python_regression.py
+                        --binding ${CMAKE_CURRENT_SOURCE_DIR}/bindings/python
+                        --library $<TARGET_FILE:unicorn>
+                        --test ${PYTHON_REGRESSION}
+                        --timeout 60
+                )
+                set_tests_properties(
+                    python-regression.${PYTHON_REGRESSION_NAME} PROPERTIES
+                    LABELS "python-regression"
+                    TIMEOUT 75
+                )
+            endforeach()
+        endif()
+    endif()
     if(UNICORN_TEST_FILE OR UNICORN_REGRESSION_TARGETS)
         add_dependencies(test_parallel
             ${UNICORN_TEST_FILE}

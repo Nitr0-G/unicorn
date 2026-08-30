@@ -13,6 +13,7 @@ $ cstool riscv64 1305100093850502
 #endif
 // #define RISCV_CODE "\x13\x05\x10\x00\x93\x85\x05\x02\x93\x85\x05\x02"
 #define RISCV_CODE "\x13\x05\x10\x00\x93\x85\x05\x02"
+#define RISCV_CODE_LOOP "\x6f\x00\x00\x00"
 
 // memory address where emulation starts
 #define ADDRESS 0x10000
@@ -291,12 +292,12 @@ static void test_riscv_step(void)
 static void test_riscv_timeout(void)
 {
     uc_engine *uc;
-    uc_hook trace1, trace2;
     uc_err err;
 
     uint32_t a0 = 0x1234;
     uint32_t a1 = 0x7890;
     uint32_t pc = 0x0000;
+    size_t timed_out;
 
     printf("Emulate RISCV code: timeout\n");
 
@@ -312,38 +313,44 @@ static void test_riscv_timeout(void)
     uc_mem_map(uc, ADDRESS, 2 * 1024 * 1024, UC_PROT_ALL);
 
     // write machine code to be emulated to memory
-    uc_mem_write(uc, ADDRESS, "\x00\x00\x00\x00\x00\x00\x00\x00", 8);
+    uc_mem_write(uc, ADDRESS, RISCV_CODE_LOOP, sizeof(RISCV_CODE_LOOP) - 1);
 
     // initialize machine registers
     uc_reg_write(uc, UC_RISCV_REG_A0, &a0);
     uc_reg_write(uc, UC_RISCV_REG_A1, &a1);
 
-    // tracing all basic blocks with customized callback
-    uc_hook_add(uc, &trace1, UC_HOOK_BLOCK, hook_block, NULL, 1, 0);
-
-    // tracing all instruction
-    uc_hook_add(uc, &trace2, UC_HOOK_CODE, hook_code, NULL, 1, 0);
-
-    // emulate 1 instruction with timeout
-    err = uc_emu_start(uc, ADDRESS, ADDRESS + 4, 1000, 1);
+    // emulate an infinite loop with timeout
+    err = uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(RISCV_CODE_LOOP) - 1,
+                       UC_SECOND_SCALE / 1000, 0);
     if (err) {
         printf("Failed on uc_emu_start() with error returned: %u\n", err);
     }
+    uc_query(uc, UC_QUERY_TIMEOUT, &timed_out);
     uc_reg_read(uc, UC_RISCV_REG_PC, &pc);
 
-    if (pc != 0x10000) {
-        printf("Error after step: PC is: 0x%x, expected was 0x10004\n", pc);
+    if (!timed_out) {
+        printf("Error: emulation did not time out\n");
+    }
+    if (pc != ADDRESS) {
+        printf("Error after timeout: PC is: 0x%x, expected was 0x%x\n", pc,
+               ADDRESS);
     }
 
-    // emulate 1 instruction with timeout
-    err = uc_emu_start(uc, ADDRESS, ADDRESS + 4, 1000, 1);
+    // repeat to demonstrate that timeout emulation can be reused
+    err = uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(RISCV_CODE_LOOP) - 1,
+                       UC_SECOND_SCALE / 1000, 0);
     if (err) {
         printf("Failed on uc_emu_start() with error returned: %u\n", err);
     }
+    uc_query(uc, UC_QUERY_TIMEOUT, &timed_out);
     uc_reg_read(uc, UC_RISCV_REG_PC, &pc);
 
-    if (pc != 0x10000) {
-        printf("Error after step: PC is: 0x%x, expected was 0x10004\n", pc);
+    if (!timed_out) {
+        printf("Error: emulation did not time out\n");
+    }
+    if (pc != ADDRESS) {
+        printf("Error after timeout: PC is: 0x%x, expected was 0x%x\n", pc,
+               ADDRESS);
     }
 
     // now print out some registers
@@ -460,7 +467,7 @@ static void test_recover_from_illegal(void)
 
     // emulate 1 instruction, wrong address, illegal code
     err = uc_emu_start(uc, 0x1000, -1, 0, 1);
-    if (err != UC_ERR_INSN_INVALID) {
+    if (err != UC_ERR_EXCEPTION) {
         printf("Expected Illegal Instruction error, got: %u\n", err);
     }
 

@@ -4,9 +4,15 @@ CMD_PATH=$(realpath $0)
 SOURCE_DIR=$(dirname ${CMD_PATH})
 
 COMMON_SYMBOLS="
+gen_helper_check_counted_entry \
 gen_helper_check_exit_request \
+gen_helper_exit_request \
+helper_check_counted_entry \
+helper_check_exit_request \
+helper_exit_request \
 helper_uc_tracecode_single \
 cpu_restore_icount \
+cpu_tcg_exit_request \
 unicorn_fill_tlb \
 reg_read \
 reg_write \
@@ -58,6 +64,8 @@ vm_start \
 address_space_dispatch_compact \
 flatview_translate \
 flatview_copy \
+flatview_reserve \
+address_space_restore_flatview \
 address_space_translate_for_iotlb \
 qemu_get_cpu \
 cpu_address_space_init \
@@ -133,6 +141,10 @@ memory_cow \
 memory_unmap \
 memory_moveout \
 memory_movein \
+memory_mapping_restore_topology \
+memory_mapping_free \
+memory_mapping_prune \
+memory_mapping_normalize \
 memory_free \
 flatview_unref \
 address_space_get_flatview \
@@ -7414,6 +7426,7 @@ riscv_cpu_debug_excp_handler \
 riscv_cpu_debug_check_breakpoint \
 riscv_cpu_debug_check_watchpoint \
 riscv_trigger_init \
+riscv_trigger_update_all \
 riscv_cpu_get_fflags \
 riscv_cpu_set_fflags \
 helper_set_rounding_mode \

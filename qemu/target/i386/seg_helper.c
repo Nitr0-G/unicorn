@@ -987,6 +987,7 @@ void helper_syscall(CPUX86State *env, int next_eip_addend)
             continue;
         if (hook->insn == UC_X86_INS_SYSCALL) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;
@@ -2374,6 +2375,7 @@ void helper_sysenter(CPUX86State *env, int next_eip_addend)
             continue;
         if (hook->insn == UC_X86_INS_SYSENTER) {
             uintptr_t pc = GETPC();
+            uc->tb_exec_frame_publish(uc, pc);
             if (!synced && !uc->skip_sync_pc_on_exit && pc) {
                 cpu_restore_state(uc->cpu, pc, false);
                 synced = true;

@@ -31,7 +31,6 @@ on:
 env:
   # Specify build type either according to the tag release or manual override
   BUILD_TYPE: ${{ inputs.buildType != '' && inputs.buildType || startsWith(github.ref, 'refs/tags') && 'Release' || 'Debug' }}
-  CTEST_PARALLEL_LEVEL: 40
 
 jobs:
   Windows:
@@ -129,6 +128,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 'Determine test parallelism'
+        shell: pwsh
+        run: |
+          "CTEST_PARALLEL_LEVEL=$([Environment]::ProcessorCount)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: '🛠️ Win MINGW setup'
         if: contains(matrix.config.mingw, 'MINGW')
         uses: msys2/setup-msys2@v2
@@ -168,7 +173,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip --config ${{ env.BUILD_TYPE }}
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
           # vctip.exe (MSVC telemetry) and antivirus scans may transiently hold
           # handles inside the build directory and make the rename fail, so
           # retry for a while, killing vctip on each attempt
@@ -204,7 +209,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip --config ${{ env.BUILD_TYPE }}
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
           # vctip.exe (MSVC telemetry) and antivirus scans may transiently hold
           # handles inside the build directory and make the rename fail, so
           # retry for a while, killing vctip on each attempt
@@ -242,7 +247,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '📦 Pack artifact'
         if: always()
@@ -331,6 +336,9 @@ jobs:
         compiler: [ gcc ]
     steps:
       - uses: actions/checkout@v4
+      - name: 'Determine test parallelism'
+        shell: bash
+        run: echo "CTEST_PARALLEL_LEVEL=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
       - name: '🚧 Mac build'
         if: contains(matrix.config.name, 'macos')
         shell: bash
@@ -350,7 +358,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '🚧 Android x86_64 build'
         if: contains(matrix.config.name, 'android')
@@ -499,6 +507,9 @@ jobs:
         compiler: [ gcc ]
     steps:
       - uses: actions/checkout@v4
+      - name: 'Determine test parallelism'
+        shell: bash
+        run: echo "CTEST_PARALLEL_LEVEL=$(getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
       - name: '🚧 Linux x64/x86 build'
         if: contains(matrix.config.arch, 'x64') || contains(matrix.config.arch, 'x86')
         shell: bash
@@ -524,7 +535,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '🚧 Linux aarch64 build'
         if: contains(matrix.config.arch, 'aarch64')
@@ -542,7 +553,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX:PATH=instdir
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '🚧 Linux ppc64le build'
         if: contains(matrix.config.arch, 'ppc64le')
@@ -568,7 +579,7 @@ jobs:
               -DCMAKE_INSTALL_PREFIX:PATH=/instdir
             cmake --build . --config ${{ env.BUILD_TYPE }}
             cmake --install . --strip
-            ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+            ctest --parallel "$(getconf _NPROCESSORS_ONLN)" --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '📦 Pack artifact'
         if: always()
@@ -596,6 +607,133 @@ jobs:
           name: ${{ matrix.config.artifact }}
           compression-level: 0
           overwrite: true
+
+  PythonRegressions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: 'python regressions'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 'Build current Python binding library'
+        shell: bash
+        run: |
+          workers=$(getconf _NPROCESSORS_ONLN)
+          python_executable=$(python -c 'import sys; print(sys.executable)')
+          python -m pip install --disable-pip-version-check capstone==6.0.0a2
+          cmake \
+            -S . \
+            -B build-python-regressions \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DPYTHON_EXECUTABLE="$python_executable" \
+            -DUNICORN_TEST_PYTHON_REGRESSIONS=ON
+          cmake --build build-python-regressions \
+            --target unicorn --parallel "$workers"
+          ctest \
+            --test-dir build-python-regressions \
+            --label-regex python-regression \
+            --parallel "$workers" \
+            --no-tests=error \
+            --output-on-failure
+
+  FuzzSanitizers:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: 'clang asan ubsan libfuzzer'
+    env:
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: 'Build fuzz targets'
+        shell: bash
+        run: |
+          workers=$(getconf _NPROCESSORS_ONLN)
+          sanitizer_flags='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer'
+          cmake \
+            -S . \
+            -B build-fuzz \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_C_FLAGS="$sanitizer_flags" \
+            -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=address,undefined' \
+            -DUNICORN_BUILD_TESTS=OFF \
+            -DUNICORN_FUZZ=ON \
+            -DUNICORN_FUZZ_LIBFUZZER=ON \
+            -DUNICORN_INSTALL=OFF
+          cmake --build build-fuzz --parallel "$workers"
+      - name: 'Run nested timeout sanitizer regression'
+        shell: bash
+        run: |
+          workers=$(getconf _NPROCESSORS_ONLN)
+          sanitizer_flags='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer'
+          cmake \
+            -S . \
+            -B build-sanitizer-tests \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_C_FLAGS="$sanitizer_flags" \
+            -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=address,undefined' \
+            -DUNICORN_ARCH=x86 \
+            -DUNICORN_BUILD_TESTS=ON \
+            -DUNICORN_FUZZ=OFF \
+            -DUNICORN_INSTALL=OFF
+          cmake --build build-sanitizer-tests \
+            --target test_ctl --parallel "$workers"
+          ctest \
+            --test-dir build-sanitizer-tests \
+            --show-only \
+            --tests-regex '^unit[.]test_ctl[.]test_uc_nested_timeout$'
+          timeout --signal=TERM --kill-after=5s 60s ctest \
+            --test-dir build-sanitizer-tests \
+            --tests-regex '^unit[.]test_ctl[.]test_uc_nested_timeout$' \
+            --no-tests=error \
+            --output-on-failure
+      - name: 'Run fuzz'
+        shell: bash
+        run: |
+          cp -R tests/fuzz/corpus/fuzz_uc_api build-fuzz/corpus-api
+          mkdir -p build-fuzz/artifacts
+          for target_path in build-fuzz/fuzz_emu_*; do
+            if [ ! -x "$target_path" ]; then
+              continue
+            fi
+            target=$(basename "$target_path")
+            artifact_dir="build-fuzz/artifacts/$target/"
+            corpus_dir=$(mktemp -d "build-fuzz/corpus-$target.XXXXXX")
+            cp -R tests/fuzz/corpus/raw/. "$corpus_dir"
+            mkdir -p "$artifact_dir"
+            "$target_path" \
+              -runs=64 \
+              -timeout=5 \
+              -max_len=4096 \
+              -artifact_prefix="$artifact_dir" \
+              -dict=tests/fuzz/corpus/fuzz_emu.dict \
+              "$corpus_dir"
+          done
+          mkdir -p build-fuzz/artifacts/fuzz_uc_api
+          build-fuzz/fuzz_uc_api \
+            -runs=128 \
+            -timeout=5 \
+            -max_len=4096 \
+            -artifact_prefix=build-fuzz/artifacts/fuzz_uc_api/ \
+            -dict=tests/fuzz/corpus/fuzz_uc_api.dict \
+            build-fuzz/corpus-api
+      - name: '📤 Upload fuzz artifacts'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-sanitizer-artifacts
+          path: build-fuzz/artifacts
+          if-no-files-found: ignore
 
   AlpineLinux:
     runs-on: ${{ matrix.config.os }}
@@ -662,6 +800,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 'Determine test parallelism'
+        shell: bash
+        run: echo "CTEST_PARALLEL_LEVEL=$(getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
+
       - name: 'Bootstrap Alpine apk-tools'
         shell: bash
         env:
@@ -715,7 +857,7 @@ jobs:
             -DBUILD_SHARED_LIBS=${{ matrix.config.shared }}
           cmake --build . --config ${{ env.BUILD_TYPE }}
           cmake --install . --strip
-          ctest --parallel ${{ env.CTEST_PARALLEL_LEVEL }} --output-on-failure -C ${{ env.BUILD_TYPE }}
+          ctest --parallel "$CTEST_PARALLEL_LEVEL" --output-on-failure -C ${{ env.BUILD_TYPE }}
 
       - name: '📦 Pack artifact'
         if: always()

@@ -133,5 +133,6 @@ bool riscv_cpu_debug_check_breakpoint(CPUState *cs);
 bool riscv_cpu_debug_check_watchpoint(CPUState *cs, CPUWatchpoint *wp);
 
 void riscv_trigger_init(CPURISCVState *env);
+void riscv_trigger_update_all(CPURISCVState *env);
 
 #endif /* RISCV_DEBUG_H */

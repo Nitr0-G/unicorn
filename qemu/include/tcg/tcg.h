@@ -674,6 +674,7 @@ struct TCGContext {
 
     /* Track which vCPU triggers events */
     CPUState *cpu;                      /* *_trans */
+    TranslationBlock *gen_tb;
 
     /* These structures are private to tcg-target.inc.c.  */
 #ifdef TCG_TARGET_NEED_LDST_LABELS
@@ -1320,6 +1321,8 @@ static inline size_t tcg_current_code_size(TCGContext *s)
 /* Combine the MemOp and mmu_idx parameters into a single value.  */
 typedef uint32_t TCGMemOpIdx;
 
+#define TCG_MO_EXIT_REQUEST (UINT32_C(1) << 31)
+
 /**
  * make_memop_idx
  * @op: memory operation
@@ -1341,7 +1344,12 @@ static inline TCGMemOpIdx make_memop_idx(MemOp op, unsigned idx)
  */
 static inline MemOp get_memop(TCGMemOpIdx oi)
 {
-    return oi >> 4;
+    return (oi & ~TCG_MO_EXIT_REQUEST) >> 4;
+}
+
+static inline bool memop_idx_has_exit_request(TCGMemOpIdx oi)
+{
+    return (oi & TCG_MO_EXIT_REQUEST) != 0;
 }
 
 /**

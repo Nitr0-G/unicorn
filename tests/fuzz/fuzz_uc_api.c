@@ -11,6 +11,8 @@
 #define API_FUZZ_PAGE_COUNT 8
 #define API_FUZZ_MAX_INPUT_SIZE 4096
 #define API_FUZZ_MAX_OPERATIONS 256
+#define API_FUZZ_MAX_EMULATION_STEPS 64
+#define API_FUZZ_MAX_X86_INSN_SIZE 15
 
 typedef struct ApiFuzzInput {
     const uint8_t *data;
@@ -23,9 +25,17 @@ typedef struct ApiFuzzState {
     uint64_t nested_address;
     uint8_t code_action;
     uint8_t memory_action;
+    size_t instruction_budget;
     bool context_valid;
     bool nested_active;
 } ApiFuzzState;
+
+typedef struct ApiFuzzNestedCheck {
+    ApiFuzzState *state;
+    uint64_t outer_address;
+    uint64_t inner_address;
+    unsigned int nested_count;
+} ApiFuzzNestedCheck;
 
 static uint8_t fuzz_read_u8(ApiFuzzInput *input)
 {
@@ -46,6 +56,81 @@ static uint32_t fuzz_permissions(uint8_t value)
     return value & UC_PROT_ALL;
 }
 
+static bool fuzz_is_x86_string_opcode(uint8_t opcode)
+{
+    return (opcode >= 0x6c && opcode <= 0x6f) ||
+           (opcode >= 0xa4 && opcode <= 0xa7) ||
+           (opcode >= 0xaa && opcode <= 0xaf);
+}
+
+static bool fuzz_is_rep_string(uc_engine *uc, uint64_t address, uint32_t size)
+{
+    uint8_t code[API_FUZZ_MAX_X86_INSN_SIZE];
+    bool has_rep = false;
+    unsigned int i;
+
+    if (size == 0 || size > sizeof(code) ||
+        uc_mem_read(uc, address, code, size) != UC_ERR_OK) {
+        return false;
+    }
+
+    for (i = 0; i < size; i++) {
+        switch (code[i]) {
+        case 0xf2:
+        case 0xf3:
+            has_rep = true;
+            continue;
+        case 0x26:
+        case 0x2e:
+        case 0x36:
+        case 0x3e:
+        case 0x64:
+        case 0x65:
+        case 0x66:
+        case 0x67:
+            continue;
+        default:
+            if (code[i] >= 0x40 && code[i] <= 0x4f) {
+                continue;
+            }
+            return has_rep && fuzz_is_x86_string_opcode(code[i]);
+        }
+    }
+    return false;
+}
+
+static void fuzz_budget_hook(uc_engine *uc, uint64_t address, uint32_t size,
+                             void *user_data)
+{
+    ApiFuzzState *state = user_data;
+    uint64_t repeat_count;
+
+    if (state->instruction_budget == 0) {
+        (void)uc_emu_stop(uc);
+        return;
+    }
+    state->instruction_budget--;
+
+    if (fuzz_is_rep_string(uc, address, size) &&
+        uc_reg_read(uc, UC_X86_REG_RCX, &repeat_count) == UC_ERR_OK &&
+        repeat_count > API_FUZZ_MAX_EMULATION_STEPS) {
+        repeat_count = API_FUZZ_MAX_EMULATION_STEPS;
+        (void)uc_reg_write(uc, UC_X86_REG_RCX, &repeat_count);
+    }
+}
+
+static uc_err fuzz_emu_start(uc_engine *uc, ApiFuzzState *state,
+                             uint64_t begin, uint64_t until, size_t count)
+{
+    size_t previous_budget = state->instruction_budget;
+    uc_err err;
+
+    state->instruction_budget = count;
+    err = uc_emu_start(uc, begin, until, 0, count);
+    state->instruction_budget = previous_budget;
+    return err;
+}
+
 static void fuzz_code_hook(uc_engine *uc, uint64_t address, uint32_t size,
                            void *user_data)
 {
@@ -59,8 +144,8 @@ static void fuzz_code_hook(uc_engine *uc, uint64_t address, uint32_t size,
     case 1:
         if (!state->nested_active) {
             state->nested_active = true;
-            (void)uc_emu_start(uc, state->nested_address,
-                               state->nested_address + 2, 0, 2);
+            (void)fuzz_emu_start(uc, state, state->nested_address,
+                                 state->nested_address + 2, 2);
             state->nested_active = false;
         }
         break;
@@ -105,16 +190,43 @@ static void fuzz_require_ok(uc_err err)
     }
 }
 
+static void fuzz_nested_budget_hook(uc_engine *uc, uint64_t address,
+                                    uint32_t size, void *user_data)
+{
+    ApiFuzzNestedCheck *check = user_data;
+
+    if (address != check->outer_address || check->nested_count != 0 ||
+        size != 3 || check->state->instruction_budget != 1) {
+        abort();
+    }
+    check->nested_count++;
+    fuzz_require_ok(fuzz_emu_start(uc, check->state, check->inner_address,
+                                   check->inner_address + 3, 1));
+    if (check->state->instruction_budget != 1) {
+        abort();
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     static const uint8_t recovery_code[] = {0x90, 0x90};
+    static const uint8_t outer_code[] = {0x48, 0xff, 0xc0, 0x48, 0xff, 0xc0};
+    static const uint8_t inner_code[] = {0x48, 0xff, 0xc3};
     uint8_t read_buffer[32];
     ApiFuzzInput input = {data, size, 0};
     ApiFuzzState state = {0};
+    ApiFuzzNestedCheck nested_check = {
+        &state, API_FUZZ_RECOVERY, API_FUZZ_RECOVERY + 0x100, 0,
+    };
     uc_hook code_hook = 0;
+    uc_hook budget_hook = 0;
     uc_hook memory_hook = 0;
+    uc_hook nested_hook = 0;
     uc_engine *uc = NULL;
+    uc_context *initial_context = NULL;
     unsigned int operation;
+    uint64_t rax = 0;
+    uint64_t rbx = 0;
     uint64_t rip;
 
     if (size > API_FUZZ_MAX_INPUT_SIZE) {
@@ -126,10 +238,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         uc_mem_map(uc, API_FUZZ_RECOVERY, API_FUZZ_PAGE_SIZE, UC_PROT_ALL));
     fuzz_require_ok(uc_mem_write(uc, API_FUZZ_RECOVERY, recovery_code,
                                  sizeof(recovery_code)));
+    fuzz_require_ok(uc_context_alloc(uc, &initial_context));
+    fuzz_require_ok(uc_context_save(uc, initial_context));
     fuzz_require_ok(uc_context_alloc(uc, &state.context));
     fuzz_require_ok(uc_context_save(uc, state.context));
     state.context_valid = true;
     state.nested_address = API_FUZZ_RECOVERY;
+    fuzz_require_ok(uc_hook_add(uc, &budget_hook, UC_HOOK_CODE,
+                                fuzz_budget_hook, &state, 1, 0));
 
     for (operation = 0;
          input.offset < input.size && operation < API_FUZZ_MAX_OPERATIONS;
@@ -166,8 +282,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                               argument % (sizeof(read_buffer) + 1));
             break;
         case 5:
-            (void)uc_emu_start(uc, page, page + API_FUZZ_PAGE_SIZE, 10000,
-                               1 + argument % 64);
+            (void)fuzz_emu_start(uc, &state, page,
+                                 page + API_FUZZ_PAGE_SIZE,
+                                 1 + argument % API_FUZZ_MAX_EMULATION_STEPS);
             break;
         case 6:
             if (uc_context_save(uc, state.context) == UC_ERR_OK) {
@@ -225,18 +342,33 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (memory_hook != 0) {
         fuzz_require_ok(uc_hook_del(uc, memory_hook));
     }
+    fuzz_require_ok(uc_context_restore(uc, initial_context));
     fuzz_require_ok(
         uc_mem_protect(uc, API_FUZZ_RECOVERY, API_FUZZ_PAGE_SIZE, UC_PROT_ALL));
-    fuzz_require_ok(uc_mem_write(uc, API_FUZZ_RECOVERY, recovery_code,
-                                 sizeof(recovery_code)));
-    fuzz_require_ok(uc_emu_start(uc, API_FUZZ_RECOVERY,
-                                 API_FUZZ_RECOVERY + sizeof(recovery_code), 0,
-                                 sizeof(recovery_code)));
+    fuzz_require_ok(uc_mem_write(uc, nested_check.outer_address, outer_code,
+                                 sizeof(outer_code)));
+    fuzz_require_ok(uc_mem_write(uc, nested_check.inner_address, inner_code,
+                                 sizeof(inner_code)));
+    fuzz_require_ok(uc_reg_write(uc, UC_X86_REG_RAX, &rax));
+    fuzz_require_ok(uc_reg_write(uc, UC_X86_REG_RBX, &rbx));
+    fuzz_require_ok(uc_hook_add(uc, &nested_hook, UC_HOOK_CODE,
+                                fuzz_nested_budget_hook, &nested_check,
+                                nested_check.outer_address,
+                                nested_check.outer_address));
+    fuzz_require_ok(fuzz_emu_start(
+        uc, &state, nested_check.outer_address,
+        nested_check.outer_address + sizeof(outer_code), 2));
+    fuzz_require_ok(uc_reg_read(uc, UC_X86_REG_RAX, &rax));
+    fuzz_require_ok(uc_reg_read(uc, UC_X86_REG_RBX, &rbx));
     fuzz_require_ok(uc_reg_read(uc, UC_X86_REG_RIP, &rip));
-    if (rip != API_FUZZ_RECOVERY + sizeof(recovery_code)) {
+    if (nested_check.nested_count != 1 || rax != 2 || rbx != 1 ||
+        rip != nested_check.outer_address + sizeof(outer_code)) {
         abort();
     }
+    fuzz_require_ok(uc_hook_del(uc, nested_hook));
+    fuzz_require_ok(uc_hook_del(uc, budget_hook));
     fuzz_require_ok(uc_context_free(state.context));
+    fuzz_require_ok(uc_context_free(initial_context));
     fuzz_require_ok(uc_close(uc));
     return 0;
 }

@@ -7,6 +7,7 @@
 #include "sysemu/cpus.h"
 #include "sysemu/tcg.h"
 #include "cpu.h"
+#include "internals.h"
 #include "uc_priv.h"
 #include "unicorn_common.h"
 #include "unicorn.h"
@@ -39,7 +40,6 @@ static void arm_release(void *ctx)
     CPUTLBDescFast *fast;
     ARMELChangeHook *entry, *next;
     CPUARMState *env = &cpu->env;
-    uint32_t nr;
 
     release_common(ctx);
     for (i = 0; i < NB_MMU_MODES; i++) {
@@ -60,31 +60,15 @@ static void arm_release(void *ctx)
         g_free(entry);
     }
 
-    if (arm_feature(env, ARM_FEATURE_PMSA) &&
-        arm_feature(env, ARM_FEATURE_V7)) {
-        nr = cpu->pmsav7_dregion;
-        if (nr) {
-            if (arm_feature(env, ARM_FEATURE_V8)) {
-                g_free(env->pmsav8.rbar[M_REG_NS]);
-                g_free(env->pmsav8.rlar[M_REG_NS]);
-                if (arm_feature(env, ARM_FEATURE_M_SECURITY)) {
-                    g_free(env->pmsav8.rbar[M_REG_S]);
-                    g_free(env->pmsav8.rlar[M_REG_S]);
-                }
-            } else {
-                g_free(env->pmsav7.drbar);
-                g_free(env->pmsav7.drsr);
-                g_free(env->pmsav7.dracr);
-            }
-        }
-    }
-    if (arm_feature(env, ARM_FEATURE_M_SECURITY)) {
-        nr = cpu->sau_sregion;
-        if (nr) {
-            g_free(env->sau.rbar);
-            g_free(env->sau.rlar);
-        }
-    }
+    g_free(env->pmsav7.drbar);
+    g_free(env->pmsav7.drsr);
+    g_free(env->pmsav7.dracr);
+    g_free(env->pmsav8.rbar[M_REG_NS]);
+    g_free(env->pmsav8.rbar[M_REG_S]);
+    g_free(env->pmsav8.rlar[M_REG_NS]);
+    g_free(env->pmsav8.rlar[M_REG_S]);
+    g_free(env->sau.rbar);
+    g_free(env->sau.rlar);
 
     g_free(cpu->cpreg_indexes);
     g_free(cpu->cpreg_values);
@@ -96,12 +80,12 @@ static void arm_release(void *ctx)
 static void reg_reset(struct uc_struct *uc)
 {
     CPUArchState *env;
-    (void)uc;
 
     env = uc->cpu->env_ptr;
     memset(env->regs, 0, sizeof(env->regs));
 
     env->pc = 0;
+    env->thumb = uc->thumb;
 }
 
 /* these functions are implemented in helper.c. */
@@ -731,6 +715,81 @@ static size_t uc_arm_context_size(struct uc_struct *uc)
     return ret;
 }
 
+typedef enum ArmContextArrayIndex {
+    ARM_CONTEXT_PMSAV7_DRBAR,
+    ARM_CONTEXT_PMSAV7_DRSR,
+    ARM_CONTEXT_PMSAV7_DRACR,
+    ARM_CONTEXT_PMSAV8_RBAR_NS,
+    ARM_CONTEXT_PMSAV8_RBAR_S,
+    ARM_CONTEXT_PMSAV8_RLAR_NS,
+    ARM_CONTEXT_PMSAV8_RLAR_S,
+    ARM_CONTEXT_SAU_RBAR,
+    ARM_CONTEXT_SAU_RLAR,
+    ARM_CONTEXT_ARRAY_COUNT,
+} ArmContextArrayIndex;
+
+typedef struct ArmContextArray {
+    const uint32_t *data;
+    uint32_t count;
+} ArmContextArray;
+
+static bool uc_arm_context_parse(const uc_context *context, size_t cpu_size,
+                                 ArmContextArray *arrays)
+{
+    const uint8_t *p = (const uint8_t *)context->data;
+    size_t remaining = context->context_size;
+    uint32_t count;
+    int i;
+
+    if (remaining < cpu_size) {
+        return false;
+    }
+    p += cpu_size;
+    remaining -= cpu_size;
+
+    for (i = 0; i < ARM_CONTEXT_ARRAY_COUNT; i++) {
+        size_t array_size;
+
+        if (remaining < sizeof(count)) {
+            return false;
+        }
+        memcpy(&count, p, sizeof(count));
+        p += sizeof(count);
+        remaining -= sizeof(count);
+        if (count > remaining / sizeof(uint32_t)) {
+            return false;
+        }
+
+        array_size = (size_t)count * sizeof(uint32_t);
+        arrays[i].data = (const uint32_t *)p;
+        arrays[i].count = count;
+        p += array_size;
+        remaining -= array_size;
+    }
+
+    return true;
+}
+
+static uc_err uc_arm_context_validate(struct uc_struct *uc,
+                                      const uc_context *context)
+{
+    ArmContextArray arrays[ARM_CONTEXT_ARRAY_COUNT];
+
+    return uc_arm_context_parse(context, uc->cpu_context_size, arrays)
+               ? UC_ERR_OK
+               : UC_ERR_ARG;
+}
+
+static void uc_arm_context_restore_array(uint32_t *destination,
+                                         uint32_t destination_count,
+                                         const ArmContextArray *source)
+{
+    if (destination && source->count == destination_count) {
+        memcpy(destination, source->data,
+               sizeof(uint32_t) * destination_count);
+    }
+}
+
 static uc_err uc_arm_context_save(struct uc_struct *uc, uc_context *context)
 {
     char *p = NULL;
@@ -771,43 +830,68 @@ static uc_err uc_arm_context_save(struct uc_struct *uc, uc_context *context)
 
 static uc_err uc_arm_context_restore(struct uc_struct *uc, uc_context *context)
 {
-    char *p = NULL;
     ARMCPU *cpu = (ARMCPU *)uc->cpu;
     CPUARMState *env = (CPUARMState *)&cpu->env;
-    uint32_t nr, ctx_nr;
+    ArmContextArray arrays[ARM_CONTEXT_ARRAY_COUNT];
+    uint32_t *pmsav7_drbar = env->pmsav7.drbar;
+    uint32_t *pmsav7_drsr = env->pmsav7.drsr;
+    uint32_t *pmsav7_dracr = env->pmsav7.dracr;
+    uint32_t *pmsav8_rbar_ns = env->pmsav8.rbar[M_REG_NS];
+    uint32_t *pmsav8_rbar_s = env->pmsav8.rbar[M_REG_S];
+    uint32_t *pmsav8_rlar_ns = env->pmsav8.rlar[M_REG_NS];
+    uint32_t *pmsav8_rlar_s = env->pmsav8.rlar[M_REG_S];
+    uint32_t *sau_rbar = env->sau.rbar;
+    uint32_t *sau_rlar = env->sau.rlar;
+    uint64_t features = env->features;
+    uint32_t nr;
 
-#define ARM_ENV_RESTORE(field)                                                 \
-    ctx_nr = *(uint32_t *)p;                                                   \
-    if (ctx_nr != 0) {                                                         \
-        p += sizeof(uint32_t);                                                 \
-        if (field && ctx_nr == nr) {                                           \
-            memcpy(field, p, sizeof(uint32_t) * ctx_nr);                       \
-        }                                                                      \
-        p += sizeof(uint32_t) * ctx_nr;                                        \
-    } else {                                                                   \
-        p += sizeof(uint32_t);                                                 \
+    if (!uc_arm_context_parse(context, uc->cpu_context_size, arrays)) {
+        return UC_ERR_ARG;
     }
 
-    p = context->data;
-    memcpy(uc->cpu->env_ptr, p, uc->cpu_context_size);
-    p += uc->cpu_context_size;
+    memcpy(uc->cpu->env_ptr, context->data, uc->cpu_context_size);
+    env->pmsav7.drbar = pmsav7_drbar;
+    env->pmsav7.drsr = pmsav7_drsr;
+    env->pmsav7.dracr = pmsav7_dracr;
+    env->pmsav8.rbar[M_REG_NS] = pmsav8_rbar_ns;
+    env->pmsav8.rbar[M_REG_S] = pmsav8_rbar_s;
+    env->pmsav8.rlar[M_REG_NS] = pmsav8_rlar_ns;
+    env->pmsav8.rlar[M_REG_S] = pmsav8_rlar_s;
+    env->sau.rbar = sau_rbar;
+    env->sau.rlar = sau_rlar;
+    env->features = features;
+    env->uc = uc;
 
     nr = cpu->pmsav7_dregion;
-    ARM_ENV_RESTORE(env->pmsav7.drbar)
-    ARM_ENV_RESTORE(env->pmsav7.drsr)
-    ARM_ENV_RESTORE(env->pmsav7.dracr)
-    ARM_ENV_RESTORE(env->pmsav8.rbar[M_REG_NS])
-    ARM_ENV_RESTORE(env->pmsav8.rbar[M_REG_S])
-    ARM_ENV_RESTORE(env->pmsav8.rlar[M_REG_NS])
-    ARM_ENV_RESTORE(env->pmsav8.rlar[M_REG_S])
+    uc_arm_context_restore_array(
+        env->pmsav7.drbar, nr, &arrays[ARM_CONTEXT_PMSAV7_DRBAR]);
+    uc_arm_context_restore_array(
+        env->pmsav7.drsr, nr, &arrays[ARM_CONTEXT_PMSAV7_DRSR]);
+    uc_arm_context_restore_array(
+        env->pmsav7.dracr, nr, &arrays[ARM_CONTEXT_PMSAV7_DRACR]);
+    uc_arm_context_restore_array(
+        env->pmsav8.rbar[M_REG_NS], nr,
+        &arrays[ARM_CONTEXT_PMSAV8_RBAR_NS]);
+    uc_arm_context_restore_array(
+        env->pmsav8.rbar[M_REG_S], nr,
+        &arrays[ARM_CONTEXT_PMSAV8_RBAR_S]);
+    uc_arm_context_restore_array(
+        env->pmsav8.rlar[M_REG_NS], nr,
+        &arrays[ARM_CONTEXT_PMSAV8_RLAR_NS]);
+    uc_arm_context_restore_array(
+        env->pmsav8.rlar[M_REG_S], nr,
+        &arrays[ARM_CONTEXT_PMSAV8_RLAR_S]);
 
     nr = cpu->sau_sregion;
-    ARM_ENV_RESTORE(env->sau.rbar)
-    ARM_ENV_RESTORE(env->sau.rlar)
+    uc_arm_context_restore_array(env->sau.rbar, nr,
+                                 &arrays[ARM_CONTEXT_SAU_RBAR]);
+    uc_arm_context_restore_array(env->sau.rlar, nr,
+                                 &arrays[ARM_CONTEXT_SAU_RLAR]);
 
-#undef ARM_ENV_RESTORE
-    // Overwrite uc to our uc
-    env->uc = uc;
+    hw_breakpoint_update_all(cpu);
+    hw_watchpoint_update_all(cpu);
+    arm_rebuild_hflags(env);
+
     return UC_ERR_OK;
 }
 
@@ -837,6 +921,7 @@ void uc_init(struct uc_struct *uc)
     uc->cpu_context_size = offsetof(CPUARMState, cpu_watchpoint);
     uc->context_size = uc_arm_context_size;
     uc->context_save = uc_arm_context_save;
+    uc->context_validate = uc_arm_context_validate;
     uc->context_restore = uc_arm_context_restore;
     uc_common_init(uc);
 }

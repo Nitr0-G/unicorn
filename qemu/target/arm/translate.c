@@ -15849,18 +15849,22 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
         return;
     }
 
-    // Unicorn: trace this instruction on request
-    if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, s->pc_curr)) {
-
-        // Sync PC in advance
-        gen_set_pc_im(s, s->pc_curr);
-        
-        gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, s->uc, s->pc_curr);
-        // the callback might want to stop emulation immediately
-        check_exit_request(tcg_ctx);
-    }
-
     if (cond == 0xf) {
+        if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_MEM_FETCH, s->pc_curr)) {
+            gen_set_pc_im(s, s->pc_curr);
+            gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, s->uc,
+                              s->pc_curr);
+            check_exit_request(tcg_ctx);
+        }
+
+        // Unicorn: trace this instruction on request
+        if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, s->pc_curr)) {
+            gen_set_pc_im(s, s->pc_curr);
+            gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, s->uc,
+                             s->pc_curr);
+            check_exit_request(tcg_ctx);
+        }
+
         /* In ARMv3 and v4 the NV condition is UNPREDICTABLE; we
          * choose to UNDEF. In ARMv5 and above the space is used
          * for miscellaneous unconditional instructions.
@@ -15921,10 +15925,34 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
         }
         goto illegal_op;
     }
+
+    if (cond == 0xe &&
+        HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_MEM_FETCH, s->pc_curr)) {
+        gen_set_pc_im(s, s->pc_curr);
+        gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, s->uc,
+                          s->pc_curr);
+        check_exit_request(tcg_ctx);
+    }
+
+    // Unicorn: trace this instruction on request
+    if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, s->pc_curr)) {
+        gen_set_pc_im(s, s->pc_curr);
+        gen_uc_tracecode(tcg_ctx, 4, UC_HOOK_CODE_IDX, s->uc, s->pc_curr);
+        check_exit_request(tcg_ctx);
+    }
+
     if (cond != 0xe) {
         /* if not always execute, we generate a conditional jump to
            next instruction */
         arm_skip_unless(s, cond);
+    }
+
+    if (cond != 0xe &&
+        HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_MEM_FETCH, s->pc_curr)) {
+        gen_set_pc_im(s, s->pc_curr);
+        gen_uc_tracefetch(tcg_ctx, 4, UC_HOOK_MEM_FETCH_IDX, s->uc,
+                          s->pc_curr);
+        check_exit_request(tcg_ctx);
     }
 
     /* TODO: Perhaps merge these into one decodetree output file.  */
@@ -16561,15 +16589,32 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 
     // Unicorn: trace this instruction on request
     insn_size = is_16bit ? 2 : 4;
-    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE, dc->base.pc_next - insn_size)) {
+    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_MEM_FETCH,
+                            dc->base.pc_next - insn_size)) {
+        int type = UC_HOOK_MEM_FETCH_IDX;
+
+        gen_set_pc_im(dc, dc->base.pc_next - insn_size);
+        if (uc->no_exit_request) {
+            type |= UC_HOOK_FLAG_NO_STOP;
+        }
+        gen_uc_tracefetch(tcg_ctx, insn_size, type, uc,
+                          dc->base.pc_next - insn_size);
+        check_exit_request(tcg_ctx);
+    }
+
+    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_CODE,
+                            dc->base.pc_next - insn_size)) {
         
         // Sync PC in advance
         gen_set_pc_im(dc, dc->base.pc_next - insn_size);
 
         if (uc->no_exit_request) {
-            gen_uc_tracecode(tcg_ctx, insn_size, UC_HOOK_CODE_IDX | UC_HOOK_FLAG_NO_STOP, uc, dc->base.pc_next - insn_size);
+            gen_uc_tracecode(tcg_ctx, insn_size,
+                             UC_HOOK_CODE_IDX | UC_HOOK_FLAG_NO_STOP, uc,
+                             dc->base.pc_next - insn_size);
         } else {
-            gen_uc_tracecode(tcg_ctx, insn_size, UC_HOOK_CODE_IDX, uc, dc->base.pc_next - insn_size);
+            gen_uc_tracecode(tcg_ctx, insn_size, UC_HOOK_CODE_IDX, uc,
+                             dc->base.pc_next - insn_size);
         }
         // the callback might want to stop emulation immediately
         check_exit_request(tcg_ctx);

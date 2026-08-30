@@ -29,6 +29,7 @@
 #include "hw/core/tcg-cpu-ops.h"
 #include "sysemu/cpus.h"
 #include "uc_priv.h"
+#include "tb-exec-frame.h"
 
 /* -icount align implementation. */
 
@@ -47,6 +48,17 @@ typedef struct SyncClocks {
 #define MAX_DELAY_PRINT_RATE 2000000000LL
 #define MAX_NB_PRINTS 100
 
+#if defined(__clang__) && __has_attribute(no_sanitize)
+static inline __attribute__((always_inline, no_sanitize("function")))
+uintptr_t tcg_qemu_tb_exec_no_sanitize(CPUArchState *env, uint8_t *tb_ptr)
+{
+    return tcg_qemu_tb_exec(env, tb_ptr);
+}
+#else
+#define tcg_qemu_tb_exec_no_sanitize(env, tb_ptr) \
+    tcg_qemu_tb_exec(env, tb_ptr)
+#endif
+
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
 static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
 {
@@ -56,14 +68,22 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
     int tb_exit;
     uint8_t *tb_ptr = itb->tc.ptr;
     unsigned int level = cpu->uc->nested_level - 1;
+    UcTbExecFrame *frame = &cpu->uc->tb_exec_frames[level];
+    UcTbExecFrame *previous_frame = cpu->uc->active_tb_exec_frame;
 
     UC_TRACE_START(UC_TRACE_TB_EXEC);
     tb_exec_lock(cpu->uc);
-    g_assert(!cpu->uc->tb_exec_active[level]);
-    cpu->uc->tb_exec_active[level] = true;
+    g_assert(!frame->active);
+    tb_exec_frame_set_tb(frame, itb);
+    frame->exit_requested = false;
+    frame->active = true;
+    cpu->uc->active_tb_exec_frame = frame;
     cpu->uc->tb_exec_depth++;
-    ret = tcg_qemu_tb_exec(env, tb_ptr);
-    cpu->uc->tb_exec_active[level] = false;
+    ret = tcg_qemu_tb_exec_no_sanitize(env, tb_ptr);
+    cpu->uc->active_tb_exec_frame = previous_frame;
+    frame->active = false;
+    frame->exit_requested = false;
+    tb_exec_frame_clear(frame);
     cpu->uc->tb_exec_depth--;
     if (cpu->uc->nested_level == 1) {
         // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
@@ -102,7 +122,6 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
             }
         }
 
-        qatomic_set(&cpu->tcg_exit_req, 0);
     }
     return ret;
 }
@@ -287,7 +306,7 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
                 }
             }
             notify_edge = false;
-            if (unlikely(qatomic_read(&cpu->exit_request))) {
+            if (unlikely(qatomic_read(&cpu->exit_request_pending))) {
                 return NULL;
             }
             if (unlikely(flush_count !=
@@ -460,13 +479,16 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
     return false;
 }
 
+static inline bool cpu_acknowledge_pending_exit(CPUState *cpu)
+{
+    return qatomic_xchg_acquire(&cpu->exit_request_pending, 0) != 0;
+}
+
 static inline bool cpu_handle_interrupt(CPUState *cpu,
                                         TranslationBlock **last_tb)
 {
     /* Clear the interrupt flag now since we're processing
-     * cpu->interrupt_request and cpu->exit_request.
-     * Ensure zeroing happens before reading cpu->exit_request or
-     * cpu->interrupt_request (see also smp_wmb in cpu_exit())
+     * cpu->interrupt_request and the pending exit edge.
      */
     qatomic_set(&cpu_neg(cpu)->icount_decr.u16.high, 0);
 
@@ -522,8 +544,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     }
 
     /* Finally, check if we need to exit to the main loop.  */
-    if (unlikely(qatomic_read(&cpu->exit_request))) {
-        qatomic_set(&cpu->exit_request, 0);
+    if (unlikely(cpu_acknowledge_pending_exit(cpu))) {
         if (cpu->exception_index == -1) {
             cpu->exception_index = EXCP_INTERRUPT;
         }
@@ -611,6 +632,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
     // SyncClocks sc = { 0 };
 
     if (cpu_handle_halt(cpu)) {
+        cpu_acknowledge_pending_exit(cpu);
         return EXCP_HALTED;
     }
 
@@ -669,7 +691,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
             }
 
             tb = tb_find(cpu, last_tb, tb_exit, cflags);
-            if (unlikely(qatomic_read(&cpu->exit_request))) {
+            if (unlikely(qatomic_read(&cpu->exit_request_pending))) {
                 continue;
             }
             cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
@@ -679,8 +701,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
         }
     }
 
-    // Unicorn: Clear any TCG exit flag that might have been left set by exit requests
-    qatomic_set(&uc->cpu->tcg_exit_req, 0);
+    cpu_acknowledge_pending_exit(cpu);
 
     cpu_tcg_exec_exit(cpu);
     // rcu_read_unlock();

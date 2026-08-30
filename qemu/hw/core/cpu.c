@@ -58,10 +58,8 @@ void cpu_reset_interrupt(CPUState *cpu, int mask)
 
 void cpu_exit(CPUState *cpu)
 {
-    qatomic_set(&cpu->exit_request, 1);
-    qatomic_set(&cpu->tcg_exit_req, 1);
-    smp_wmb();
     qatomic_set(&cpu->icount_decr_ptr->u16.high, -1);
+    qatomic_fetch_or_release(&cpu->exit_request_pending, 1);
 }
 
 static void cpu_common_noop(CPUState *cpu)

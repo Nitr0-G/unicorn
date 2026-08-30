@@ -64,11 +64,52 @@ You might implement memory protection in a different manner than the standard Un
 
 *What is it?*
 
-The `UC_HOOK_MEM_FETCH` hook is not used.
+The `UC_HOOK_MEM_FETCH` hook reports successful instruction fetches as
+runtime instruction events. It uses the `uc_cb_hookmem_t` callback type:
+
+```c
+typedef void (*uc_cb_hookmem_t)(uc_engine *uc, uc_mem_type type,
+                                uint64_t address, int size, int64_t value,
+                                void *user_data);
+```
+
+For this hook, `type` is `UC_MEM_FETCH`, `address` is the guest address of the
+instruction, `size` is the decoded instruction size in bytes, and `value` is
+0. The callback-visible program counter is synchronized to `address`. This is
+an instruction-level event, not a callback for each internal memory read used
+to translate a block; executing a cached translated block still reports the
+instructions that reach their runtime execution gates.
+
+Normally, when both `UC_HOOK_MEM_FETCH` and `UC_HOOK_CODE` match an
+instruction, the fetch callback runs first. A code callback which stops
+emulation therefore does not suppress the fetch event already delivered for
+that instruction.
+
+Architectural execution rules still apply. A32 conditional instructions keep
+the existing code hook before the predicate check: a failed predicate reports
+the code hook but no successful fetch, while a passed predicate reports the
+code hook and then the fetch hook. A code hook which changes the condition
+flags can consequently change whether that instruction executes and reports a
+fetch. Thumb IT predicates are checked before both hooks, so a skipped
+instruction reports neither hook and an executed instruction reports fetch
+before code. A MIPS branch-likely delay slot which is annulled is also skipped
+before both hooks; an executed delay slot reports one fetch event.
+
+An invalid encoding does not suppress a successful fetch if the instruction
+reaches this runtime path. The callback is delivered with the decoded width
+before emulation reports the architecture's invalid-instruction error. For
+example, the current x86 path reports the two-byte invalid encoding before
+returning `UC_ERR_INSN_INVALID`, while an invalid two-byte RISC-V compressed
+encoding is reported before `UC_ERR_EXCEPTION`. A fetch which fails because
+memory is unmapped or non-executable is instead handled by the corresponding
+`UC_HOOK_MEM_FETCH_UNMAPPED` or `UC_HOOK_MEM_FETCH_PROT` hook.
 
 *Why might you use it?*
 
-You wouldn't. It's deprecated and will never be called.
+You might use it to trace the runtime instruction-fetch stream with each
+instruction's address and decoded size, including variable-length
+instructions, while retaining the architecture's predicate and annul
+semantics.
 
 
 ## UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED

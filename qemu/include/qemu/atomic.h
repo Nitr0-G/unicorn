@@ -139,6 +139,11 @@
     atomic_xchg__nocheck(ptr, i);                           \
 })
 
+#define atomic_xchg_acquire(ptr, i)    ({                   \
+    QEMU_BUILD_BUG_ON(sizeof(*ptr) > ATOMIC_REG_SIZE);      \
+    __atomic_exchange_n(ptr, (i), __ATOMIC_ACQUIRE);        \
+})
+
 /* Returns the eventual value, failed or not */
 #define atomic_cmpxchg__nocheck(ptr, old, new)    ({                    \
     typeof_strip_qual(*ptr) _old = (old);                               \
@@ -160,6 +165,8 @@
 #define atomic_fetch_and(ptr, n) __atomic_fetch_and(ptr, n, __ATOMIC_SEQ_CST)
 #define atomic_fetch_or(ptr, n)  __atomic_fetch_or(ptr, n, __ATOMIC_SEQ_CST)
 #define atomic_fetch_xor(ptr, n) __atomic_fetch_xor(ptr, n, __ATOMIC_SEQ_CST)
+#define atomic_fetch_or_release(ptr, n) \
+    __atomic_fetch_or(ptr, n, __ATOMIC_RELEASE)
 
 #define atomic_inc_fetch(ptr)    __atomic_add_fetch(ptr, 1, __ATOMIC_SEQ_CST)
 #define atomic_dec_fetch(ptr)    __atomic_sub_fetch(ptr, 1, __ATOMIC_SEQ_CST)
@@ -246,6 +253,9 @@
 /* Provide shorter names for GCC atomic builtins.  */
 #ifdef _MSC_VER
 // these return the new value (so we make it return the previous value)
+#define atomic_xchg_acquire(ptr, i) \
+    InterlockedExchange((volatile long *)(ptr), (long)(i))
+
 #define atomic_fetch_inc(ptr)         ((InterlockedIncrement(ptr))-1)
 #define atomic_fetch_dec(ptr)         ((InterlockedDecrement(ptr))+1)
 #define atomic_fetch_add(ptr, n)      ((InterlockedAdd(ptr,  n))-n)
@@ -253,6 +263,8 @@
 #define atomic_fetch_and(ptr, n)      ((InterlockedAnd(ptr, n)))
 #define atomic_fetch_or(ptr, n)       ((InterlockedOr(ptr, n)))
 #define atomic_fetch_xor(ptr, n)      ((InterlockedXor(ptr, n)))
+#define atomic_fetch_or_release(ptr, n) \
+    InterlockedOr((volatile long *)(ptr), (long)(n))
 
 #define atomic_inc_fetch(ptr)         (InterlockedIncrement((long*)(ptr)))
 #define atomic_dec_fetch(ptr)         (InterlockedDecrement((long*)(ptr)))
@@ -274,6 +286,8 @@
 #define atomic_xor(ptr, n)     ((void) InterlockedXor(ptr, n))
 #else // GCC/clang
 // these return the previous value
+#define atomic_xchg_acquire(ptr, i) atomic_xchg(ptr, i)
+
 #define atomic_fetch_inc(ptr)  __sync_fetch_and_add(ptr, 1)
 #define atomic_fetch_dec(ptr)  __sync_fetch_and_add(ptr, -1)
 #define atomic_fetch_add(ptr, n) __sync_fetch_and_add(ptr, n)
@@ -281,6 +295,7 @@
 #define atomic_fetch_and(ptr, n) __sync_fetch_and_and(ptr, n)
 #define atomic_fetch_or(ptr, n) __sync_fetch_and_or(ptr, n)
 #define atomic_fetch_xor(ptr, n) __sync_fetch_and_xor(ptr, n)
+#define atomic_fetch_or_release(ptr, n) __sync_fetch_and_or(ptr, n)
 
 #define atomic_inc_fetch(ptr)  __sync_add_and_fetch(ptr, 1)
 #define atomic_dec_fetch(ptr)  __sync_add_and_fetch(ptr, -1)
@@ -322,6 +337,9 @@
 #ifndef qatomic_rcu_set
 #define qatomic_rcu_set atomic_rcu_set
 #endif
+#ifndef qatomic_xchg_acquire
+#define qatomic_xchg_acquire atomic_xchg_acquire
+#endif
 #ifndef qatomic_xchg__nocheck
 #define qatomic_xchg__nocheck atomic_xchg__nocheck
 #endif
@@ -354,6 +372,9 @@
 #endif
 #ifndef qatomic_fetch_xor
 #define qatomic_fetch_xor atomic_fetch_xor
+#endif
+#ifndef qatomic_fetch_or_release
+#define qatomic_fetch_or_release atomic_fetch_or_release
 #endif
 #ifndef qatomic_inc_fetch
 #define qatomic_inc_fetch atomic_inc_fetch

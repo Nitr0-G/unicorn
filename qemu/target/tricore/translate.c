@@ -9238,8 +9238,17 @@ static void tricore_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         is_16bit = tricore_insn_is_16bit(insn_lo);
 
         insn_size = is_16bit ? 2 : 4;
+        if (HOOK_EXISTS_BOUNDED(ctx->uc, UC_HOOK_MEM_FETCH,
+                                ctx->base.pc_next)) {
+            gen_save_pc(ctx, ctx->base.pc_next);
+            gen_uc_tracefetch(tcg_ctx, insn_size, UC_HOOK_MEM_FETCH_IDX,
+                              ctx->uc, ctx->base.pc_next);
+            check_exit_request(tcg_ctx);
+        }
+
         // Unicorn: trace this instruction on request
-        if (HOOK_EXISTS_BOUNDED(ctx->uc, UC_HOOK_CODE, ctx->base.pc_next)) {
+        if (HOOK_EXISTS_BOUNDED(ctx->uc, UC_HOOK_CODE,
+                                ctx->base.pc_next)) {
             // Sync PC in advance
             gen_save_pc(ctx, ctx->base.pc_next);
 

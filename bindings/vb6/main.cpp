@@ -287,6 +287,11 @@ uc_err __stdcall ucs_context_alloc(uc_engine *uc, uc_context **context){
     return uc_context_alloc(uc, context);
 }
 
+uc_err __stdcall ucs_context_free(uc_context *context){
+#pragma EXPORT
+    return uc_context_free(context);
+}
+
 uc_err __stdcall ucs_free(void *mem){
 #pragma EXPORT
     return uc_free(mem);

@@ -32,9 +32,18 @@ class Emulator:
         self.set_hooks()
 
     def set_hooks(self):
-        self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_access)
-        self.mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, self.hook_mem_invalid)
-        self.mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, self.hook_mem_fetch_unmapped)
+        self.hooks = (
+            self.mu.hook_add(UC_HOOK_MEM_WRITE, self.hook_mem_access),
+            self.mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED |
+                             UC_HOOK_MEM_WRITE_UNMAPPED,
+                             self.hook_mem_invalid),
+            self.mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED,
+                             self.hook_mem_fetch_unmapped),
+        )
+
+    def close(self):
+        for hook in self.hooks:
+            self.mu.hook_del(hook)
 
     def hook_mem_fetch_unmapped(self, uc, access, address, size, value, user_data):
         next_ip = self.unicorn_code + size
@@ -71,11 +80,13 @@ class Emulator:
 class TranslatorBuffer(regress.RegressTest):
     def init_unicorn(self, ip, sp, magic):
         emu = Emulator(ip, sp)
+        try:
+            emu.write_data(ip, b"\xf4" * 8)
+            emu.write_data(sp, struct.pack("<Q", magic))
 
-        emu.write_data(ip, b"\xf4" * 8)
-        emu.write_data(sp, struct.pack("<Q", magic))
-
-        emu.emu(1)
+            emu.emu(1)
+        finally:
+            emu.close()
 
     @unittest.skipIf(sys.version_info < (3, 7), reason="requires python3.7 or higher")
     def runTest(self):

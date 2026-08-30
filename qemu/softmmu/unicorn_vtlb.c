@@ -77,6 +77,7 @@ bool unicorn_fill_tlb(CPUState *cs, vaddr address, int size,
             continue;
         }
         handled = true;
+        uc->tb_exec_frame_publish(uc, retaddr);
         JIT_CALLBACK_GUARD_VAR(ret, ((uc_cb_tlbevent_t)hook->callback)(uc, address & TARGET_PAGE_MASK, rw_to_mem_type(rw), &e, hook->user_data));
         if (ret) {
             break;

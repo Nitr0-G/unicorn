@@ -561,6 +561,7 @@ SPARCCPU *cpu_sparc_init(struct uc_struct *uc)
     cpu_address_space_init(cs, 0, cs->memory);
 
     qemu_init_vcpu(cs);
+    cpu_reset(cs);
 
     return cpu;
 }

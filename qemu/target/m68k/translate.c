@@ -6452,12 +6452,24 @@ static void m68k_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     struct uc_struct *uc = dc->uc;
     TCGContext *tcg_ctx = uc->tcg_ctx;
     CPUM68KState *env = cpu->env_ptr;
+    target_ulong pc_start = dc->pc;
+    TCGOp *tcg_op, *fetch_prev_op = NULL;
     uint16_t insn;
+    bool fetch_hook = false;
 
     // Unicorn: end address tells us to stop emulation
     if (uc_addr_is_exit(uc, dc->pc)) {
         gen_exception(dc, dc->pc, EXCP_HLT);
         return;
+    }
+
+    if (HOOK_EXISTS_BOUNDED(uc, UC_HOOK_MEM_FETCH, dc->pc)) {
+        tcg_gen_movi_i32(tcg_ctx, QREG_PC, dc->pc);
+        fetch_prev_op = tcg_last_op(tcg_ctx);
+        fetch_hook = true;
+        gen_uc_tracefetch(tcg_ctx, 0xf1f1f1f1, UC_HOOK_MEM_FETCH_IDX, uc,
+                          dc->pc);
+        check_exit_request(tcg_ctx);
     }
 
     // Unicorn: trace this instruction on request
@@ -6476,6 +6488,15 @@ static void m68k_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     ((disas_proc)env->opcode_table[insn])(env, dc, insn);
     do_writebacks(dc);
     do_release(dc);
+
+    if (fetch_hook) {
+        if (fetch_prev_op) {
+            tcg_op = QTAILQ_NEXT(fetch_prev_op, link);
+        } else {
+            tcg_op = QTAILQ_FIRST(&tcg_ctx->ops);
+        }
+        tcg_op->args[1] = dc->pc - pc_start;
+    }
 
     dc->base.pc_next = dc->pc;
 

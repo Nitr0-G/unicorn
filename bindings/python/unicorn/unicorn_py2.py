@@ -168,7 +168,13 @@ _setup_prototype(_uc, "uc_context_save", ucerr, uc_engine, uc_context)
 _setup_prototype(_uc, "uc_context_restore", ucerr, uc_engine, uc_context)
 _setup_prototype(_uc, "uc_context_size", ctypes.c_size_t, uc_engine)
 _setup_prototype(_uc, "uc_context_reg_read", ucerr, uc_context, ctypes.c_int, ctypes.c_void_p)
+_setup_prototype(_uc, "uc_context_reg_read_batch", ucerr, uc_context,
+                 ctypes.POINTER(ctypes.c_int),
+                 ctypes.POINTER(ctypes.c_void_p), ctypes.c_int)
 _setup_prototype(_uc, "uc_context_reg_write", ucerr, uc_context, ctypes.c_int, ctypes.c_void_p)
+_setup_prototype(_uc, "uc_context_reg_write_batch", ucerr, uc_context,
+                 ctypes.POINTER(ctypes.c_int),
+                 ctypes.POINTER(ctypes.c_void_p), ctypes.c_int)
 _setup_prototype(_uc, "uc_context_free", ucerr, uc_context)
 _setup_prototype(_uc, "uc_mem_regions", ucerr, uc_engine, ctypes.POINTER(ctypes.POINTER(_uc_mem_region)),
                  ctypes.POINTER(ctypes.c_uint32))
@@ -244,42 +250,31 @@ def uc_arch_supported(query):
 
 
 # uc_reg_read/write and uc_context_reg_read/write.
-def reg_read(reg_read_func, arch, reg_id, opt=None):
+def _reg_read_arg(arch, reg_id, opt=None):
     if arch == uc.UC_ARCH_X86:
         if reg_id in [x86_const.UC_X86_REG_IDTR, x86_const.UC_X86_REG_GDTR, x86_const.UC_X86_REG_LDTR,
                       x86_const.UC_X86_REG_TR]:
             reg = uc_x86_mmr()
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.selector, reg.base, reg.limit, reg.flags
+            return reg, lambda value: (
+                value.selector, value.base, value.limit, value.flags)
         if reg_id in xrange(x86_const.UC_X86_REG_FP0, x86_const.UC_X86_REG_FP0 + 8):
             reg = uc_x86_float80()
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.mantissa, reg.exponent
+            return reg, lambda value: (value.mantissa, value.exponent)
         if reg_id in xrange(x86_const.UC_X86_REG_XMM0, x86_const.UC_X86_REG_XMM0 + 8):
             reg = uc_x86_xmm()
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.low_qword | (reg.high_qword << 64)
+            return reg, lambda value: (
+                value.low_qword | (value.high_qword << 64))
         if reg_id in xrange(x86_const.UC_X86_REG_YMM0, x86_const.UC_X86_REG_YMM0 + 16):
             reg = uc_x86_ymm()
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.first_qword | (reg.second_qword << 64) | (reg.third_qword << 128) | (reg.fourth_qword << 192)
+            return reg, lambda value: (
+                value.first_qword | (value.second_qword << 64) |
+                (value.third_qword << 128) | (value.fourth_qword << 192))
         if reg_id is x86_const.UC_X86_REG_MSR:
             if opt is None:
                 raise UcError(uc.UC_ERR_ARG)
             reg = uc_x86_msr()
             reg.rid = opt
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.value
+            return reg, lambda value: value.value
 
     if arch == uc.UC_ARCH_ARM:
         if reg_id == arm_const.UC_ARM_REG_CP_REG:
@@ -287,10 +282,7 @@ def reg_read(reg_read_func, arch, reg_id, opt=None):
             if not isinstance(opt, tuple) or len(opt) != 7:
                 raise UcError(uc.UC_ERR_ARG)
             reg.cp, reg.is64, reg.sec, reg.crn, reg.crm, reg.opc1, reg.opc2 = opt
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.val
+            return reg, lambda value: value.val
 
     if arch == uc.UC_ARCH_ARM64:
         if reg_id == arm64_const.UC_ARM64_REG_CP_REG:
@@ -298,28 +290,53 @@ def reg_read(reg_read_func, arch, reg_id, opt=None):
             if not isinstance(opt, tuple) or len(opt) != 5:
                 raise UcError(uc.UC_ERR_ARG)
             reg.crn, reg.crm, reg.op0, reg.op1, reg.op2 = opt
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.val
+            return reg, lambda value: value.val
 
-        elif reg_id in xrange(arm64_const.UC_ARM64_REG_Q0, arm64_const.UC_ARM64_REG_Q31 + 1) or xrange(
-                arm64_const.UC_ARM64_REG_V0, arm64_const.UC_ARM64_REG_V31 + 1):
+        elif (reg_id in xrange(arm64_const.UC_ARM64_REG_Q0,
+                               arm64_const.UC_ARM64_REG_Q31 + 1) or
+              reg_id in xrange(arm64_const.UC_ARM64_REG_V0,
+                               arm64_const.UC_ARM64_REG_V31 + 1)):
             reg = uc_arm64_neon128()
-            status = reg_read_func(reg_id, ctypes.byref(reg))
-            if status != uc.UC_ERR_OK:
-                raise UcError(status)
-            return reg.low_qword | (reg.high_qword << 64)
+            return reg, lambda value: (
+                value.low_qword | (value.high_qword << 64))
 
     # read to 64bit number to be safe
-    reg = ctypes.c_uint64(0)
+    return ctypes.c_uint64(0), lambda value: value.value
+
+
+def reg_read(reg_read_func, arch, reg_id, opt=None):
+    reg, get_value = _reg_read_arg(arch, reg_id, opt)
     status = reg_read_func(reg_id, ctypes.byref(reg))
     if status != uc.UC_ERR_OK:
         raise UcError(status)
-    return reg.value
+    return get_value(reg)
 
 
-def reg_write(reg_write_func, arch, reg_id, value):
+def reg_read_batch(reg_read_batch_func, arch, reg_data):
+    count = len(reg_data)
+    reg_ids = []
+    values = []
+    get_values = []
+
+    for elem in reg_data:
+        reg_id, opt = elem if isinstance(elem, tuple) else (elem, None)
+        value, get_value = _reg_read_arg(arch, reg_id, opt)
+        reg_ids.append(reg_id)
+        values.append(value)
+        get_values.append(get_value)
+
+    reg_list = (ctypes.c_int * count)(*reg_ids)
+    ptr_list = (ctypes.c_void_p * count)(*(
+        ctypes.c_void_p(ctypes.addressof(value)) for value in values))
+    status = reg_read_batch_func(reg_list, ptr_list, ctypes.c_int(count))
+    if status != uc.UC_ERR_OK:
+        raise UcError(status)
+
+    return tuple(get_value(value) for value, get_value in
+                 zip(values, get_values))
+
+
+def _reg_write_arg(arch, reg_id, value):
     reg = None
 
     if arch == uc.UC_ARCH_X86:
@@ -351,20 +368,22 @@ def reg_write(reg_write_func, arch, reg_id, value):
             reg.value = value[1]
 
     if arch == uc.UC_ARCH_ARM64:
-        if reg_id in xrange(arm64_const.UC_ARM64_REG_Q0, arm64_const.UC_ARM64_REG_Q31 + 1) or xrange(
-                arm64_const.UC_ARM64_REG_V0, arm64_const.UC_ARM64_REG_V31 + 1):
-            reg = uc_arm64_neon128()
-            reg.low_qword = value & 0xffffffffffffffff
-            reg.high_qword = value >> 64
-
-    if arch == uc.UC_ARCH_ARM:
         if reg_id == arm64_const.UC_ARM64_REG_CP_REG:
             reg = uc_arm64_cp_reg()
             if not isinstance(value, tuple) or len(value) != 6:
                 raise UcError(uc.UC_ERR_ARG)
             reg.crn, reg.crm, reg.op0, reg.op1, reg.op2, reg.val = value
 
-        elif reg_id == arm_const.UC_ARM_REG_CP_REG:
+        elif (reg_id in xrange(arm64_const.UC_ARM64_REG_Q0,
+                               arm64_const.UC_ARM64_REG_Q31 + 1) or
+              reg_id in xrange(arm64_const.UC_ARM64_REG_V0,
+                               arm64_const.UC_ARM64_REG_V31 + 1)):
+            reg = uc_arm64_neon128()
+            reg.low_qword = value & 0xffffffffffffffff
+            reg.high_qword = value >> 64
+
+    if arch == uc.UC_ARCH_ARM:
+        if reg_id == arm_const.UC_ARM_REG_CP_REG:
             reg = uc_arm_cp_reg()
             if not isinstance(value, tuple) or len(value) != 8:
                 raise UcError(uc.UC_ERR_ARG)
@@ -374,7 +393,32 @@ def reg_write(reg_write_func, arch, reg_id, value):
         # convert to 64bit number to be safe
         reg = ctypes.c_uint64(value)
 
+    return reg
+
+
+def reg_write(reg_write_func, arch, reg_id, value):
+    reg = _reg_write_arg(arch, reg_id, value)
     status = reg_write_func(reg_id, ctypes.byref(reg))
+    if status != uc.UC_ERR_OK:
+        raise UcError(status)
+
+    return
+
+
+def reg_write_batch(reg_write_batch_func, arch, reg_data):
+    reg_ids = []
+    values = []
+
+    for elem in reg_data:
+        reg_id, value = elem
+        reg_ids.append(reg_id)
+        values.append(_reg_write_arg(arch, reg_id, value))
+
+    count = len(reg_ids)
+    reg_list = (ctypes.c_int * count)(*reg_ids)
+    ptr_list = (ctypes.c_void_p * count)(*(
+        ctypes.c_void_p(ctypes.addressof(value)) for value in values))
+    status = reg_write_batch_func(reg_list, ptr_list, ctypes.c_int(count))
     if status != uc.UC_ERR_OK:
         raise UcError(status)
 
@@ -971,19 +1015,46 @@ class UcContext:
     def reg_read(self, reg_id, opt=None):
         return reg_read(partial(_uc.uc_context_reg_read, self._context), self.arch, reg_id, opt)
 
+    # return the values of multiple registers
+    def reg_read_batch(self, reg_data):
+        return reg_read_batch(
+            partial(_uc.uc_context_reg_read_batch, self._context),
+            self.arch, reg_data)
+
     # write to a register
     def reg_write(self, reg_id, value):
         return reg_write(partial(_uc.uc_context_reg_write, self._context), self.arch, reg_id, value)
 
+    # write to multiple registers
+    def reg_write_batch(self, reg_data):
+        return reg_write_batch(
+            partial(_uc.uc_context_reg_write_batch, self._context),
+            self.arch, reg_data)
+
     # Make UcContext picklable
     def __getstate__(self):
-        return (bytes(self), self.size, self.arch, self.mode)
+        return (ctypes.string_at(self.context, self.size), self.size,
+                self.arch, self.mode)
 
     def __setstate__(self, state):
-        self._size = state[1]
-        self._context = ctypes.cast(ctypes.create_string_buffer(state[0], self._size), uc_context)
-        # __init__ won'e be invoked, so we are safe to set it here.
+        # __init__ won't be invoked for unpickled objects.
         self._to_free = False
+        self._size = state[1]
+        if (self._size != len(state[0]) or
+                self._size < ctypes.sizeof(ctypes.c_size_t)):
+            raise ValueError("Invalid Unicorn context")
+
+        context_size = ctypes.c_size_t.from_buffer_copy(state[0]).value
+        if context_size > self._size:
+            raise ValueError("Invalid Unicorn context")
+
+        header_size = self._size - context_size
+        self._context_buffer = ctypes.create_string_buffer(self._size + 15)
+        buffer_address = ctypes.addressof(self._context_buffer)
+        offset = -(buffer_address + header_size) & 15
+        context_address = buffer_address + offset
+        ctypes.memmove(context_address, state[0], self._size)
+        self._context = ctypes.cast(context_address, uc_context)
         self._arch = state[2]
         self._mode = state[3]
 

@@ -1573,6 +1573,24 @@ class UcContext(RegStateManager):
 
         return self._mode
 
+    def _select_reg_class(self, reg_id: int) -> Type:
+        if self.arch == uc.UC_ARCH_ARM:
+            from .arch.arm import UcAArch32
+
+            return UcAArch32._select_reg_class(reg_id)
+
+        if self.arch == uc.UC_ARCH_ARM64:
+            from .arch.arm64 import UcAArch64
+
+            return UcAArch64._select_reg_class(reg_id)
+
+        if self.arch == uc.UC_ARCH_X86:
+            from .arch.intel import UcIntel
+
+            return UcIntel._select_reg_class(reg_id)
+
+        return super()._select_reg_class(reg_id)
+
     # RegStateManager mixin method implementation
     def _do_reg_read(self, reg_id: int, reg_obj) -> int:
         """Private register read implementation.
@@ -1606,7 +1624,20 @@ class UcContext(RegStateManager):
     def __setstate__(self, state: Tuple[bytes, int, int, int]) -> None:
         context, size, arch, mode = state
 
-        self._context = ctypes.cast(ctypes.create_string_buffer(context, size), uc_context)
+        if size != len(context) or size < ctypes.sizeof(ctypes.c_size_t):
+            raise ValueError("Invalid Unicorn context")
+
+        context_size = ctypes.c_size_t.from_buffer_copy(context).value
+        if context_size > size:
+            raise ValueError("Invalid Unicorn context")
+
+        header_size = size - context_size
+        self._context_buffer = ctypes.create_string_buffer(size + 15)
+        buffer_address = ctypes.addressof(self._context_buffer)
+        offset = -(buffer_address + header_size) & 15
+        context_address = buffer_address + offset
+        ctypes.memmove(context_address, context, size)
+        self._context = ctypes.cast(context_address, uc_context)
         self._size = size
         self._arch = arch
         self._mode = mode

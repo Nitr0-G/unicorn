@@ -101,7 +101,21 @@ static void sparc_set_ccr(CPUSPARCState *env, target_ulong value)
 
 static void sparc_release(void *ctx)
 {
+    int i;
+    TCGContext *tcg_ctx = (TCGContext *)ctx;
+    SPARCCPU *cpu = (SPARCCPU *)tcg_ctx->uc->cpu;
+    CPUTLBDesc *d = cpu->neg.tlb.d;
+    CPUTLBDescFast *f = cpu->neg.tlb.f;
+    CPUTLBDesc *desc;
+    CPUTLBDescFast *fast;
+
     release_common(ctx);
+    for (i = 0; i < NB_MMU_MODES; i++) {
+        desc = &(d[i]);
+        fast = &(f[i]);
+        g_free(desc->fulltlb);
+        g_free(fast->table);
+    }
 
 #if 0
     int i;
